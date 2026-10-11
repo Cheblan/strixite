@@ -36,8 +36,6 @@ Ideas I want, but that wait for evidence that they're worth their cost, or for t
   and diagrams.
 - **Two conversations at once.** Measured ~1.3x combined throughput with two agents, but in my use two requests are
   rarely in flight together, and a second slot's memory would cost every user.
-- **Prefill progress for clients**, as a stream chunk rather than a comment most clients don't show - there's an open
-  pull request for it (#4, @TheBeaninator).
 - **Changing settings without a restart**: an endpoint to change the server's settings while it runs - no 30-second
   reload of the weights, no emptied prompt cache.
 - **Sleep mode**: after a configurable idle time, free the GPU memory and reload on the next request - for machines
