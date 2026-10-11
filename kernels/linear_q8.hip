@@ -54,7 +54,7 @@ __device__ inline void load_x16(const uint16_t *x, int64_t off, float (&v)[kChun
 // one instruction). The codes (0..255, exact in BF16) are converted to packed BF16 pairs once per chunk and shared by
 // every row; x stays in its packed BF16 pairs - no per-row conversion - and the group sum of x is a second dot2
 // against (1, 1). At M = 5 the scalar form was instruction-bound (35-37% of wave cycles waiting to issue, 3+ VALU
-// per weight per row; counters 01654bd); this is ~1. Products are exact in FP32; only the summation order
+// per weight per row); this is ~1. Products are exact in FP32; only the summation order
 // differs from the scalar form.
 typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 __device__ inline float dot2(uint32_t a, uint32_t b, float c) {
@@ -152,8 +152,7 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
         }
 }
 
-// Split-K factor: waves per output row. Swept at the target's shapes (M = 1, KS 1/2/4/8, git e5dca34-ksN in
-// bench/results.jsonl): K <= 2560 is best at KS 1 (3-8% over KS 2 on the small, latency-bound matrices - the
+// Split-K factor: waves per output row. Swept at the target's shapes (M = 1, KS 1/2/4/8): K <= 2560 is best at KS 1 (3-8% over KS 2 on the small, latency-bound matrices - the
 // shared expert, [512-1280, 2560] - and equal on the large ones); K = 6144 at KS 4 (KS 1 is 30% slower), which the
 // ~2048 code bytes per wave rule gives.
 int split_k(int64_t K) {

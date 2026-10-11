@@ -91,8 +91,8 @@ std::string json_escaped(std::string_view s) {
 
 // The parameters from body[i] on, then </function> and nothing else. A value ends at a </parameter> followed (white
 // space aside) by the next <parameter= or by </function> - and of those, the first that lets the rest parse: a value
-// may hold the tags as text (2026-10-09: opencode writing a parser test, `"abc\n</parameter>"` in its code, cut the
-// value there and the whole call came back as text). budget bounds the backtracking on pathological bodies.
+// may hold the tags as text (an agent writing a parser test with `"abc\n</parameter>"` in its code cut the value
+// there, and the whole call came back as text). budget bounds the backtracking on pathological bodies.
 bool parse_params(const std::string &body, size_t i, const json::Value *tools, ToolCallOut &call, int &budget) {
     if (--budget < 0) return false;
     skip_ws(body, i);

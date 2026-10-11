@@ -249,10 +249,10 @@ ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &de
                               ", '" + name + "' = " + std::to_string(b));
         if (!budgets.empty()) r.thinking_budget = budgets[0].second;
     }
-    // Thinking on / off: three spellings clients use (smoke test 2026-09-29: the Anthropic- and vLLM-style ones were
+    // Thinking on / off: three spellings clients use (the Anthropic- and vLLM-style ones used to be
     // silently ignored) - chat_template_kwargs.enable_thinking, top-level enable_thinking, thinking.type
     // ("enabled" / "disabled") - plus reasoning_effort "none" (OpenAI's "no reasoning"; Hermes Agent sends it for its
-    // auxiliary calls - 7 of them were 400s on 2026-10-03, its title retry among them). Two that disagree are refused,
+    // auxiliary calls - they used to be refused, its title retry among them). Two that disagree are refused,
     // as for the budgets.
     std::vector<std::pair<std::string, bool>> on_off;
     // Reasoning effort: a level, or "none" = thinking off.
@@ -400,6 +400,7 @@ json::Value strix_ext(const GenerationResult &r, bool clamped, const std::string
     s.set("thinking_budget_hit", json::Value::boolean(r.thinking_budget_hit));
     if (r.think_nudges > 0) s.set("think_nudges", json::Value::integer(r.think_nudges));
     if (r.think_end_blocked > 0) s.set("think_end_blocked", json::Value::integer(r.think_end_blocked));
+    if (r.think_closed_for_call > 0) s.set("think_closed_for_call", json::Value::integer(r.think_closed_for_call));
     if (!thinking.empty()) s.set("thinking", json::Value::string(thinking));
     if (thinking == "skipped")
         s.set("thinking_skipped_reason",

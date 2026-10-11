@@ -17,7 +17,7 @@ WorkingDirectory=%h/src/strix-infer
 # The served weights stay a flag: STRIX_WEIGHTS, the shipping layout unless a drop-in overrides it (e.g.
 # strix-server.service.d/weights.conf to compare layouts).
 Environment=STRIX_WEIGHTS=%h/models/strix-infer/converted/Qwen3.8-Flash-Next.U-gdn_in-g128/weights.strixw
-# STRIX_EXTRA_ARGS: flags for an A/B run (e.g. "--think-nudge off"), set by a job through a drop-in
+# STRIX_EXTRA_ARGS: temporary extra flags (e.g. "--think-nudge off"), set through a drop-in
 # (strix-server.service.d/extra.conf) and removed afterwards; empty in service. Unbraced $VAR: split into words, no
 # argument at all when empty.
 Environment=STRIX_EXTRA_ARGS=
@@ -25,7 +25,7 @@ Environment=STRIX_EXTRA_ARGS=
 Environment=STRIX_LOCAL_ARGS=
 # A GPU memory fault (an aperture violation) aborts the process from the HIP runtime's queue callback (exit 134, then
 # Restart= below) and by default dumps the GPU's memory into the working directory - this checkout, 156 MB for a
-# one-buffer test process (tests/hazards/gpu_fault_sticky, 2026-10-10), far more for the server's ~95 GiB. Off.
+# one-buffer process, far more for the server's ~95 GiB. Off.
 Environment=HSA_DISABLE_COREDUMP_ON_EXCEPTION=1
 ExecStart=%h/src/strix-infer/build/strix/strix_server --config %h/src/strix-infer/deploy/strix-server.conf --weights ${STRIX_WEIGHTS} $STRIX_LOCAL_ARGS $STRIX_EXTRA_ARGS
 # SIGTERM stops the HTTP server, then the prompt cache writes its RAM-only entries to disk (up to 40 s); the model's

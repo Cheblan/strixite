@@ -170,6 +170,10 @@ constexpr const char *kThinkingStop =
     "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly "
     "now.\n</think>\n\n";
 
+// What the engine feeds ahead of a tool call begun inside the think block (Engine::Options::think_close_on_call):
+// the template's think close; the newline before it is the model's own.
+constexpr const char *kThinkCloseBeforeCall = "</think>\n\n";
+
 constexpr int64_t kMtpMaxDraft = 4;  // rejection-point buckets: j = 0, 1, 2 and 3 or more accepted drafts
 
 struct GenerationResult {
@@ -191,6 +195,7 @@ struct GenerationResult {
     bool thinking_budget_hit = false;  // the engine closed the think block (kThinkingStop was fed)
     int64_t think_nudges = 0;          // thinking nudges fed (serve/think_nudge.hpp)
     int64_t think_end_blocked = 0;     // rows where the guard took out an end of turn that was the top token
+    int64_t think_closed_for_call = 0;  // think blocks closed ahead of a tool call begun inside them (think_close_on_call)
 };
 
 // Where the prefill stands (GenerationSink::on_prefill): `processed` of the prompt's `total` tokens are in the KV
@@ -221,6 +226,7 @@ struct EngineStats {
     int64_t mtp_reject_at[kMtpMaxDraft] = {};
     int64_t think_nudges = 0;  // thinking nudges fed
     int64_t think_end_blocked = 0;  // GenerationResult::think_end_blocked, summed
+    int64_t think_closed_for_call = 0;  // GenerationResult::think_closed_for_call, summed
     int64_t cache_hits = 0, cache_misses = 0;
     double prefill_seconds = 0, decode_seconds = 0;
     double last_prefill_tps = 0, last_decode_tps = 0;
@@ -263,6 +269,13 @@ public:
         // Non-empty: what startup turned down (serve/memory_plan.hpp, low-memory adapt). Every request's log block
         // carries it as a "performance degraded" WARNING row, and /health reports it.
         std::string degraded;
+        // Close the think block before a tool call begun inside it (config think-close-on-call): a
+        // <tool_call> sampled right after a newline while the think block is open is reasoning text to the parser,
+        // so no call runs; the model then wrote call after call into its thinking (52 in one opencode turn) while the
+        // guard kept the turn from ending, until the client cancelled. With this on, the engine feeds
+        // kThinkCloseBeforeCall ahead of that <tool_call> and the call is parsed as one. Off only for like-for-like
+        // comparisons. (Last, so the positional Options{...} in the tests keep their meaning.)
+        bool think_close_on_call = true;
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -312,6 +325,8 @@ private:
     const TokenMasker masker_;  // structured output's token masks over the logits row (built once, ~35 ms)
     const std::vector<int32_t> thinking_stop_;  // kThinkingStop, tokenized
     const std::vector<int32_t> nudge_[2];       // kThinkNudge1 / 2, tokenized
+    const std::vector<int32_t> think_close_;    // kThinkCloseBeforeCall, tokenized
+    const int32_t call_begin_;                  // <tool_call>
     std::vector<int32_t> seq_;  // the tokens in the backend (seq_.size() == be_.pos())
     mutable std::mutex mu_;
     std::condition_variable cv_;

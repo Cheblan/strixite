@@ -1,15 +1,14 @@
 #pragma once
 
 // Q6: 6-bit asymmetric per-group weight format - Q4's / Q8's scheme (formats/q4.hpp, formats/q8.hpp) at 6 bits, for
-// dense classes that tolerate less than 8 (a per-class shrink study, quant_study_qwen4exp.py
-// "q6gG"). For W [N, K], group size G (32/64/128, K % G == 0, K % 64 == 0):
+// dense classes that tolerate less than 8. For W [N, K], group size G (32/64/128, K % G == 0, K % 64 == 0):
 //   q      [N, 3K/4] bytes, per row two planes back to back:
 //            low  [K/2]: bits 0..3 of the codes, two per byte along K (low nibble = even k) - Q4's packing
 //            high [K/4]: bits 4..5, four per byte (code k at bits 2 * (k % 4) of byte k / 4)
 //   scale  [N, K/G] BF16 bits,  min [N, K/G] BF16 bits
 //   w[n,k] = q[n,k] * scale[n,k/G] + min[n,k/G]
 // Per group: s = bf16((max - min) / 63), m = bf16(min), q = clamp(round_half_even((w - m) / s), 0, 63), all FP32
-// (a constant group, s == 0, gets q = 0) - bit-identical to int_asym(bits=6) in reference/quant_study.py.
+// (a constant group, s == 0, gets q = 0) - bit-identical to the reference quantizer at 6 bits.
 // 6.25 bits per weight at G = 128, 6.5 at G = 64. K % 64 == 0 keeps every row's planes 16-byte aligned (the kernels'
 // vector loads).
 

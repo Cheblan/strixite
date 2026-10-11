@@ -6,7 +6,7 @@
 // (~115 GiB quantized vs 124 GiB RAM) keeping a second, cached copy would
 // crowd out everything else.
 //
-// Default mode is buffered (2026-09-24): the test machine's
+// Default mode is buffered: the build machine's
 // /home is btrfs with zstd compression, where O_DIRECT silently falls back
 // to buffered reads anyway. O_DIRECT stays available as LoadMode::Direct
 // (re-derived from man 2 open, not from llama.cpp) for uncompressed storage;

@@ -68,7 +68,7 @@ int64_t thinking_budget_for(const ChatRequest &r, int64_t max_tokens);
 bool thinking_left_out(const ChatRequest &r, int64_t max_tokens);
 // True when the request asked for thinking in any way (enable_thinking true in any spelling, reasoning_effort, a
 // budget): then it is never left out, and the answer room without a budget is kExplicitAnswerRoom, not 1024
-// (second smoke test, 2026-09-29: thinking.type "enabled" at max_tokens 600 thought 0 tokens).
+// (thinking.type "enabled" at max_tokens 600 used to think 0 tokens).
 bool thinking_requested(const ChatRequest &r);
 constexpr int64_t kExplicitAnswerRoom = 64;
 

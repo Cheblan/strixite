@@ -22,7 +22,7 @@ struct ConvertOptions {
     std::string out_dir;      // created if missing; must not already hold weights.strixw
     std::string git;          // converter git hash, recorded in the metadata
     // Per-class formats: "default=q4g64" is layout A; e.g. ",gdn_in=q8g64" puts a class
-    // at Q8 (only where a kernel exists). The study's class names (reference/quant_study_qwen4exp.py).
+    // at Q8 (only where a kernel exists).
     std::string layout = "default=q4g64";
     int threads = 0;          // 0: all hardware threads
     std::vector<int64_t> layers;  // decoder layers to convert; empty = all

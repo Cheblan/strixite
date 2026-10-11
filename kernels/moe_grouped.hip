@@ -313,7 +313,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
 // the weight codes go to LDS still packed (coalesced loads by the block), each wave decodes its own 16 rows to F16
 // in registers (code * scale + min, one F16 rounding), and the matrix units accumulate the whole K extent in FP32.
 // (Loading each wave's rows straight from memory instead was 1.65x slower: scattered code and 2-byte scale loads,
-// 5bf11ce - what costs is cache lines touched, not bytes.)
+// what costs is cache lines touched, not bytes.)
 using f16x2 = wmma_f16x2;  // kernels/wmma_gemm.hpp's F16 helpers
 __device__ inline void q4_word_to_f16(uint32_t w, f16x2 s, f16x2 m, uint32_t *out) { wmma_q4_word_to_f16(w, s, m, out); }
 __device__ inline f16x2 bf16_bits_to_f16x2(uint16_t b) { return wmma_bf16_bits_to_f16x2(b); }
@@ -382,7 +382,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     constexpr int kSegs = kWmmaKC / 8, kPasses = (TR * kSegs + kWmmaThreads - 1) / kWmmaThreads;
     const int wr = wave * 16 + (int)threadIdx.x % 16;  // this lane's weight row (B column); lanes l, l + 16 the same
     // The K loop for TMA active 16-row tiles, chosen once per block: a per-tile `if` inside the loop made the compiler
-    // copy all the accumulators at every join (913 register moves, 241 VGPRs - ca3552c ISA).
+    // copy all the accumulators at every join (913 register moves, 241 VGPRs in the ISA).
     auto k_loop = [&](auto tma_c) {
         constexpr int TMA = decltype(tma_c)::value;
         wmma_f32x8 acc[TMA] = {};
@@ -529,8 +529,7 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA): needs wave32 (gfx11 WMMA)");
         // Always the RW-slot tiles: on the real model (skewed routing: the shared expert takes every token, popular
         // experts many) they beat 16-slot tiles at both chunk sizes - prefill to 8192 786 vs 748 t/s (T = 512), 908 vs
-        // 837 (T = 2048), bench/results.jsonl 83c575a-tiles64 / -tiles16 - although uniform routing (bench_prefill_gemm)
-        // favours 16 at T = 512.
+        // 837 (T = 2048) - although uniform routing favours 16 at T = 512.
         const int64_t tiles = route_layout(M, A, E).WTmax;
         STRIX_CHECK(tiles <= 65535, "moe grouped (WMMA): ", tiles, " tile slots exceed the grid");
         dim3 grid((unsigned)((N + kWmmaBN - 1) / kWmmaBN), (unsigned)tiles), block(kWmmaThreads);

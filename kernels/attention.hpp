@@ -15,7 +15,7 @@
 // dtype, all attention math in FP32 (scores, online softmax, P*V), one
 // rounding at the output. That is more precise than transformers' eager BF16
 // run, which rounds scores, probabilities and P*V to BF16; FP32 activations
-// match the FP32 goldens tightly.
+// match an FP32 reference tightly.
 //
 // KV cache: [capacity, Hk, D] per layer for K and V, activation dtype.
 

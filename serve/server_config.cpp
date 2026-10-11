@@ -258,11 +258,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "a turn is saved as a delta on the whole entry it extends while it adds at most this many tokens (and a "
          "quarter of the base); 0 = every entry whole"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
-        // MTP defaults from the sweeps (bench/results.jsonl 740bdd7 + c816938-k*, real text, 10 prompts): chained
-        // drafts at margin 2.0 with a 65536-id draft vocabulary. 5 drafts since 2026-10-01: teacher-forced replays of
-        // real traffic, 3 repeats (7692313-draftconf-*): -0.60% ms/token on terminal-bench / mixed captures, -0.74% on
-        // opencode turns vs 4.
-        {"mtp-draft", K::Int, 1, 15, "5", "MTP: most drafts per verify (the head chained)"},
+        // MTP defaults: chained drafts at margin 2.0 with a 65536-id draft vocabulary, 7 drafts (reasons in
+        // deploy/strix-server.conf).
+        {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "2", "MTP: draft only while the top-1 logit margin is at least this"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
@@ -275,6 +273,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "no end of turn while the think block or a tool call is open (Engine::Options::think_end_guard); off for like-for-like comparisons"},
         {"literal-tags", K::OnOff, 0, 0, "on",
          "a </think> / <tool_call> / </tool_call> token not right after a newline is text (OutputParser::Config::literal_tags); off for like-for-like comparisons"},
+        {"think-close-on-call", K::OnOff, 0, 0, "on",
+         "a tool call begun inside the think block gets </think> fed ahead of it, so it runs (Engine::Options::think_close_on_call); off for like-for-like comparisons"},
         {"think-nudge-rate", K::Number, 0.01, 1, "0.25",
          "thinking nudge: due when this share of the last 1024 thinking tokens repeat earlier 8-grams"},
         {"think-nudge-min-tokens", K::Int, 1024, 1 << 24, "3072", "thinking nudge: no rate trigger before this many thinking tokens"},

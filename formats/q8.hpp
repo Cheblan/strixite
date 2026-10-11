@@ -1,13 +1,13 @@
 #pragma once
 
 // Q8: int8 asymmetric per-group weight format - Q4's scheme (formats/q4.hpp)
-// at 8 bits, for the classes the quantization study shows need it (quant_study_qwen4exp.py, "q8gG").
+// at 8 bits, for the classes that need it.
 // For W [N, K], group size G (32/64/128, K % G == 0):
 //   q      [N, K] bytes: one unsigned code 0..255 per weight, row-major
 //   scale  [N, K/G] BF16 bits,  min [N, K/G] BF16 bits
 //   w[n,k] = q[n,k] * scale[n,k/G] + min[n,k/G]
 // Per group: s = bf16((max - min) / 255), m = bf16(min), q = clamp(round_half_even((w - m) / s), 0, 255), all
-// FP32 (a constant group, s == 0, gets q = 0) - bit-identical to int_asym(bits=8) in reference/quant_study.py.
+// FP32 (a constant group, s == 0, gets q = 0) - bit-identical to the reference quantizer at 8 bits.
 // 8.5 bits per weight at G = 64.
 
 #include <cstdint>

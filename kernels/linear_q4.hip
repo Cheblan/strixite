@@ -299,7 +299,7 @@ void launch_mr(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, int KS, hip
 // Split-K factor: waves per output row. One wave per row leaves long-K
 // shapes with few, long waves and an underfilled last round on the GPU;
 // splitting so each wave covers ~2048 codes measured best across the bench
-// shapes (bench/results.jsonl), while short K loses to the LDS reduction.
+// shapes, while short K loses to the LDS reduction.
 int split_k(int64_t K) {
     int ks = 1;
     while (ks < 8 && K / (2048 * (ks * 2)) >= 1) ks *= 2;

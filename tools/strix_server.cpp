@@ -115,6 +115,7 @@ int run(int argc, char **argv) {
     const bool think_nudge = settings.on("think-nudge");
     const bool think_end_guard = settings.on("think-end-guard");
     const bool literal_tags = settings.on("literal-tags");
+    const bool think_close_on_call = settings.on("think-close-on-call");
     ThinkWatch::Policy nudge_policy;
     nudge_policy.rate = settings.number("think-nudge-rate");
     nudge_policy.min_tokens = settings.integer("think-nudge-min-tokens");
@@ -229,9 +230,10 @@ int run(int argc, char **argv) {
     eng_opts.think_nudge_wording = nudge_wording;
     eng_opts.think_end_guard = think_end_guard;
     eng_opts.literal_tags = literal_tags;
+    eng_opts.think_close_on_call = think_close_on_call;
     eng_opts.degraded = degraded;
-    slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s", think_end_guard ? "on" : "off",
-         literal_tags ? "on" : "off");
+    slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s, think close before a call %s",
+         think_end_guard ? "on" : "off", literal_tags ? "on" : "off", think_close_on_call ? "on" : "off");
     if (think_nudge)
         slog(LogLevel::Info, "startup: thinking nudge on: %.0f%% self-copy over %lld tokens past %lld, wording %s",
              100.0 * nudge_policy.rate, (long long)nudge_policy.window, (long long)nudge_policy.min_tokens,

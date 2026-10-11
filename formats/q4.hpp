@@ -4,8 +4,8 @@
 //   q      [N, K/2] bytes: two 4-bit codes per byte along K (low nibble = even k)
 //   scale  [N, K/G] BF16 bits,  min [N, K/G] BF16 bits
 //   w[n,k] = q[n,k] * scale[n,k/G] + min[n,k/G]
-// Quantization is bit-identical to int_asym in reference/quant_study.py, so
-// the engine runs exactly what the study measured.
+// Quantization is bit-identical to the reference quantizer the layouts were measured with, so the engine runs
+// exactly what was measured.
 
 #include <cstdint>
 #include <vector>

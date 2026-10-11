@@ -2,12 +2,12 @@
 
 // RDNA3 / RDNA3.5 (gfx11) matrix-core tile, wave32: D[16x16] = A[16x16] * B[16x16] + C, BF16 inputs, FP32
 // accumulation (v_wmma_f32_16x16x16_bf16). Device-only helpers for the tiled GEMMs; the lane layout below is
-// checked end to end by test_wmma (kernels::wmma_tile_product), since everything built on it depends on it:
+// checked end to end (kernels::wmma_tile_product), since everything built on it depends on it:
 //   A (M x K): lane l < 16 holds row l's 16 K values; lanes 16..31 hold the same (the ISA reads both halves).
 //   B (K x N): lane l < 16 holds column l's 16 K values - i.e. row l of B^T, which is how a weight W [N, K]
 //              is stored, so a W tile loads like an A tile; lanes 16..31 again duplicate.
 //   C / D:     8 floats per lane; element v of lane l is row 2v + l / 16, column l % 16.
-// The FP32 accumulation is not bit-exact IEEE: up to 2^-23 of sum|a*b| per 16x16x16 step (test_wmma, gfx1100) -
+// The FP32 accumulation is not bit-exact IEEE: up to 2^-23 of sum|a*b| per 16x16x16 step (measured on gfx1100) -
 // FP32 noise, far below the BF16 input rounding (2^-9).
 // Lower-precision path: the inputs are BF16-rounded; only kernels behind
 // an explicit switch use it.

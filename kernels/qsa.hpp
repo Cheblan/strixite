@@ -57,20 +57,19 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
 // Row - one workgroup per query, one launch (the passes over the row in LDS, the select in index order so no
 // sort), for decode and verifies (T <= kQsaTopkRowMaxT), where Split's cost was its launches. Auto picks Row for
 // rows of at most kQsaTopkRowMaxBlocks blocks (any T: prefill chunks too, 3-8x faster than Split there), Coop for small T past that (the split's
-// workgroups in one cooperative launch: grid syncs between the passes, a select in index order - no sort); tests force
-// each. Measured (bench_qsa,
-// 82f5969-launch-new vs e388910-launch-old, gfx1151, T = 1): Row 7.3 / 12.5 / 33.8 / 64.0 / 124.0 us at 1k / 4k /
+// workgroups in one cooperative launch: grid syncs between the passes, a select in index order - no sort); either can be forced
+// explicitly. Measured (gfx1151, T = 1): Row 7.3 / 12.5 / 33.8 / 64.0 / 124.0 us at 1k / 4k /
 // 16k / 32k / 64k blocks, Split 30.5-32.5 us throughout - one workgroup streaming a long row loses to the split's
-// parallel passes past ~14k blocks (~56k tokens of context). With the select from per-thread slices (b263643, T = 1):
+// parallel passes past ~14k blocks (~56k tokens of context). With the select from per-thread slices (T = 1):
 // Row 6.9 / 8.6 / 14.3 / 29.4 us at 1k / 4k / 16k / 32k blocks; T = 5 14.6 at 16k, 55.4 at 32k - so Row up to 16384
-// blocks (Coop there: 23.7 at T = 1, 27.8 at T = 5, 04e1b3d-coop). workspace: >= qsa_topk_workspace_bytes(T), zeroed once after
+// blocks (Coop there: 23.7 at T = 1, 27.8 at T = 5). workspace: >= qsa_topk_workspace_bytes(T), zeroed once after
 // allocation (hipMemset); every completed call leaves the words a path needs zeroed at its start zeroed again (Row
 // doesn't touch the workspace; Coop's per-workgroup counts are rewritten each call). Not shared between concurrent
 // calls.
 // Filter (many queries past kQsaTopkRowMaxBlocks: deep prefill chunks; Auto there): a bound from ~1/16 of the row,
 // one pass keeping the blocks at or above it, the exact select on those - the row read about once instead of four
 // times (details at the kernels). A row whose candidates miss (fewer than k, or past the list's 4096) runs the exact
-// select on its whole row: same result. FilterTight: a list of exactly k (tests: mostly the fallback).
+// select on its whole row: same result. FilterTight: a list of exactly k (it mostly takes the fallback).
 enum class TopkPath { Auto, Split, Row, Coop, Filter, FilterTight };
 constexpr int64_t kQsaTopkRowMaxT = 8, kQsaTopkRowMaxBlocks = 16384, kQsaTopkCoopMaxBlocksT1 = 40960;
 size_t qsa_topk_workspace_bytes(int64_t T);

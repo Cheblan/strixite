@@ -1,7 +1,7 @@
 #pragma once
 
 // The HTTP surface on cpp-httplib: POST /v1/chat/completions (JSON or SSE),
-// GET /v1/models, /health, /metrics (Prometheus text), /cache (prefix-reuse counters, for hbench). Requests are
+// GET /v1/models, /health, /metrics (Prometheus text), /cache (prefix-reuse counters). Requests are
 // rendered and tokenized on the HTTP thread, then queued on the Engine; a streaming response relays the engine's
 // events as they come, with SSE comment keep-alives while the request waits or prefills; a client that goes away
 // cancels its request.

@@ -10,7 +10,7 @@
 // BF16 checkpoint (that one starts from the original values); it is the Q4 nearest to what the engine actually serves.
 //
 // Threads split the rows into contiguous chunks: Q4 groups run along K inside a row, so chunks quantize independently
-// and append_rows_q4 makes the result byte-identical to one call over all rows (checked in tests/test_q4_format.cpp).
+// and append_rows_q4 makes the result byte-identical to one call over all rows.
 
 #include "formats/q4.hpp"
 #include "formats/q8.hpp"

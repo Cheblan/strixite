@@ -2,8 +2,7 @@
 
 // Qwen3.8-Flash-Next's chat template (the checkpoint's chat_template.jinja), rendered by hand in C++ - no Jinja
 // engine. Output is byte-identical to transformers' apply_chat_template
-// for the same messages / tools / options (tests/test_chat_template.cpp against
-// reference/golden_chat_template_qwen4exp.py), including its `trim` (Python str.strip) and `tojson`
+// for the same messages / tools / options, including its `trim` (Python str.strip) and `tojson`
 // (json.dumps, ensure_ascii=False) semantics. What the template would reject (no messages, a system message not
 // first, no user query, an unknown role or content type, a bad reasoning effort) throws strix::Error with the
 // template's reason; so do the shapes it would render nonsensically from (non-string role, non-object parts).

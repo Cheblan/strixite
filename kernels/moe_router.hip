@@ -125,7 +125,7 @@ template <> __device__ inline void store<uint16_t>(uint16_t *p, int64_t i, float
 
 // Grid (column slices, token rows): a block covers kAddThreads columns of one row. One block per row put a decode
 // step's whole row on one workgroup (moe_shared_add_inject measured 15.7 us traced vs 3.4 + 1.9 for the two
-// kernels it replaced, stack 74b8888); the first slice's block raises a row's error.
+// kernels it replaced); the first slice's block raises a row's error.
 template <typename T>
 __global__ void __launch_bounds__(kAddThreads)
     moe_shared_add_kernel(T *y, const T *s, const float *gate_logit, int64_t gate_ld, int64_t N, uint32_t gate_index,

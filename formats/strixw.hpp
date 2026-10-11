@@ -20,7 +20,7 @@ enum class StrixwRole : uint8_t { Data = 0, Q = 1, Scale = 2, Min = 3 };
 const char *strixw_encoding_name(StrixwEncoding e);
 const char *strixw_role_name(StrixwRole r);
 
-// v2 (2026-09-25) added Q8RowMajor, v3 (2026-09-25) Q8ChunkMajor, v4 (2026-09-27) Q6RowMajor and Q5RowMajor; the
+// v2 added Q8RowMajor, v3 Q8ChunkMajor, v4 Q6RowMajor and Q5RowMajor; the
 // reader also accepts v1-v3 files (subsets).
 constexpr uint32_t kStrixwVersion = 4, kStrixwOldestVersion = 1;
 constexpr size_t kStrixwHeaderBytes = 128, kStrixwTensorAlign = 4096, kStrixwComponentAlign = 256;

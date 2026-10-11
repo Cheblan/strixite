@@ -54,12 +54,13 @@ Qwen4ExpModel::Hc load_hc(const StrixwDevice &w, const std::string &p, const Qwe
 }  // namespace
 
 Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngram, Act act,
-                             bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor)
+                             bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor,
+                             WeightPlacement placement)
     : act_(act) {
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, "Qwen4ExpModel: unsupported activation dtype ", (int)act);
     STRIX_CHECK(std::isfinite(yarn_factor) && yarn_factor >= 1.0f && yarn_factor <= 8.0f, "Qwen4ExpModel: yarn_factor = ",
                 yarn_factor, ", expected 1 (RoPE as trained) .. 8");
-    w_ = std::make_unique<StrixwDevice>(weights);
+    w_ = std::make_unique<StrixwDevice>(weights, 8, placement);
     const StrixwFile &f = w_->file();
     Qwen4ExpDims &D = dims_;
     while (f.find(kLm + "layers." + std::to_string(D.layers) + ".attn_hyper_connection.mix_down")) ++D.layers;
@@ -804,7 +805,7 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
 
 // The end of a forward: the error words and the logits come back in one go - async copies into pinned memory on
 // stream_ behind the forward, one synchronize, then the checks on the host copies. It used to be a synchronize and
-// five blocking hipMemcpy calls (~40 us each on gfx1151, HIP API trace dea5523-apitrace), per forward - and the MTP
+// five blocking hipMemcpy calls (~40 us each on gfx1151), per forward - and the MTP
 // cycle runs several forwards per token. The pinned area is reused only after this synchronize (the gfx1151
 // pinned-reuse hazard).
 std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what, int64_t n_cand_rows) {
@@ -1311,7 +1312,7 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
         if (!D.is_attention[li]) {
             // GDN: the verify wrote its states to the spare set, so conv_state_ / rec_state_ are still the ones before
             // it - replay rows [0, rows) on them in place, with the verify's own path (Auto: per token), so the state
-            // is exactly the verify's after that row (split invariance, tests/test_gdn_kernel *_mtp_rollback).
+            // is exactly the verify's after that row (split invariance).
             kernels::gdn_front(verify_in_[li].get(),
                                {rows, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
                                l.conv_w, conv_state_[li].get(), conv_state_[li].get(), false, l.A_log, l.dt_bias,

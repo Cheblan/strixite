@@ -19,7 +19,7 @@
 //
 // Dims come from the checkpoint's tensor shapes; the scalar hyperparameters
 // (eps, RoPE theta, rotary fraction) are Qwen3.5's config.json values,
-// written down here because this stage had no JSON parser, and pinned by the golden tests.
+// written down here because this stage had no JSON parser.
 
 #include "formats/safetensors.hpp"
 #include "kernels/embedding.hpp"
@@ -73,7 +73,7 @@ private:
     std::vector<Layer> layers_;
 };
 
-// Called with each intermediate the goldens capture, under the goldens' names
+// Called with each intermediate, under the reference implementation's names
 // ("embed", "L<i>.in_norm", "L<i>.mixer", "L<i>.post_norm", "L<i>.mlp",
 // "L<i>.out", "final_norm"): a device pointer to rows x cols values in the
 // activation dtype, valid only during the call (the stream is synchronized first).

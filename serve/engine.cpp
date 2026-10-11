@@ -31,7 +31,9 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
       think_end_(tok.id_of("</think>")),
       masker_(tok, backend.logits_row()),
       thinking_stop_(tok.encode(kThinkingStop)),
-      nudge_{tok.encode(think_nudge1_text(options.think_nudge_wording)), tok.encode(kThinkNudge2)} {
+      nudge_{tok.encode(think_nudge1_text(options.think_nudge_wording)), tok.encode(kThinkNudge2)},
+      think_close_(tok.encode(kThinkCloseBeforeCall)),
+      call_begin_(tok.id_of("<tool_call>")) {
     STRIX_CHECK(backend.logits_row() >= tok.size(), "Engine: logits rows of ", backend.logits_row(),
                 " are shorter than the tokenizer's ", tok.size(), " tokens");
     STRIX_CHECK(backend.max_chunk() >= (int64_t)thinking_stop_.size() && backend.capacity() >= 2, "Engine: backend chunk ",
@@ -43,6 +45,12 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
                         std::count(n.begin(), n.end(), tok.id_of("</think>")) == 0,
                     "Engine: a thinking nudge tokenizes to ", n.size(), " tokens (backend chunk ", backend.max_chunk(),
                     ") or contains </think> - it must leave the think block open");
+    STRIX_CHECK(!think_close_.empty() && think_close_.front() == think_end_ &&
+                    std::count(think_close_.begin(), think_close_.end(), think_end_) == 1 &&
+                    (int64_t)think_close_.size() + 1 <= backend.max_chunk(),
+                "Engine: kThinkCloseBeforeCall tokenizes to ", think_close_.size(),
+                " tokens, expected </think> first and only once, and room for it + <tool_call> in a backend chunk of ",
+                backend.max_chunk());
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
@@ -364,6 +372,7 @@ void Engine::run(Job &job) {
             stats_.mtp_drafted_tokens += res.mtp_drafted_tokens;
             stats_.think_nudges += res.think_nudges;
             stats_.think_end_blocked += res.think_end_blocked;
+            stats_.think_closed_for_call += res.think_closed_for_call;
             stats_.mtp_accepted_tokens += res.mtp_accepted_tokens;
             stats_.mtp_rollbacks += res.mtp_rollbacks;
             for (int64_t i = 0; i < kMtpMaxDraft; ++i) stats_.mtp_reject_at[i] += res.mtp_reject_at[i];
@@ -501,6 +510,33 @@ void Engine::run(Job &job) {
             if (!options_.capture_dir.empty())
                 steps.push_back({(uint8_t)drafted, (uint8_t)accepted, (uint8_t)emitted});
         };
+        // A tool call begun inside the think block (Options::think_close_on_call): a sampled <tool_call> right after
+        // a newline while the think block is open. Not under a response_format grammar, which owns the structure.
+        const auto misplaced_call = [&](int32_t t) {
+            return options_.think_close_on_call && !so && t == call_begin_ && parser.in_reasoning() && parser.after_newline();
+        };
+        // Feeds kThinkCloseBeforeCall, then the sampled <tool_call> (counted already, not yet fed or forwarded), in one
+        // forward: the call then parses as one. False: no room left for it under max_tokens (the caller ends, length).
+        const auto close_think_before_call = [&](int32_t call_tok) {
+            STRIX_CHECK(call_tok == call_begin_ && parser.in_reasoning(), "Engine: closing the think block before token ",
+                        call_tok, " (expected <tool_call> ", call_begin_, ") with the think block ",
+                        parser.in_reasoning() ? "open" : "closed");
+            const int64_t n = (int64_t)think_close_.size();
+            if (res.completion_tokens + n >= req.max_tokens) return false;
+            std::vector<int32_t> fed = think_close_;
+            fed.push_back(call_tok);
+            for (int32_t t : fed) parser.feed(t, events);  // no stop string can complete: none of it is content
+            STRIX_CHECK(parser.in_call(), "Engine: the think block closed before a tool call, but the parser isn't in the call");
+            if (!events.empty()) sink.on_events(events), events.clear();
+            res.completion_tokens += n, res.fed_tokens += n;
+            ++res.think_closed_for_call;
+            ++res.decode_forwards;
+            logits = be_.forward_rows(fed, 1, cands, n_valid, masks_for({}));
+            seq_.insert(seq_.end(), fed.begin(), fed.end());
+            step(kThinkingStopStep, 0, n);  // the fed close, then the sampled <tool_call> as a step of its own
+            step(0, 0, 1);
+            return true;
+        };
         // A token sampled at a rejected draft's position - already counted, fed to the parser and the response format,
         // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
         // forward of its own (strixite PR #1).
@@ -586,6 +622,13 @@ void Engine::run(Job &job) {
                     reason = "stop";
                     break;
                 }
+                if (misplaced_call(id)) {
+                    if (!close_think_before_call(id)) {
+                        reason = "length";
+                        break;
+                    }
+                    continue;
+                }
                 if (so) so->feed(id);
                 const bool stopped = parser.feed(id, events);
                 watch_tok(id);
@@ -616,6 +659,8 @@ void Engine::run(Job &job) {
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
                     if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
+                    if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
                     if (so) {
                         if (!so->allows(draft_at, d)) break;
@@ -683,6 +728,14 @@ void Engine::run(Job &job) {
                         reason = "stop";
                         break;
                     }
+                    if (misplaced_call(v)) {  // fed with the close in a forward of its own, not carried
+                        step(k, j, j + 1);
+                        if (!close_think_before_call(v)) {
+                            reason = "length";
+                            break;
+                        }
+                        continue;
+                    }
                     if (so) so->feed(v);
                     const bool st = parser.feed(v, events);
                     watch_tok(v);
@@ -718,6 +771,9 @@ void Engine::run(Job &job) {
         slog_row(LogLevel::Info, "generate", "%s   %s tokens (think %s) in %s s", gen_rate,
                  fmt_n(res.completion_tokens).c_str(), fmt_n(res.reasoning_tokens).c_str(),
                  fmt_rate(res.decode_ms / 1e3, 2).c_str());
+        if (res.think_closed_for_call > 0)
+            slog_row(LogLevel::Info, "guard", "think block closed ahead of a tool call begun inside it %s time%s (</think> fed)",
+                     fmt_n(res.think_closed_for_call).c_str(), res.think_closed_for_call == 1 ? "" : "s");
         if (res.think_end_blocked > 0)
             slog_row(LogLevel::Info, "guard", "end of turn blocked inside the think block or a tool call %s time%s (it was the top token)",
                      fmt_n(res.think_end_blocked).c_str(), res.think_end_blocked == 1 ? "" : "s");

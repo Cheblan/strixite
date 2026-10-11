@@ -350,7 +350,7 @@ void HttpServer::routes() {
         });
     });
 
-    // Legacy completions (Serving contract v1, amended 2026-09-30): the raw prompt as is - no chat template, no
+    // Legacy completions: the raw prompt as is - no chat template, no
     // thinking or tool parsing; the same engine, queue, prefix reuse and prompt cache as chat.
     svr_->Post("/v1/completions", [this](const httplib::Request &req, httplib::Response &res) {
         const int64_t id = ++next_id_;
@@ -568,6 +568,8 @@ void HttpServer::routes() {
                (double)s.think_nudges);
         metric("strix_think_end_blocked_total", "counter",
                "Ends of turn the guard took out inside the think block or a tool call while they were the top token.", (double)s.think_end_blocked);
+        metric("strix_think_closed_for_call_total", "counter",
+               "Think blocks the engine closed ahead of a tool call the model began inside them.", (double)s.think_closed_for_call);
         metric("strix_mtp_accepted_tokens_total", "counter", "MTP candidate tokens accepted.", (double)s.mtp_accepted_tokens);
         metric("strix_mtp_rollbacks_total", "counter", "MTP speculation rollbacks on rejection.", (double)s.mtp_rollbacks);
         metric("strix_mtp_rejections_total", "counter",

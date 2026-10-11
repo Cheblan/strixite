@@ -2,7 +2,7 @@
 
 // Why a request resumed short of what an earlier state shared with it. The model's recurrent (GDN) layers resume only
 // on an exact prefix: one changed token ahead of a conversation - a client rebuilding its system prompt, pruning old
-// tool output - costs a prefill of everything after it. On 2026-09-30 that was 8 cold prefills of 84k-180k tokens (an
+// tool output - costs a prefill of everything after it. One day that was 8 cold prefills of 84k-180k tokens (an
 // opencode plugin re-rendering memories into the system prompt), found only by comparing the saved system-prefix sizes
 // across turns. This names the token and the message where the prompt left the nearest saved state, so the log says it
 // at once.

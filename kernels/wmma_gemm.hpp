@@ -8,7 +8,7 @@
 // sub-step of wmma_sub(G) = min(G, kWmmaKC) along K: acc += s * sum_k bf16(x_k) q_k + m * sum_k bf16(x_k). So x is
 // the only rounded input (a no-op for BF16 activations); the weights enter exactly (as formats/q4 / q8 dequantize,
 // up to FP32 rounding), and staging costs ~2 ops per code instead of a dequantize + round (measured: dequant bounded
-// these kernels - bench_prefill_gemm, git 3b6f941 vs d815416). BF16 weights (the router) go to LDS unchanged. FP32
+// these kernels). BF16 weights (the router) go to LDS unchanged. FP32
 // accumulation either way (a lower-precision path). Included by .hip files
 // only.
 
@@ -164,7 +164,7 @@ __device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_
 // into registers; stage() writes them to LDS [BN][kWmmaLd] as BF16 bits. The rows' scales and mins come in windows
 // of kWin groups (a step that opens a window fetches and stages it into sw / mw [BN][kWin], BF16 bits; groups past
 // the row's end and rows past rows_valid zero): coalesced - consecutive lanes read consecutive groups - where one
-// scattered 2-byte load per row per step cost the experts ~2x (bench_prefill_gemm, git d32cddf vs its -noscale).
+// scattered 2-byte load per row per step cost the experts ~2x.
 // BITS 4: a 16-byte load is 32 codes; 8: 16 codes (6 / 5: the specializations below).
 template <int BITS, int G, int BN>
 struct WmmaWCodes {

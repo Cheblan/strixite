@@ -4,8 +4,9 @@
 // (the prompt cache's host buffers). A std::vector was the stall: resize() zero-fills and
 // faults in 4 KiB pages, most of the ~0.7 s the engine spent exporting an entry after every response at 160-200k
 // context. This maps anonymous memory and faults it all in up front, and resize() keeps the mapping when it is big
-// enough, so a reused buffer costs nothing but the copy (bench_host_buffer, 6dac2e9: 5 GiB 782 ms with a vector, 287
-// fresh with huge pages, 66 reused). 4 KiB pages since 2026-09-29 (host_buffer.cpp: huge pages compact under memory
+// enough, so a reused buffer costs nothing but the copy (5 GiB: 782 ms with a vector, 287 fresh with huge pages, 66
+// reused). 4 KiB pages (host_buffer.cpp:
+// huge pages compact under memory
 // pressure; 517 ms fresh). Contents after resize() are unspecified.
 
 #include <cstddef>

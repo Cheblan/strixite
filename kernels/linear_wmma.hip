@@ -168,8 +168,7 @@ int device_mps() {
     return n;
 }
 
-// Row tile 128 when that still gives >= 8 blocks per WGP, else 64. Measured (bench_prefill_gemm, 16c005d-bm128 vs
-// 94cebaf): 128 rows +10-15% on in_proj / qkv at T = 512 / 2048 and out_proj / o_proj at 2048 (the weight codes
+// Row tile 128 when that still gives >= 8 blocks per WGP, else 64. Measured: 128 rows +10-15% on in_proj / qkv at T = 512 / 2048 and out_proj / o_proj at 2048 (the weight codes
 // staged once for twice the rows), but -12% on out_proj / o_proj at 512 (N = 2560: 80 blocks for 20 WGPs).
 template <typename TX, typename TY, int BITS>
 void launch(const TX *x, const View &w, TY *y, int64_t M, hipStream_t stream) {

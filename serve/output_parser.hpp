@@ -64,8 +64,8 @@ public:
         // Trim each channel's leading / trailing white space (chat, like the template's re-render). Off for raw
         // /v1/completions, where it's part of the text (code indentation, a continuation's leading space).
         bool trim_ws = true;
-        // Literal tags (2026-10-09): </think>, <tool_call> and </tool_call> are structure only right after a newline
-        // (where the model always writes them: 4,654 / 4,654 </think> and 6,039 / 6,051 call tags in the 2026-10-09 captures);
+        // Literal tags: </think>, <tool_call> and </tool_call> are structure only right after a newline
+        // (where the model writes them: all but a dozen of ~10,700 in served requests);
         // anywhere else - `id_of("<tool_call>")` in code it writes, a tag named in a sentence - the model had no other
         // way to spell the tag (it has no text tokens for it), and the token is text of the channel it is in.
         bool literal_tags = true;
@@ -84,6 +84,7 @@ public:
     int64_t reasoning_tokens() const { return reasoning_tokens_; }
     bool in_reasoning() const { return phase_ == Phase::Reasoning; }
     bool in_call() const { return phase_ == Phase::Call; }  // between <tool_call> and its </tool_call>
+    bool after_newline() const { return after_newline_; }  // the last token fed ended in '\n' (or none was fed yet)
     int64_t tool_calls() const { return tool_calls_; }
     bool dropped_partial_call() const { return dropped_call_; }
     int64_t malformed_calls() const { return malformed_calls_; }  // streamed calls that went out but weren't well-formed

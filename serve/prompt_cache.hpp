@@ -34,7 +34,7 @@
 //
 // RAM-only entries (put(..., ram_only = true)): the engine marks those of one-shot requests - one message, no tools,
 // nothing a later turn extends (a batch client's classification prompts). They serve repeats from RAM but never reach
-// the disk - no eviction, idle or shutdown write; leaving RAM drops them (counted as ram_only_dropped). On 2026-09-30
+// the disk - no eviction, idle or shutdown write; leaving RAM drops them (counted as ram_only_dropped). On one day
 // such prompts were 251 of the disk's 279 entries (50 GB) and most of its ~230 GB/day of writes. A put of the same
 // tokens without the flag clears it.
 //
@@ -53,16 +53,16 @@
 //   counts both); at startup a delta file whose base file is missing is dropped (counted invalid);
 // - using or saving a delta refreshes its base's place in the LRU, so the two leave RAM together;
 // - a Checkpoint's base is a Checkpoint or a System entry, never a Turn (the next turn would replace it, and the
-//   checkpoint would go with it); the checkpoints_per_chain trim skips a base while a delta needs it (2026-10-08:
-//   terminal-bench sends every terminal output as a user message - a whole ~1.2 GB checkpoint a request - and the
-//   margin test's 264k conversations a whole 7.4 GB one).
+//   checkpoint would go with it); the checkpoints_per_chain trim skips a base while a delta needs it (an
+//   agent harness that sends every terminal output as a user message made a whole ~1.2 GB checkpoint a request, and
+//   264k conversations a whole 7.4 GB one).
 // On disk a delta is a version-2 file whose header names its base by length (the base's tokens are the delta's own
 // first base_n tokens).
 //
 // Buffers: a state leaving RAM (replaced, evicted, written after eviction) becomes a spare - up to kMaxSpares,
 // the largest kept - which take_buffer() hands to the next export or disk load: at 100-200k context a fresh buffer
-// costs ~0.2 s of page population, a reused one nothing (switch test, dac725e: 3.7 GB export 205-230 ms fresh vs
-// ~48 ms reused). Since RAM entries keep their buffers, the writer thread prefaults spares while idle: up to
+// costs ~0.2 s of page population, a reused one nothing (3.7 GB export 205-230 ms fresh vs
+// ~48 ms reused).
 // kMaxSpares of the last saved state's size + prefault_headroom, only while MemAvailable stays above ram_margin plus
 // that size. Spares count as RAM and go first when memory is short.
 
@@ -113,26 +113,26 @@ public:
 
     struct Options {
         // Keep MemAvailable above this (RAM entries leave first; make_room_for holds it at every allocation). 4 GiB
-        // (2026-10-08; was 24, set against direct compaction from MADV_HUGEPAGE buffers and buffered writes, both gone
-        // since e35f0c8): the switch test at 512k capacity / chunk 16384, two 264k conversations, n-gram table warm,
-        // bottomed at 5.5 GiB with 0 compaction stalls, RAM resumes 1.2-1.4 s.
+        // (was 24, set against direct compaction from MADV_HUGEPAGE buffers and buffered writes, both gone now): at
+        // 512k capacity / chunk 16384, two 264k conversations switching, n-gram table warm, MemAvailable bottomed at 5.5 GiB
+        // with 0 compaction stalls, RAM resumes 1.2-1.4 s.
         uint64_t ram_margin = 4ull << 30;
-        double idle_seconds = 3600;  // an entry idle in RAM this long is written (and kept in RAM); served since 2026-10-02
+        double idle_seconds = 3600;  // an entry idle in RAM this long is written (and kept in RAM)
         // The margin watch: the writer applies the RAM rule this often, so memory another process takes between saves
-        // (a build or test an agent runs, a sidecar) is answered within seconds, not at the next save (2026-10-10:
-        // the margin was held only at allocations). One /proc/meminfo read a check. Below the margin it frees down to
+        // (a build or test an agent runs, a sidecar) is answered within seconds, not at the next save (it was held
+        // only at allocations before). One /proc/meminfo read a check. Below the margin it frees down to
         // margin + ram_watch_headroom: freeing only the shortfall let a hog growing 0.5 GiB/s outrun a 2 s watch to
-        // 2.8 GiB (hog test 77ab6df, ~/bench-out/day/2026-10-10/memwatch2).
+        // 2.8 GiB.
         double ram_watch_seconds = 1;
         uint64_t ram_watch_headroom = 1ull << 30;
-        // Budget for eviction and idle writes; 0 = no limit. 32 GiB/h: the served value since 2026-10-03 (reasons in
+        // Budget for eviction and idle writes; 0 = no limit. 32 GiB/h: the served value (reasons in
         // deploy/strix-server.conf); the old 64 predates delta entries.
         double write_gib_per_hour = 32;
         uint64_t disk_free_margin = 32ull << 30;  // a write never leaves less free space on the cache's filesystem
         double shutdown_seconds = 40;       // the destructor's flush stops after this long
         int checkpoints_per_chain = 2;      // Checkpoints kept per conversation (>= 1)
         // Delta entries: a Turn is a delta on its base while it adds at most this many tokens (and at most a quarter of
-        // the base's); 0 = every entry whole. 65536 (was 32768, 2026-10-08): below a 262k base the quarter rule
+        // the base's); 0 = every entry whole. 65536 (was 32768): below a 262k base the quarter rule
         // decides - a delta of <= ~1.4 GB (27 KiB a token + ~0.12 GB) instead of a whole rebase every 32k tokens.
         int64_t delta_max_tokens = 65536;
         bool prefault = true;               // the writer keeps populated spares ready for the next export
@@ -201,7 +201,7 @@ public:
     // The RAM buffer of the Turn entry a put of tokens[0, n) will replace (the longest Turn it extends - the same
     // conversation one step back), taken now: that entry leaves the index (RAM and disk) as the put would do anyway.
     // The export then grows it by the turn's few MB instead of populating a fresh multi-GB buffer - near the RAM
-    // margin spares are the first thing dropped, so there usually is none (2026-09-30: 2-6 GB exports 278-546 ms
+    // margin spares are the first thing dropped, so there usually is none (2-6 GB exports took 278-546 ms
     // median). Empty if there is no such entry in RAM, or it is being read or written: use take_buffer(). If the
     // export then fails, the old turn is lost - a miss later, never a wrong state. Never a base: neither one with
     // deltas nor the entry of tokens[0, keep_n) - the base the coming put will name (delta_base()), whose old delta
@@ -211,7 +211,7 @@ public:
     // entries leave RAM until MemAvailable >= ram_margin + bytes, measured after their memory is unmapped. False if it
     // still isn't (an eviction write still queued holds its RAM until written): the caller then doesn't grow the
     // buffer - the save is skipped, the load refused - so the margin holds at every allocation, not only after a put
-    // (2026-10-08: a whole 7.4 GB export a request, checked only afterwards, took the machine to 0.5 GB and hung it).
+    // (a whole 7.4 GB export a request, checked only afterwards, once took the machine to 0.5 GB and hung it).
     bool make_room_for(uint64_t bytes);
     uint64_t mem_available_now() const { return mem_available(); }  // MemAvailable (or the test's probe), bytes
     uint64_t disk_free_now() const { return disk_free(); }          // free bytes on the directory's filesystem
@@ -224,7 +224,7 @@ public:
     const Options &options() const { return opt_; }
 
     // Queued eviction writes beyond max(this, 4 x the last saved state) are refused (Options::max_pending_bytes): 8 GiB
-    // alone held two ~3.7 GB states, and the margin switch tests dropped an entry a run on "write queue full".
+    // alone held two ~3.7 GB states, and switching two long conversations dropped an entry a run on "write queue full".
     static constexpr uint64_t kMaxPendingBytes = 8ull << 30;
     static constexpr int kMaxSpares = 2;                        // a checkpoint and a turn exported per request
 
@@ -303,5 +303,13 @@ private:
     PromptCacheStats stats_;
     std::thread thread_;
 };
+
+// write_all for a source that is being thrown away: a pwrite loop that hands back the buffer's already-written
+// whole pages (MADV_DONTNEED) as the write progresses, so a queued eviction returns its RAM with its bytes instead of
+// all at the end (the margin watch's dip). `where` names the file in errors. Returns the bytes
+// given back; a madvise failure stops the releasing, not the write.
+// on_progress (optional, for tests) sees (bytes written, bytes given back) after every chunk that released.
+uint64_t write_all_releasing(int fd, HostBuffer &src, size_t n, uint64_t at, const std::string &where,
+                             const std::function<void(uint64_t, uint64_t)> &on_progress = {});
 
 }  // namespace strix

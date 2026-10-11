@@ -1,7 +1,7 @@
 #pragma once
 
 // Q5: 5-bit asymmetric per-group weight format - formats/q6.hpp's two-plane layout with a 1-bit high plane, for the
-// dense classes the per-class shrink study finds tolerant (reference/quant_study_qwen4exp.py "q5gG"). For W [N, K],
+// dense classes that tolerate it. For W [N, K],
 // group size G (32/64/128, K % G == 0, K % 128 == 0):
 //   q      [N, 5K/8] bytes, per row two planes back to back:
 //            low  [K/2]: bits 0..3 of the codes, two per byte along K (low nibble = even k) - Q4's packing
@@ -9,7 +9,7 @@
 //   scale  [N, K/G] BF16 bits,  min [N, K/G] BF16 bits
 //   w[n,k] = q[n,k] * scale[n,k/G] + min[n,k/G]
 // Per group: s = bf16((max - min) / 31), m = bf16(min), q = clamp(round_half_even((w - m) / s), 0, 31), all FP32
-// (a constant group, s == 0, gets q = 0) - bit-identical to int_asym(bits=5) in reference/quant_study.py.
+// (a constant group, s == 0, gets q = 0) - bit-identical to the reference quantizer at 5 bits.
 // 5.25 bits per weight at G = 128, 5.5 at G = 64. K % 128 == 0 keeps every row (5K/8 bytes) and both planes 16-byte
 // aligned (the kernels' vector loads).
 

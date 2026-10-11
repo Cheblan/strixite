@@ -119,7 +119,7 @@ int32_t Sampler::sample(const float *logits, size_t size, float *out_margin) {
     if (k > kSmallK) return sample_large_k(logits, k, out_margin);
     // Top-k in one pass over the row: the best max(k, 2) so far (2 for the margin), sorted. Once the list is full, a
     // logit enters only if it beats the last one - ids ascend, so an equal logit never does and the lower id stays
-    // ahead. Replaces filling and partial-sorting all 248,320 candidates per row (bench_sampler).
+    // ahead. Replaces filling and partial-sorting all 248,320 candidates per row.
     const size_t m = (size_t)std::min<int64_t>(n, std::max<int64_t>(k, 2));
     cand_.clear();
     bool nan = false;
@@ -298,8 +298,7 @@ int32_t Sampler::sample_large_k(const float *logits, int64_t k, float *out_margi
 // top_k off: the softmax over the whole row, then only the part of the sorted order the draw needs - the top-p
 // nucleus, then the prefix holding the drawn mass. sorted_prefix sorts the tokens above a probability threshold and
 // lowers it until the prefix is covered: every token left out has a lower logit than every one taken, so the sorted
-// set is exactly the head of the full sort. A peaked row sorts a handful instead of all 248,320 (bench_sampler:
-// top_k0). Same distribution as sorting everything; only the order of summation (and so the last bits of the
+// set is exactly the head of the full sort. A peaked row sorts a handful instead of all 248,320. Same distribution as sorting everything; only the order of summation (and so the last bits of the
 // normalizer) differs.
 int32_t Sampler::sample_all(const float *logits, float *out_margin) {
     const int64_t n = n_valid_;

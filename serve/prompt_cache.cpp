@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -53,6 +54,7 @@ std::string ago(double seconds) {
 
 // Continuation lines of a "prompt cache: " line start under its text.
 constexpr const char *kCont = "              ";
+constexpr size_t kReleaseChunkBytes = 64ull << 20;  // write_all_releasing: give back a whole chunk of pages at a time
 uint64_t align4k(uint64_t x) { return (x + 4095) & ~uint64_t{4095}; }
 uint64_t file_total(uint64_t n_tokens, uint64_t state_bytes) { return align4k(kHeaderBytes + n_tokens * 4) + state_bytes; }
 
@@ -122,6 +124,40 @@ void set_idle_io_priority() {
 }
 
 }  // namespace
+
+// write_all for a source that is being thrown away: as each chunk of `src` reaches the file, its pages go back to
+// the kernel (MADV_DONTNEED, whole pages, only after every byte of theirs is written). pwrite with O_DIRECT returns
+// once the bytes are at the device, and a buffered pwrite has copied them into the page cache - either way the
+// source's pages are dead afterwards. A queued eviction write used to hold all its RAM until the write ended
+// (~0.7 s per 1.6 GB) - the dip the margin watch chased under a fast-growing memory hog - so the memory it
+// frees is freed as it is written. Returns the
+// bytes given back; a madvise failure stops the releasing, not the write.
+uint64_t write_all_releasing(int fd, HostBuffer &src, size_t n, uint64_t at, const std::string &where,
+                             const std::function<void(uint64_t, uint64_t)> &on_progress) {
+    STRIX_CHECK(fd >= 0, where, ": write_all_releasing with fd ", fd);
+    STRIX_CHECK(n % 4096 == 0, where, ": write_all_releasing of ", n, " bytes, expected a whole number of pages");
+    STRIX_CHECK(src.capacity() >= n, where, ": write_all_releasing of ", n, " bytes from a buffer of ", src.capacity());
+    STRIX_CHECK(src.data() != nullptr || n == 0, where, ": write_all_releasing of ", n, " bytes from a null buffer");
+    size_t done = 0, released = 0;
+    bool releasing = true;
+    while (done < n) {
+        const size_t want = std::min(n - done, kReleaseChunkBytes);
+        const ssize_t w = ::pwrite(fd, src.data() + done, want, (off_t)(at + done));
+        if (w < 0 && errno == EINTR) continue;
+        STRIX_CHECK(w > 0, where, ": write of ", want, " bytes at ", at + done, " failed: ",
+                    w < 0 ? std::strerror(errno) : "0 bytes");
+        done += (size_t)w;
+        const size_t landed = done & ~(size_t)4095;  // pages whose every byte is in the file (a short write may end mid-page)
+        if (releasing && landed > released) {
+            if (::madvise(src.data() + released, landed - released, MADV_DONTNEED) != 0) releasing = false;
+            else {
+                released = landed;
+                if (on_progress) on_progress((uint64_t)done, (uint64_t)released);
+            }
+        }
+    }
+    return (uint64_t)released;
+}
 
 // /proc/meminfo's MemAvailable in bytes; throws if it can't be read.
 uint64_t proc_mem_available() {
@@ -443,7 +479,7 @@ HostBuffer PromptCache::take_buffer() {
     std::lock_guard<std::mutex> lock(mu_);
     // Near the margin with no spare big enough for the next state: take the buffer of the least recently used RAM
     // entry that's already on disk (it stays there) instead of letting the export map a fresh one - a fresh
-    // MADV_HUGEPAGE mapping under memory pressure compacts in the faulting thread (OCtest run 4: exports ~3 GB/s,
+    // MADV_HUGEPAGE mapping under memory pressure compacts in the faulting thread (exports ~3 GB/s,
     // 75.7 s on the request path, once the RAM tier was full).
     const uint64_t want = prefault_bytes_;
     bool spare_fits = false;
@@ -632,7 +668,7 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
                 chain.emplace_back(e->tokens.size(), e.get());
         std::sort(chain.begin(), chain.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
         // Longest first, so a delta goes before its base. A base stays while a delta needs it - this put's own base
-        // and the base of a checkpoint delta kept above (Checkpoint deltas, 2026-10-08); it goes on a later trim.
+        // and the base of a checkpoint delta kept above (Checkpoint deltas); it goes on a later trim.
         for (size_t k = (size_t)opt_.checkpoints_per_chain - 1; k < chain.size(); ++k) {
             if (chain[k].second == base.get() || chain[k].second->dependents > 0) continue;
             const int i = find_locked(chain[k].second);
@@ -747,8 +783,8 @@ void PromptCache::make_room_locked(uint64_t extra) {
     while (need > 0) {
         // Candidates: every RAM entry not being imported and not already leaving. One queued for a write (idle, or
         // being written) counts too - it leaves RAM once written - so the least recently used goes first, never the
-        // newest just because the older ones sat in the write queue (the margin switch test, 5848183: the entry just
-        // saved was dropped, "write queue full", and its conversation re-prefilled 132k tokens).
+        // newest just because the older ones sat in the write queue (otherwise the entry just saved was dropped,
+        // "write queue full", and its conversation re-prefilled 132k tokens).
         Entry *lru = nullptr;
         for (const EntryPtr &e : entries_)
             if (!e->ram.empty() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
@@ -990,6 +1026,7 @@ void PromptCache::write_entry(Job &job) {
     Entry &e = *job.e;
     const double t0 = now_s();
     uint64_t n = 0, total = 0, state_at = 0, state_bytes = 0, base_n = 0;
+    bool releasing = false;  // set under the lock below: whether this write's source is being thrown away
     {
         std::vector<HostBuffer> trash;
         std::lock_guard<std::mutex> lock(mu_);
@@ -1014,16 +1051,18 @@ void PromptCache::write_entry(Job &job) {
         }
         ++e.readers;  // the RAM copy stays put while the file is written
         e.queued = true;
+        releasing = e.drop_ram;  // an eviction: its RAM goes back as its bytes are written (not all at the end)
     }
     const uint64_t token_hash = strix_hash64(e.tokens.data(), n * 4);
     char name[64];
     std::snprintf(name, sizeof name, "%016llx-%llu.pcache", (unsigned long long)token_hash, (unsigned long long)n);
     const std::string path = dir_ + "/" + name, partial = path + ".partial";
     bool ok = false;
+    uint64_t released = 0;
     try {
         // O_DIRECT: the state never becomes dirty page cache. Buffered, a multi-GB write under memory pressure (free
         // memory ~0 with the n-gram table cached) made the request path's allocations wait in reclaim for writeback -
-        // exports 7-12 s in the warm switch test (0bc9472, idle writes on) vs 1.5-2.4 s with only eviction writes -
+        // exports 7-12 s while switching conversations with idle writes on vs 1.5-2.4 s with only eviction writes -
         // and pushed the n-gram table's pages out. Aligned pieces: [header | tokens | pad] from `head` (page-aligned),
         // the state's whole 4 KiB blocks straight from its HostBuffer, the last partial block via `head`'s spare
         // page; then the file is cut to its exact size.
@@ -1049,7 +1088,8 @@ void PromptCache::write_entry(Job &job) {
                 (void)::ioctl(fd, FS_IOC_SETFLAGS, &flags);
             }
             write_all(fd, h, state_at, 0, partial);
-            write_all(fd, e.ram.data(), body, state_at, partial);
+            if (releasing) released = write_all_releasing(fd, e.ram, body, state_at, partial);
+            else write_all(fd, e.ram.data(), body, state_at, partial);
             if (tail) write_all(fd, h + state_at, 4096, state_at + body, partial);
             STRIX_CHECK(::ftruncate(fd, (off_t)total) == 0, partial, ": truncate to ", total, " bytes failed: ",
                         std::strerror(errno));
@@ -1078,8 +1118,10 @@ void PromptCache::write_entry(Job &job) {
         e.path = path, e.file_bytes = total;
         disk_bytes_ += total;
         const std::string by = e.saved_by > 0 ? " (saved by Request " + std::to_string(e.saved_by) + ")" : "";
-        slog(LogLevel::Info, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s", kind_name(e.kind),
-             fmt_n((long long)n).c_str(), by.c_str(), fmt_rate(total / 1e6, 0).c_str(), fmt_rate(now_s() - t0, 2).c_str());
+        const std::string freeing = releasing && released > 0 ? ", " + fmt_rate(released / 1e9, 1) + " GB gave back RAM as it wrote" : "";
+        slog(LogLevel::Info, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s%s", kind_name(e.kind),
+             fmt_n((long long)n).c_str(), by.c_str(), fmt_rate(total / 1e6, 0).c_str(), fmt_rate(now_s() - t0, 2).c_str(),
+             freeing.c_str());
         const std::string delta = base_n > 0 ? "; a delta on the " + fmt_n((long long)base_n) + "-token entry" : "";
         slog(LogLevel::Info, "%swhy: %s%s", kCont,
              job.why == Why::Idle    ? ("unused for " + ago(now_s() - e.touched_s)).c_str()

@@ -252,7 +252,7 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // Rows per wave (RW) and waves per row group (KS) for hc_mix_down, swept at the target's shape (324 x 10240,
-// Q4 G64; RW 1/2/4 x KS 1/2/4/8, git c9fc0c4-rwN-ksM in bench/results.jsonl): T = 1 best at RW 1, KS 2
+// Q4 G64; RW 1/2/4 x KS 1/2/4/8): T = 1 best at RW 1, KS 2
 // (13.2 us, 62% of read peak - the ~1.9 MB matrix is latency-bound like linear_q4's of that size); T = 4 at
 // RW 2, KS 1 (21.3 us), where sharing each X load across rows starts to pay. Sharing X didn't help at T = 1.
 int split_k(int64_t T) { return T == 1 ? 2 : 1; }

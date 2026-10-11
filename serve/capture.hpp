@@ -2,8 +2,8 @@
 
 // Token-level capture of finished requests (strix_server --capture-dir): the
 // prompt and generated token ids plus what MTP did at every decode step, so drafting policies - prompt-lookup drafts
-// where the MTP head holds back, per-turn-type margins - can be simulated offline on real agent traffic before any of
-// them is built (measure on logged requests first, build second). Opt-in; nothing is
+// where the MTP head holds back, per-turn-type margins - can be simulated offline on logged requests before any of
+// them is built. Opt-in; nothing is
 // captured without the flag. The files hold the user's prompts: they stay on the serving machine.
 //
 // One file per request, `<unix ms>-req<id>.cap`:

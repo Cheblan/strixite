@@ -4,7 +4,7 @@
 // second - equal to the best on a tie, -inf for one logit) and whether any logit is NaN - serve/sampler.hpp top2()'s
 // result for non-NaN rows - written with the forward's error words into one small struct, so a draft step ends with
 // one ~64-byte copy to the host instead of five copies and the whole draft vocabulary's logits (256 KB for 65536 ids)
-// scanned on the CPU. A 2026-09-28 trace of the draft loop (tools/trace_gaps.py) had ~0.3 ms of each ~1.2 ms draft
+// scanned on the CPU. A trace of the draft loop had ~0.3 ms of each ~1.2 ms draft
 // step idle around those copies and the host scan.
 
 #include "kernels/embedding.hpp"

@@ -48,7 +48,7 @@ void HostBuffer::resize(size_t bytes) {
     if (p_) {
         // Growing: mremap keeps the pages already there (the VMA's MADV_NOHUGEPAGE too) and only the new tail is
         // populated. A conversation's state grows 3-80 MB a turn, so re-mapping the whole buffer cost ~100 ms per GB
-        // on every large export once the RAM tier sat at its margin (2026-09-30: 2-6 GB exports 278-546 ms median).
+        // on every large export once the RAM tier sat at its margin (2-6 GB exports 278-546 ms median).
         void *p = ::mremap(p_, cap_, cap, MREMAP_MAYMOVE);
         STRIX_CHECK(p != MAP_FAILED, "HostBuffer::resize: growing a ", cap_, "-byte mapping to ", cap, " bytes failed: ",
                     std::strerror(errno));
@@ -62,8 +62,8 @@ void HostBuffer::resize(size_t bytes) {
     STRIX_CHECK(p != MAP_FAILED, "HostBuffer::resize: mmap of ", cap, " bytes failed: ", std::strerror(errno));
     // 4 KiB pages, not transparent huge pages: with free memory ~0 (the n-gram table in the page cache) a
     // MADV_HUGEPAGE fault compacts in the faulting thread - a fresh 5 GiB buffer 287 ms median but up to 1,094 ms
-    // under pressure, and the prompt cache's exports stalled seconds (bench_host_buffer 0bc9472-pressure; the warm
-    // switch test). 4 KiB: 517 ms fresh, flat; copies 3-6% slower (66 -> 69 ms per 5 GiB). The prompt cache
+    // under pressure, and the prompt cache's exports stalled seconds. 4 KiB:
+    // 517 ms fresh, flat; copies 3-6% slower (66 -> 69 ms per 5 GiB). The prompt cache
     // prefaults and reuses buffers, so the fresh cost stays off the request path.
     (void)::madvise(p, cap, MADV_NOHUGEPAGE);
     populate(p, 0, cap, cap);

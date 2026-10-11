@@ -2,8 +2,7 @@
 
 // qwen4_exp PLE n-gram ids (PLE steps 1-3), on the host: the ids select rows of
 // the SSD-backed n-gram table, so they're needed where the table reads are issued, and they're 16 integer
-// hashes per token. Validated against HF's own id code (reference/golden_ple_ids.py fixture) and, through
-// the row gather, against the L1.ple goldens.
+// hashes per token. Validated against HF's own id code and, through the row gather, against HF's PLE outputs.
 
 #include <array>
 #include <cstdint>

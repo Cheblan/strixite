@@ -1,11 +1,10 @@
 #pragma once
 
-// The thinking nudge (a permanent engine feature for this model, 2026-10-01): when a turn's thinking goes in circles,
+// The thinking nudge (a permanent engine feature for this model): when a turn's thinking goes in circles,
 // the engine feeds one first-person sentence into the think block - never a </think>, the model decides whether to wrap
-// up. Measured first: on terminal-bench captures a 1k window of >= 25% self-repeated 8-grams past 3k thinking tokens
-// fired on 21 / 31 of the cobol rabbit hole's long turns and 5 / 55 of other tasks' long turns, never on opencode;
-// resumed with the nudge, 7 / 12 runs wrapped up 5-40x sooner with the same kind of next step, 5 ignored it (as long as
-// without).
+// up. The trigger (a 1k window of >= 25% self-repeated 8-grams past 3k thinking tokens) fires mostly on turns stuck in
+// a loop and rarely elsewhere; with the nudge, about half of those wrapped up 5-40x sooner with the same kind of next
+// step, the rest ignored it (as long as without).
 //
 // ThinkWatch follows one turn's reasoning tokens and says when a nudge is due:
 //   nudge 1: past min_tokens with the last `window` tokens' self-copy rate >= rate;

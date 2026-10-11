@@ -48,8 +48,8 @@ public:
     }
 
 private:
-    // Never destroyed: a static DeviceBuffer elsewhere may be freed after a function-local static would be (test_mtp
-    // aborted at exit that way).
+    // Never destroyed: a static DeviceBuffer elsewhere may be freed after a function-local static would be (a
+    // program aborted at exit that way).
     static std::mutex &mu() {
         static std::mutex *m = new std::mutex;
         return *m;

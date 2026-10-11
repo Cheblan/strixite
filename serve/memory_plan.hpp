@@ -9,9 +9,9 @@
 // The rule: the prompt cache must be able to save the largest conversation the capacity allows while keeping its RAM
 // margin - MemAvailable >= max(margin, floor) + one state at full capacity. Without a prompt cache, MemAvailable >=
 // floor. The floor (kLowMemoryFloor) is what the desktop, the page cache and the server's own pinned staging buffers
-// need; a test machine hard-hung at 0.5 GB MemAvailable (2026-10-08).
+// need; a machine hard-hung at 0.5 GB MemAvailable.
 //
-// low-memory = fail (the default everywhere, 2026-10-10): short of the rule, startup fails with what was
+// low-memory = fail (the default everywhere): short of the rule, startup fails with what was
 // measured, what is needed, and the settings that would fit - including low-memory = adapt.
 // low-memory = adapt: the RAM caches are turned down, cheapest loss first, re-checked after each step, each step one
 // WARNING (measured, changed, impact, how to get it back):

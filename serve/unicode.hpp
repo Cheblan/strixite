@@ -1,7 +1,8 @@
 #pragma once
 
 // The Unicode the tokenizer and the chat template need, from tables generated off Python's unicodedata
-// (reference/gen_unicode_tables.py -> serve/unicode_tables.inc): UTF-8 <-> code points, the pre-tokenizer's
+// (serve/unicode_tables.inc):
+// UTF-8 <-> code points, the pre-tokenizer's
 // letter / mark / number classes and white space, NFC, and Python's str.isspace (Jinja's `trim`). The classes and
 // NFC come from different Unicode versions on purpose - the ones the reference tokenizer uses (see the script).
 

@@ -254,8 +254,7 @@ private:
 
 // ---------------------------------------------------------------- layout
 
-// Per-class weight formats, the study's class names (reference/quant_study_qwen4exp.py) so a measured variant
-// converts as written: "default=q4g64,gdn_in=q8g64,...". Plus mtp_fc (the MTP head's two input projections).
+// Per-class weight formats by class name, so a measured variant converts as written: "default=q4g64,gdn_in=q8g64,...". Plus mtp_fc (the MTP head's two input projections).
 // Only formats a kernel can run are accepted: Q4 everywhere; Q8 for the dense classes linear_q8 covers and the
 // HC mixes (hc_mix_down / hc_mix_up have Q8 overloads) - not the routed experts (Q4-only gather/combine).
 struct QFmt {
@@ -722,7 +721,7 @@ const char *explain(ConvertOp op, bool merged, int64_t experts, int bits) {
                    "scale + min per group - 6.25 bits per weight at G128, 4x finer steps than q4.";
         if (bits == 8)
             return "q8: 8-bit codes, one per byte, with the same BF16 scale + min per group - 8.5 bits per weight "
-                   "at G64, ~16x finer steps than q4; for the classes the quantization study found sensitive.";
+                   "at G64, ~16x finer steps than q4; for the classes that measured sensitive to 4 bits.";
         return "q4: 4-bit codes (two per byte) plus a BF16 scale and min per 64 weights along K = 4.5 bits per "
                "weight; per group s = (max - min) / 15, code = round((w - min) / s), w' = code * s + min.";
     case ConvertOp::Q4FoldHC:
@@ -934,7 +933,7 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
             const int64_t N = s.out.shape[0], K = s.out.shape[1], G = s.out.group_size;
             W q = empty_w<W>(N, K, G);
             if (s.op == ConvertOp::Q4FoldHC) {
-                // Fold in FP32: w' = w * (1 + hc_norm[k]), exactly as test_hc_kernel builds the reference.
+                // Fold in FP32: w' = w * (1 + hc_norm[k]), exactly as the HC kernel's reference does.
                 const std::vector<float> norm = src.read_f32(s.sources[2]);
                 std::vector<float> di((size_t)(N * K));
                 int64_t row = 0;

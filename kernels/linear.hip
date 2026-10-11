@@ -134,7 +134,7 @@ __global__ void __launch_bounds__(kThreads)
 int device_warp_size() { return kernels::device_warp_size(kThreads); }
 
 // Waves per output row: split until each lane makes at most ~5 16-byte loads per row (at most 8 waves).
-// Swept on gfx1151 at 1/2/4/8 (bench/results.jsonl, `<git>-ksN`): the best factor at every target shape
+// Swept on gfx1151 at 1/2/4/8: the best factor at every target shape
 // left each lane 2.5-5 loads - K = 640 unsplit, 2560 at 2 (router 73 -> 80% of read peak), 6144 at 8
 // (out_proj 60 -> 96%).
 int split_k(int64_t K) {

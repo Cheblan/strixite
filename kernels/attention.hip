@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(kD) attention_combine_kernel(const float *ws, 
 // The C layout's row for element v (2v + lane / 16) is the same in S and O, so the softmax rescale of O is per
 // element. Query rows past G are zero and never written. The softmax is split by rows across the waves (shared P
 // and rescale factors in LDS); Q fragments stay in registers; the next tile's K / V rows load during this tile's
-// softmax and P * V; gathered key positions come from a per-chunk LDS table. Measured (bench_prefill_gemm, gathered
+// softmax and P * V; gathered key positions come from a per-chunk LDS table. Measured (gathered
 // at 8k, T = 512): 139.7 ms per 512 tokens (the first version: all of D in one wave, 240 VGPRs, occupancy 2, a
 // 32-way conflicted V transpose) -> 33.6 (208 VGPRs, 16.7 KB LDS, occupancy 7); the vector kernel: 142.9.
 constexpr int kWWaves = 4;  // 8 waves x 32 dims measured slower (36.8 vs 33.6 ms per 512 tokens at 8k, occupancy 10 vs 7)
@@ -490,7 +490,7 @@ __global__ void __launch_bounds__(kWWaves * 32)
     }
 }
 
-// Keys per split. Measured on gfx1151 (bench/results.jsonl, bench_attention *-blkN): 80 blocks - 2 per
+// Keys per split. Measured on gfx1151: 80 blocks - 2 per
 // CU of its 40 - is best; fewer, longer contiguous key ranges beat more splits (0.8B at 32K context: 92%
 // of read peak at 80 blocks, 65% at 160, 52% at 320, 78% at 40); at least 2 tiles per split.
 // HIP's multiprocessor count is in WGPs on this device (20 = 40 CUs / 2), hence 4 per reported unit.

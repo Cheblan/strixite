@@ -157,19 +157,7 @@ target_link_libraries(convert_ngram_table PRIVATE strix_formats)
 add_executable(inspect_strixw tools/inspect_strixw.cpp)
 target_link_libraries(inspect_strixw PRIVATE strix_formats)
 
-# Development tools (benches, studies, inspectors) and tests/ are built when their sources are in the tree; the
-# engine, the server and the converters build without them.
-if(EXISTS "${CMAKE_SOURCE_DIR}/tools/bench_linear.cpp")
-    set(STRIX_DEV_TOOLS_DEFAULT ON)
-else()
-    set(STRIX_DEV_TOOLS_DEFAULT OFF)
-endif()
-option(STRIX_DEV_TOOLS "Build the bench / study / inspection tools" ${STRIX_DEV_TOOLS_DEFAULT})
 
-if(STRIX_DEV_TOOLS)
-add_executable(inspect_safetensors tools/inspect_safetensors.cpp)
-target_link_libraries(inspect_safetensors PRIVATE strix_formats)
-endif()
 
 add_library(strix_runtime STATIC
     runtime/weight_loader.cpp
@@ -177,14 +165,6 @@ add_library(strix_runtime STATIC
 target_include_directories(strix_runtime PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_runtime PUBLIC strix_formats strix_rocm Threads::Threads)
 
-if(STRIX_DEV_TOOLS)
-add_executable(load_weights tools/load_weights.cpp)
-target_link_libraries(load_weights PRIVATE strix_runtime)
-
-add_executable(bench_load tools/bench_load.cpp)
-target_link_libraries(bench_load PRIVATE strix_runtime)
-
-endif()
 
 # The int8 n-gram table from convert_ngram_table's BF16 one (the published table is made this way).
 add_executable(transcode_ngram_table tools/transcode_ngram_table.cpp)
@@ -209,67 +189,6 @@ if(STRIX_ROCTX)
     target_compile_definitions(strix_model PUBLIC STRIX_ROCTX=1)
 endif()
 
-if(STRIX_DEV_TOOLS)
-add_executable(bench_linear)
-strix_hip_sources(bench_linear tools/bench_linear.cpp)
-target_link_libraries(bench_linear PRIVATE strix_kernels strix_formats)
-
-add_executable(bench_prefill_gemm)
-strix_hip_sources(bench_prefill_gemm tools/bench_prefill_gemm.cpp)
-target_link_libraries(bench_prefill_gemm PRIVATE strix_kernels strix_formats)
-
-add_executable(bench_attention)
-strix_hip_sources(bench_attention tools/bench_attention.cpp)
-target_link_libraries(bench_attention PRIVATE strix_kernels)
-
-add_executable(bench_forward)
-strix_hip_sources(bench_forward tools/bench_forward.cpp)
-target_link_libraries(bench_forward PRIVATE strix_model)
-
-add_executable(bench_gdn)
-strix_hip_sources(bench_gdn tools/bench_gdn.cpp)
-target_link_libraries(bench_gdn PRIVATE strix_kernels)
-
-add_executable(bench_forward_qwen4exp)
-strix_hip_sources(bench_forward_qwen4exp tools/bench_forward_qwen4exp.cpp)
-target_link_libraries(bench_forward_qwen4exp PRIVATE strix_model)
-
-add_executable(act_range)
-strix_hip_sources(act_range tools/act_range.cpp)
-target_link_libraries(act_range PRIVATE strix_model)
-
-add_executable(route_stats)
-strix_hip_sources(route_stats tools/route_stats.cpp)
-target_link_libraries(route_stats PRIVATE strix_model)
-
-add_executable(bench_hc)
-strix_hip_sources(bench_hc tools/bench_hc.cpp)
-target_link_libraries(bench_hc PRIVATE strix_kernels strix_formats)
-
-add_executable(bench_router)
-strix_hip_sources(bench_router tools/bench_router.cpp)
-target_link_libraries(bench_router PRIVATE strix_kernels)
-
-add_executable(bench_boundary)
-strix_hip_sources(bench_boundary tools/bench_boundary.cpp)
-target_link_libraries(bench_boundary PRIVATE strix_kernels strix_formats)
-
-add_executable(bench_wmma_peak)
-strix_hip_sources(bench_wmma_peak tools/bench_wmma_peak.cpp)
-target_link_libraries(bench_wmma_peak PRIVATE strix_kernels)
-
-add_executable(bench_logits_topk)
-strix_hip_sources(bench_logits_topk tools/bench_logits_topk.cpp)
-target_link_libraries(bench_logits_topk PRIVATE strix_kernels)
-
-add_executable(bench_qsa)
-strix_hip_sources(bench_qsa tools/bench_qsa.cpp)
-target_link_libraries(bench_qsa PRIVATE strix_kernels)
-
-add_executable(bench_ple)
-strix_hip_sources(bench_ple tools/bench_ple.cpp)
-target_link_libraries(bench_ple PRIVATE strix_kernels)
-endif()
 
 # Serving: host-only pieces - JSON, tokenizer, chat template, ...
 add_library(strix_serve STATIC
@@ -293,7 +212,6 @@ add_library(strix_serve STATIC
     serve/prompt_cache.cpp
     serve/resume_loss.cpp
     serve/capture.cpp
-    serve/replay.cpp
     serve/host_buffer.cpp)
 target_include_directories(strix_serve PUBLIC "${CMAKE_SOURCE_DIR}")
 target_include_directories(strix_serve SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
@@ -303,43 +221,16 @@ target_link_libraries(strix_serve PUBLIC strix_formats Threads::Threads)
 add_library(strix_serve_model STATIC serve/qwen4exp_backend.cpp)
 target_link_libraries(strix_serve_model PUBLIC strix_serve strix_model)
 
-if(STRIX_DEV_TOOLS)
-# The prompt cache under memory pressure, host only (no model, no GPU): tools/stress_prompt_cache.cpp.
-add_executable(stress_prompt_cache tools/stress_prompt_cache.cpp)
-target_link_libraries(stress_prompt_cache PRIVATE strix_serve)
 
-add_executable(bench_host_buffer tools/bench_host_buffer.cpp serve/host_buffer.cpp)
-target_include_directories(bench_host_buffer PRIVATE "${CMAKE_SOURCE_DIR}")
-target_link_libraries(bench_host_buffer PRIVATE strix_rocm)
-
-add_executable(bench_sampler tools/bench_sampler.cpp)
-target_link_libraries(bench_sampler PRIVATE strix_serve)
-add_executable(bench_token_mask tools/bench_token_mask.cpp)
-target_link_libraries(bench_token_mask PRIVATE strix_serve)
 # Streamed tool calls against the buffered parser, host only (no model, no GPU; the model's tokenizer.json):
 # check_stream_calls <tokenizer.json> [random cases] [seed].
 add_executable(check_stream_calls tools/check_stream_calls.cpp)
 target_link_libraries(check_stream_calls PRIVATE strix_serve)
-endif()
 
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
-if(STRIX_DEV_TOOLS)
-# Decode A/Bs on captured real traffic, teacher-forced (serve/replay.hpp).
-add_executable(bench_replay tools/bench_replay.cpp)
-target_link_libraries(bench_replay PRIVATE strix_serve_model)
-add_executable(nudge_fork tools/nudge_fork.cpp)
-target_link_libraries(nudge_fork PRIVATE strix_serve_model)
-# P(end of turn) at every position of captured turns, per decode path (the 2026-10-09 mid-thought stops).
-add_executable(eot_probe tools/eot_probe.cpp)
-target_link_libraries(eot_probe PRIVATE strix_serve_model)
-endif()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
-    enable_testing()
-    add_subdirectory(tests)
-endif()
 
 # The tutorials live in the public repo only; built when present.
 if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")

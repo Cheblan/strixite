@@ -3,8 +3,7 @@
 // MoE experts for multi-token forwards (prefill, MTP verify): tokens grouped by expert, so each active expert's Q4
 // weights are read once per tile of up to kMoeTileRows slots instead of once per token. The decode kernels
 // (kernels/linear_q4.hpp linear_q4_experts_gather / _combine) read an expert's rows once per (token, slot): at
-// T = 512 the 5120 slots of a layer touch ~all 512 experts ~10 times each, 55% of prefill time (rocprofv3, git
-// 7f3e2d2). Same semantics as those kernels - FP32 math, one rounding where the output is stored - only the
+// T = 512 the 5120 slots of a layer touch ~all 512 experts ~10 times each, 55% of prefill time (rocprofv3). Same semantics as those kernels - FP32 math, one rounding where the output is stored - only the
 // summation order differs:
 //   gather:  y[m, a, :] = x[m, :] * W[ids[m, a]]^T                      x [M, K], y [M, A, N]
 //   combine: y[m, :] = sum_a coef[m, a] * (h[m, a, :] * W[ids[m, a]]^T)  h [M, A, K], y [M, N]

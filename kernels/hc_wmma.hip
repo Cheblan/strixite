@@ -93,8 +93,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     __syncthreads();
     // Over the stream's K range [s d, (s + 1) d), software-pipelined two steps deep: two register sets (a, b) take
     // turns, so while a step's tiles are staged and multiplied the loads for the next two steps are in flight (one
-    // step ahead left 43% of wave cycles waiting on memory - counters 50bdc6e; two deep: -6% / -14% at 2048 / 512
-    // tokens, dd1778f).
+    // step ahead left 43% of wave cycles waiting on memory; two deep: -6% / -14% at 2048 / 512 tokens).
     WmmaXTile<T, BM, G, false> xa, xb;
     WCodes wa, wb;
     xa.fetch(x, xoff, rows_x, 0);

@@ -7,7 +7,7 @@
 //
 // Enforced: type (one or a list), properties, required, additionalProperties (false, true or absent - see below),
 // items (one schema), minItems / maxItems, minLength / maxLength (characters = code points; an escaped surrogate pair
-// is one; bounds up to kMaxLengthBound - 2026-10-05, Hermes Agent's own tests asked for maxLength), enum, const, anyOf, oneOf (as anyOf: exclusivity not checked), $ref to "#", "#/$defs/NAME"
+// is one; bounds up to kMaxLengthBound - Hermes Agent's schemas use maxLength), enum, const, anyOf, oneOf (as anyOf: exclusivity not checked), $ref to "#", "#/$defs/NAME"
 // or "#/definitions/NAME" ($defs / definitions at the root only), and `true` / `{}` (any value).
 // Ignored (annotations, no constraint): description, title, default, examples, $comment, $schema, $id, deprecated,
 // readOnly, writeOnly.

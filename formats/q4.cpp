@@ -10,7 +10,7 @@ namespace strix {
 
 namespace {
 
-// Same RNE conversion as the kernels and the Python study (torch .to(bfloat16)).
+// Same RNE conversion as the kernels and torch's .to(bfloat16).
 uint16_t f32_to_bf16(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
@@ -120,7 +120,7 @@ Q4ChunkMajor to_chunk_major(const Q4Weight &w, const char *what) {
 
 std::vector<float> dequantize_q4(const Q4Weight &q) {
     // q*s then +m, each rounded separately like torch's `q * s + m`: no FMA contraction, or the
-    // result could differ from the Python study quantizer in the last bit.
+    // result could differ from a torch reference quantizer in the last bit.
 #pragma clang fp contract(off)
     check_q4(q, "dequantize_q4");
     std::vector<float> w((size_t)(q.N * q.K));

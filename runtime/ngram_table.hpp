@@ -62,7 +62,7 @@ public:
         uint64_t requested = 0, unique = 0, hits = 0, reads = 0, prefetched = 0;
     };
     Stats stats() const;
-    // For measurements (tools/bench_replay --ple-after-prefill): empties the row cache (its counters stay), as after a
+    // For measurements: empties the row cache (its counters stay), as after a
     // server restart; and asks the kernel to drop the table file's clean pages from the page cache, as under memory
     // pressure (posix_fadvise DONTNEED - advisory: pages another process holds mapped may stay).
     void clear_cache() const;

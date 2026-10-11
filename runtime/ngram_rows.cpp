@@ -74,7 +74,7 @@ NgramRowsFromShards::~NgramRowsFromShards() {
 }
 
 // The rows are random 320-byte reads across 95 GiB of shards: one at a time they cost ~0.25 ms each cold (a 512-token
-// prefill chunk wants 8192 of them - ~2 s, rocprofv3 + wall clock at depth 8192, git d9dc5cc). So: sort and
+// prefill chunk wants 8192 of them - ~2 s at depth 8192). So: sort and
 // dedupe the ids (repeats are common - the hash heads share rows across tokens), fetch the unique rows with up to
 // kReadThreads concurrent preads (queue depth for the SSD), then scatter to the output order.
 void NgramRowsFromShards::gather(const int64_t *rows, int64_t n, uint16_t *out) const {

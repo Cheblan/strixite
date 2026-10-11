@@ -465,7 +465,7 @@ __device__ inline void row_select(const Src &src, int64_t n, int k, int32_t *out
     // the threshold (no barriers), one workgroup exclusive scan of the packed counts gives what comes before its
     // slice, then it writes its picks from there - ascending, ties to the lower block index. Replaced stepping
     // through the row 1024 blocks at a time with two flag scans (four barriers) a step: ~17 of 26.6 us at 12288
-    // blocks (deletion probe a50e6a7-probe3, bench_qsa T = 1).
+    // blocks (T = 1).
     const int64_t per = (n + kRowThreads - 1) / kRowThreads;
     const int64_t b0 = std::min<int64_t>(n, (int64_t)threadIdx.x * per), b1 = std::min<int64_t>(n, b0 + per);
     uint32_t gt = 0, eq = 0;
@@ -516,7 +516,7 @@ __global__ void __launch_bounds__(kRowThreads)
 
 // Filter top-k (long rows of many queries - deep prefill chunks): the split path reads a row four times (three
 // histogram passes and the select: 3.7 GB a layer per pass at 460k context, 8192 queries - 1,345 of a deep chunk's
-// 7,437 ms, profile d7ce6b8-pfprof490k). Here the row is read about once:
+// 7,437 ms). Here the row is read about once:
 //  1. bound: contiguous samples (kFilterSeg blocks every kFilterStride: ~1/16 of the row), one workgroup per query,
 //     to (at most) the sample ranked ~kFilterAim * k * samples / n - so about kFilterAim * k blocks of the whole row
 //     are expected at or above it;
@@ -529,7 +529,7 @@ __global__ void __launch_bounds__(kRowThreads)
 constexpr int64_t kFilterSeg = 64, kFilterStride = 1024;  // sampled blocks, and every how many
 // Candidates a query holds (the exact kernel's LDS, a power of two for its sort) and how many are aimed for, in
 // units of k: 2.5 k = 1280 keeps both misses (fewer than k, more than the cap) past ~4 sigma of the sample's rank
-// noise - at 1.5 k / 2048 a bench row (8192 queries, 131k) fell back ~6% of the time (counts 502-928, bench 08fa03f).
+// noise - at 1.5 k / 2048 a row (8192 queries, 131k) fell back ~6% of the time (counts 502-928).
 constexpr int64_t kFilterCap = 4096;
 constexpr double kFilterAim = 2.5;
 // Per-query filter words, at the workspace's end: bound, count, then kFilterCap (key, block) pairs (the bound kernel
@@ -547,8 +547,8 @@ __device__ inline int64_t filter_samples(int64_t n) {
 // LDS and the bound is the survivor of rank r - never above the true rank-r sample (the survivors are a subset of
 // the samples), so at worst a few more candidates. Radix passes over the samples serialized on LDS atomics (a row's
 // keys fall in a handful of bins): 1024 threads x 3 passes 40 ms, 256 x 2 passes 35 ms at 8192 queries x 117,760
-// blocks (rocprofv3 on bench_qsa, 471k); this way 17.6 ms - nearly all the scattered sample reads (one 4 KB page a
-// 64-block segment: the same reads from contiguous memory took 5.5 ms, probe). Contiguous segments would be cheaper
+// blocks (rocprofv3, 471k); this way 17.6 ms - nearly all the scattered sample reads (one 4 KB page a
+// 64-block segment: the same reads from contiguous memory took 5.5 ms). Contiguous segments would be cheaper
 // but RoPE gives the scores structure along the row: 1024 blocks every 16384 made the counts swing 206-2970.
 constexpr int kBoundPer = 4;
 constexpr int kBoundSurvivors = kThreads * kBoundPer;
@@ -941,7 +941,7 @@ static int64_t filter_words(int64_t T) { return T * kFwStride + 1; }
 size_t qsa_topk_workspace_bytes(int64_t T) {
     STRIX_CHECK(T >= 1 && T <= kMaxTokens, "qsa_topk_workspace_bytes: T = ", T, ", expected 1..", kMaxTokens);
     // The coop path's words for kQsaTopkRowMaxT queries first, then the split path's per query - fixed offsets, so a
-    // call with one T never meets words another T's call left behind (2026-10-01: the coop words sat at T * kWsStride,
+    // call with one T never meets words another T's call left behind (the coop words once sat at T * kWsStride,
     // and a decode call's counts landed inside a later prefill's split rows - NaNs in a real forward). The filter
     // path's words go at the very end (filter_words below), past every T's split rows: they aren't kept zero.
     return (size_t)(kCoopWords + T * kWsStride + filter_words(T)) * sizeof(uint32_t);
@@ -993,7 +993,7 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
         STRIX_HIP_CHECK_LAUNCH(fn, " filter exact T=", T, " pos0=", pos0, " k=", k);
         return;
     }
-    // Auto (bench_qsa 04e1b3d-coop, b263643, gfx1151): row up to 16384 blocks; past that coop for verifies (T = 5: 27.8 /
+    // Auto (gfx1151): row up to 16384 blocks; past that coop for verifies (T = 5: 27.8 /
     // 41.1 / 46.8 us at 16k / 32k / 64k blocks vs split 50.4 / 56.3 / 52.0) and for T = 1 up to 40960 blocks (23.7 /
     // 28.5 vs 31.2 / 31.8); T = 1 deeper keeps split (64k: coop 45.4 vs split 32.3).
     const bool coop_auto = small_t && nb > kQsaTopkRowMaxBlocks && (T > 1 || nb <= kQsaTopkCoopMaxBlocksT1);
@@ -1012,7 +1012,7 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
                         fn, " coop T=", T, " pos0=", pos0, " k=", k, " W=", W);
         return;
     }
-    // Row also for prefill chunks (any T) up to kQsaTopkRowMaxBlocks: T = 2048, bench_qsa aab7a9d - row 0.33 / 0.47 /
+    // Row also for prefill chunks (any T) up to kQsaTopkRowMaxBlocks: T = 2048 - row 0.33 / 0.47 /
     // 0.71 / 1.24 / 1.80 ms vs split 1.23 / 3.91 / 4.53 / 5.11 / 5.82 at 1k / 4k / 8k / 12k / 16k blocks; at 32k
     // blocks row 14.7 vs split 9.2, so split past the limit.
     if (path == TopkPath::Row || (path == TopkPath::Auto && nb <= kQsaTopkRowMaxBlocks)) {

@@ -9,7 +9,7 @@
 //       out q [Hk, Dk] | k [Hk, Dk] | v [Hv, Dv] per token;
 //   beta [T, Hv] = sigmoid(b), g [T, Hv] = -exp(A_log) * softplus(a + dt_bias)
 //       (softplus as torch: x for x > 20, else log1p(exp(x))).
-// It ends where the goldens' `delta.*` are captured: q/k are NOT L2-normed or
+// It ends before the delta rule: q/k are NOT L2-normed or
 // scaled here; that belongs to the delta-rule kernel. q/k stay per key head;
 // with Hv > Hk (target: 16 key / 48 value heads) value head h pairs with key
 // head h / (Hv/Hk), as transformers' repeat_interleave does.
@@ -83,7 +83,7 @@ void gdn_front(const void *in_proj, const GdnFrontShape &s, const float *conv_w,
 //              q_t.k_s)_{s <= t} U and S = e^(G_last) S0 + (e^(G_last - G_s)
 //              k_s)^T U. Chunks start at the call's first token.
 //   Auto picks PerToken for T < kDeltaRuleChunkMinT - for now every T: the
-//   chunked kernel is slower at every measured size (bench_gdn, results.jsonl)
+//   chunked kernel is slower at every measured size
 //   and is kept as the correct baseline to tune. MTP rollback is bit-exact
 //   only when the verify and the re-run take the same path.
 constexpr int64_t kGdnHeadDim = 128;  // Dk = Dv, both models

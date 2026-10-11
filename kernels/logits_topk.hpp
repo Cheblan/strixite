@@ -9,8 +9,7 @@
 // rest with (-inf, INT32_MAX).
 //
 // Measured before building: after every MTP verify the GPU idled ~0.3 ms
-// (bench) while the host copied and scanned the rows; Sampler on one cold row 0.059 ms (bench_sampler 738810b
-// cold variants, gfx1151).
+// while the host copied and scanned the rows; Sampler on one cold row 0.059 ms (gfx1151).
 //
 // A workgroup reduces 8,192 inputs to their best kLogitCands by rank counting (a threshold from the threads' bests, then
 // each candidate's place = the candidates better than it - no sequential picking); levels repeat it on the lists:

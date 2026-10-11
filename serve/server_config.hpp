@@ -82,8 +82,8 @@ private:
 constexpr int64_t kServedNgramCacheRows = 8388608;
 
 // strix_server's option table. models_dir: $STRIX_MODELS_DIR (else ~/models/strix-infer), under which the default
-// paths live. Every default is the served value (2026-10-10: the defaults are what a dedicated headless
-// Strix Halo serving a coding agent uses); tests/test_server_config.cpp checks deploy/strix-server.conf against them.
+// paths live. Every default is the served value (the defaults are what a dedicated headless Strix Halo serving a
+// coding agent uses), and deploy/strix-server.conf lists the same values.
 std::vector<ConfigOption> strix_server_options(const std::string &models_dir);
 
 }  // namespace strix

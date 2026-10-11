@@ -81,10 +81,11 @@ public:
     // ngram_cache_rows: the table's row cache (NgramTableRows; only a table file has one - another value with the
     // checkpoint directory is refused). yarn_factor: 1 = RoPE as trained (262,144 positions); > 1 = YaRN over
     // 262,144 * yarn_factor positions (kernels/rope.hpp rope_yarn) - every RoPE user (attention q/k, the QSA indexer,
-    // MTP) then rotates with the YaRN table, so caches made under another factor don't match.
+    // MTP) then rotates with the YaRN table, so caches made under another factor don't match. placement: where the
+    // weights live (runtime/strixw_loader.hpp; HostExperts is for test / bench tools, never the server).
     Qwen4ExpModel(const std::string &weights, const std::string &ngram, kernels::Act act,
                   bool allow_truncated = false, int64_t ngram_cache_rows = NgramTableRows::kDefaultCacheRows,
-                  float yarn_factor = 1.0f);
+                  float yarn_factor = 1.0f, WeightPlacement placement = WeightPlacement::Device);
     const Qwen4ExpDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }
     const StrixwDevice &weights() const { return *w_; }
@@ -171,13 +172,12 @@ private:
     DeviceBuffer<float> inv_freq_;
 };
 
-// What strix_server does at load when MTP is on, shared so the benches (bench_forward_qwen4exp, bench_replay) measure
-// the served path: the Q4 draft head copy (Qwen4ExpModel::make_draft_head_q4, group 64) over the rows the drafts
+// What strix_server does at load when MTP is on, shared so every tool that loads the model runs the served path: the Q4 draft head copy (Qwen4ExpModel::make_draft_head_q4, group 64) over the rows the drafts
 // score - mtp_vocab rows, or the whole vocabulary when mtp_vocab is 0. Returns the rows copied. Throws (from
 // make_draft_head_q4) when the model has no MTP head or mtp_vocab is outside 0..vocab.
 int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab);
 
-// Called with each intermediate under the goldens' names where they exist ("embed", "L<i>.attn_in",
+// Called with each intermediate under the reference implementation's names where they exist ("embed", "L<i>.attn_in",
 // "L<i>.mixer", "L<i>.mlp_in", "L<i>.router_logits", "L<i>.moe", "L<i>.out", "final_mixed") plus what a
 // sublayer-by-sublayer check needs ("L<i>.ple_in" / "L<i>.ple_out" (the streams around the PLE),
 // "L<i>.attn_w_in" / "L<i>.mlp_w_in" [T, 4] F32, "L<i>.router_ids" [T, A] I32, "L<i>.router_coef" [T, A] F32;
@@ -258,17 +258,15 @@ public:
     static constexpr int64_t kMaxLogits = 16;
     // Forwards of at least this many tokens run the MoE experts grouped by expert (each expert's weights read
     // once per tile, kernels/moe_grouped); shorter ones (decode, MTP verify) the per-slot kernels (grouped measured
-    // slower there: +5 ms a 2-token verify, bench 999c38d-grouped-*). Swept on U - gdn_in
-    // (git ca803c1-perslot / -grouped, prefill): T = 16 124 vs 99 t/s, 32 136 vs 131, 64 142 vs 154, 128 141 vs 166
-    // - break-even ~38 tokens, so 48. Re-swept after the F16 prefill GEMMs (2026-09-29, 3ab23cc-g* / -b* / -default*,
-    // one forward from position 0, ms): T = 6 58.8 per-slot vs 57.0 grouped, 8 72.0 vs 65.9, 12 100.0 vs 84.8, 20 152.6
+    // slower there: +5 ms a 2-token verify). Swept on the served layout (prefill): T = 16 124 vs 99 t/s, 32 136 vs 131, 64 142 vs 154, 128 141 vs 166
+    // - break-even ~38 tokens, so 48. Re-swept after the F16 prefill GEMMs (one forward from position 0, ms): T = 6 58.8 per-slot vs 57.0 grouped, 8 72.0 vs 65.9, 12 100.0 vs 84.8, 20 152.6
     // vs 118.4, 40 203.1 vs 109.8 - so 6. A 4-draft MTP verify (5 tokens) stays per-slot. Tool-call turns (12-32 new
-    // tokens, OCtest run 4) were paying 40-70 ms each for the old threshold.
+    // tokens) were paying 40-70 ms each for the old threshold.
     static constexpr int64_t kGroupedMinTokens = 6;
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
-    // mixes on the matrix units (a 64-row tile). Swept on U - gdn_in (git f53fb14, prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
+    // mixes on the matrix units (a 64-row tile). Swept on the served layout (prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
     // 24 131 vs 129, 32 136 vs 144, 48 145 vs 226 - break-even ~24-26, so 32. Re-swept with the experts grouped
-    // (2026-09-29, 3ab23cc, ms): T = 8 65.9 FP32 vs 76.8 WMMA, 10 78.8 vs 80.2, 12 84.7 vs 82.8, 16 101.0 vs 88.6, 24
+    // (ms): T = 8 65.9 FP32 vs 76.8 WMMA, 10 78.8 vs 80.2, 12 84.7 vs 82.8, 16 101.0 vs 88.6, 24
     // 131.3 vs 97.4 - so 12.
     static constexpr int64_t kWmmaMinTokens = 12;
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe = nullptr);
@@ -456,7 +454,7 @@ private:
     std::vector<int32_t> ple_lookahead_;  // set_lookahead's ids, for the next forward to start gathering
     // Small forwards' gathers (decode, MTP verify) run on one persistent thread, started when the forward starts, so
     // they overlap the embedding and layer 0 on the GPU instead of stalling it at the PLE layer - without a thread
-    // per token (std::async per token cost decode ~0.2 ms, 94cebaf). Jobs run in order; the gathers go in one at a
+    // per token (std::async per token cost decode ~0.2 ms). Jobs run in order; the gathers go in one at a
     // time (submit_alone). Declared after ple_host_ (and ple_pending_), so it's joined before the buffers it writes
     // are freed.
     class PleWorker {
