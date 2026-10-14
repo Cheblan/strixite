@@ -3,9 +3,34 @@
 #include "common/check.hpp"
 #include "serve/unicode.hpp"
 
+#include <cctype>
+
 namespace strix {
 
 namespace {
+
+// A past turn's thinking that ends in a budget stop is rendered without that last paragraph. A budget stop: a
+// paragraph of at most 300 bytes starting "Considering" that speaks of the user's time ("limited time", "time
+// constraint", "user's time"), any case - the engine's kThinkingStop, or the model's own copies of it. Sent back in
+// history (clients that return past reasoning), the injected sentence teaches the model to open its thinking with it
+// and skip thinking, in drifting wordings ("Considering the user's limited time, I have to answer directly ...",
+// "Considering the user's time constraints, I must answer directly from thinking right now."). The length bound keeps
+// a real conclusion that happens to start the same way.
+std::string drop_budget_stop(const std::string &reasoning) {
+    static const std::string kOpen = "considering";
+    static const char *const kTime[] = {"limited time", "time constraint", "user's time", "user\u2019s time"};
+    constexpr size_t kMaxStop = 300;
+    const size_t para = reasoning.rfind("\n\n");
+    const size_t start = para == std::string::npos ? 0 : para + 2;
+    if (reasoning.size() - start > kMaxStop) return reasoning;
+    std::string last = reasoning.substr(start);
+    for (char &ch : last) ch = (char)std::tolower((unsigned char)ch);
+    if (last.compare(0, kOpen.size(), kOpen) != 0) return reasoning;
+    bool about_time = false;
+    for (const char *k : kTime) about_time = about_time || last.find(k) != std::string::npos;
+    if (!about_time) return reasoning;
+    return unicode::python_strip(reasoning.substr(0, para == std::string::npos ? 0 : para));
+}
 
 constexpr const char *kXhigh =
     "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider "
@@ -30,8 +55,14 @@ bool ends_with(const std::string &s, const std::string &p) {
     return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0;
 }
 
-// The template's render_content macro, then |trim.
-std::string content_of(const json::Value &msg, const std::string &path, bool is_system) {
+// The template's render_content macro, then |trim. With vision on, an image part renders as one
+// sentinel character (0x01 - NOT 0x1f: Python's str.strip() treats 0x1c..0x1f as whitespace and would
+// trim a sentinel at a content edge, while interior text is kept byte-exactly); render_chat expands
+// the sentinels as it appends text. With vision off the v1 refusal stands, word for word.
+constexpr char kVisionSentinel = '\x01';
+constexpr const char *kVisionTokens = "<|vision_start|><|image_pad|><|vision_end|>";
+
+std::string content_of(const json::Value &msg, const std::string &path, bool is_system, bool vision) {
     const json::Value *c = msg.find("content");
     if (!c || c->is_null()) return "";
     if (c->is_string()) return unicode::python_strip(c->as_string(path));
@@ -47,10 +78,19 @@ std::string content_of(const json::Value &msg, const std::string &path, bool is_
         const bool image = part.find("image") || part.find("image_url") || (type && type->is_string() && type->as_string(pp) == "image");
         const bool video = part.find("video") || (type && type->is_string() && type->as_string(pp) == "video");
         STRIX_CHECK(!(is_system && (image || video)), "chat template: '", pp, "': System message cannot contain images or videos.");
-        STRIX_CHECK(!image && !video, "chat template: '", pp, "' is an image / video part; vision is not served (v1)");
+        STRIX_CHECK(!video, "chat template: '", pp, "' is a video part; videos are not served");
+        if (image) {
+            STRIX_CHECK(vision, "chat template: '", pp, "' is an image / video part; vision is not served (v1)");
+            out += kVisionSentinel;
+            continue;
+        }
         const json::Value *text = part.find("text");
         STRIX_CHECK(text != nullptr, "chat template: '", pp, "' has no 'text' (Unexpected item type in content.)");
-        out += text->as_string(pp + ".text");
+        const std::string &txt = text->as_string(pp + ".text");
+        STRIX_CHECK(!vision || txt.find(kVisionSentinel) == std::string::npos, "chat template: '", pp,
+                    ".text' contains byte 0x01, the expansion sentinel - it would render as an extra "
+                    "vision token run; strip it (or send vision off)");
+        out += txt;
     }
     return unicode::python_strip(out);
 }
@@ -95,7 +135,7 @@ std::optional<json::Value> arguments_of(const json::Value &call, const std::stri
 }  // namespace
 
 std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt,
-                        std::vector<std::pair<size_t, size_t>> *plain_spans) {
+                        std::vector<std::pair<size_t, size_t>> *plain_spans, bool vision) {
     if (plain_spans) plain_spans->clear();
     const auto &msgs = messages.as_array("messages");
     STRIX_CHECK(!msgs.empty(), "chat template: No messages provided.");
@@ -113,9 +153,23 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
 
     std::string out;
     // Appends request-supplied text, recording its span.
-    const auto plain = [&](const std::string &s) {
-        if (plain_spans && !s.empty()) plain_spans->emplace_back(out.size(), out.size() + s.size());
-        out += s;
+    // Request text, span-marked - except where the sentinels expand: the template's own vision tokens go
+    // in UNMARKED (a plain span means "the user's text - never a control token"; these are the server's
+    // control tokens). Without the sentinel path the lambda is today's, byte-identical.
+    const auto plain = [&](const std::string &raw) {
+        size_t at = 0;
+        while (at < raw.size()) {
+            const size_t nxt = vision ? raw.find(kVisionSentinel, at) : std::string::npos;
+            const std::string piece =
+                nxt == std::string::npos ? raw.substr(at) : raw.substr(at, nxt - at);
+            if (!piece.empty()) {
+                if (plain_spans) plain_spans->emplace_back(out.size(), out.size() + piece.size());
+                out += piece;
+            }
+            if (nxt == std::string::npos) break;
+            out += kVisionTokens;
+            at = nxt + 1;
+        }
     };
     const bool have_tools = tools && tools->is_array() && !tools->as_array("tools").empty();
     if (have_tools) {
@@ -126,12 +180,12 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         out += "\n</tools>";
         out += kToolsFormat;
         if (roles[0] == "system") {
-            const std::string c = content_of(msgs[0], "messages[0].content", true);
+            const std::string c = content_of(msgs[0], "messages[0].content", true, vision);
             if (!c.empty()) out += "\n\n", plain(c);
         }
         out += "<|im_end|>\n";
     } else if (roles[0] == "system") {
-        const std::string c = content_of(msgs[0], "messages[0].content", true);
+        const std::string c = content_of(msgs[0], "messages[0].content", true, vision);
         if (!c.empty()) {
             out += "<|im_start|>system\n" + (reasoning.empty() ? "" : reasoning + "\n\n");
             plain(c);
@@ -146,7 +200,7 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
     long last_query = -1;
     for (size_t k = msgs.size(); k-- > 0;) {
         if (roles[k] != "user") continue;
-        const std::string c = content_of(msgs[k], "messages[" + std::to_string(k) + "].content", false);
+        const std::string c = content_of(msgs[k], "messages[" + std::to_string(k) + "].content", false, vision);
         if (!(starts_with(c, "<tool_response>") && ends_with(c, "</tool_response>"))) {
             last_query = (long)k;
             break;
@@ -158,7 +212,10 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         const std::string path = "messages[" + std::to_string(k) + "]";
         const json::Value &m = msgs[k];
         const std::string &role = roles[k];
-        const std::string content = content_of(m, path + ".content", role == "system");
+        const std::string content = content_of(m, path + ".content", role == "system", vision);
+        if (role == "assistant")
+            STRIX_CHECK(content.find(kVisionSentinel) == std::string::npos, "chat template: '", path,
+                        ".content': assistant messages cannot contain image parts");
         if (role == "system") {
             STRIX_CHECK(k == 0, "chat template: '", path, "': System message must be at the beginning.");
         } else if (role == "user") {
@@ -176,7 +233,7 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         } else if (role == "assistant") {
             std::string reasoning_content;
             if (const json::Value *r = m.find("reasoning_content"); r && r->is_string())
-                reasoning_content = unicode::python_strip(r->as_string(path));
+                reasoning_content = drop_budget_stop(unicode::python_strip(r->as_string(path)));
             if (!opt.preserve_thinking.has_value() || *opt.preserve_thinking || (long)k > last_query)
                 out += "<|im_start|>assistant\n<think>\n" + reasoning_content + "\n</think>\n\n" + content;
             else

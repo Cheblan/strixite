@@ -7,6 +7,7 @@
 #include "serve/chat_template.hpp"
 #include "serve/engine.hpp"
 #include "serve/json.hpp"
+#include "serve/vision_request.hpp"
 
 #include <optional>
 #include <stdexcept>
@@ -26,6 +27,10 @@ std::string error_body(const std::string &message, const std::string &type, cons
 
 struct ChatRequest {
     json::Value messages, tools;  // tools: null unless a non-empty array that will be rendered
+    // Image parts (vision, Phase D; stream order, matching the template's single pads): parsed here (data
+    // URLs only) when the server has vision - empty for text requests. vision off: image parts stay the
+    // today's 400.
+    std::vector<vision::ParsedImage> images;
     bool stream = false;
     bool return_progress = false;  // streamed: prefill progress as data chunks (prompt_progress_chunk_body)
     std::string model;  // as asked (any name is served: logged, not refused)
@@ -72,8 +77,11 @@ bool thinking_left_out(const ChatRequest &r, int64_t max_tokens);
 bool thinking_requested(const ChatRequest &r);
 constexpr int64_t kExplicitAnswerRoom = 64;
 
-// Validates body (already parsed JSON) against the contract. defaults: generation_config's sampling values.
-ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &defaults);
+// Validates body (already parsed JSON) against the contract. defaults: generation_config's sampling
+// values. vision_enabled (the server's tower): image_url / image parts are parsed into r.images instead of
+// the (unchanged) 400; remote URLs and other media types are 400s either way.
+ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &defaults,
+                               bool vision_enabled = false);
 
 // max_tokens against the room the prompt leaves: returns the tokens to allow and sets clamped when the request
 // asked for more (or for nothing, meaning "all the room"). Throws ApiError 400 when the prompt alone fills the

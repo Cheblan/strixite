@@ -9,11 +9,12 @@
 namespace strix {
 
 Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp,
-                                 int64_t mtp_vocab)
+                                 int64_t mtp_vocab, const PrecisionOptions &precision)
     : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp()),
       snapshots_{session_.make_snapshot(), session_.make_snapshot(), session_.make_snapshot(),
                  session_.make_snapshot()} {
     STRIX_CHECK(mtp_vocab >= 0, "Qwen4ExpBackend: mtp_vocab ", mtp_vocab, ", expected >= 0 (0 = the whole vocabulary)");
+    session_.set_precision(precision);
     if (mtp_vocab > 0) session_.set_mtp_vocab(mtp_vocab);
 }
 
@@ -71,10 +72,13 @@ std::string Qwen4ExpBackend::state_fingerprint() const {
     // under the same factor (" yarn<f>"; nothing without YaRN, so the plain entries stay valid).
     char yarn[32] = "";
     if (model_.dims().yarn_factor > 1.0f) std::snprintf(yarn, sizeof yarn, " yarn%g", (double)model_.dims().yarn_factor);
-    const int n = std::snprintf(buf, sizeof buf, "qwen4exp-state-v2 %s layout-%016llx %s L%lld%s%s",
+    // Precision: a state built with a non-exact step is not the one the exact math builds (" gdn=fast"; nothing when
+    // all exact, so the existing entries stay valid).
+    const std::string prec = session_.precision().exact() ? std::string() : " " + session_.precision().describe();
+    const int n = std::snprintf(buf, sizeof buf, "qwen4exp-state-v2 %s layout-%016llx %s L%lld%s%s%s",
                                 f.meta("source_fingerprint").c_str(), (unsigned long long)strix_hash64(layout.data(), layout.size()),
                                 kernels::act_name(model_.act()), (long long)model_.dims().layers,
-                                session_.has_mtp() ? " mtp" : "", yarn);
+                                session_.has_mtp() ? " mtp" : "", yarn, prec.c_str());
     STRIX_CHECK(n > 0 && n < (int)sizeof buf, "Qwen4ExpBackend::state_fingerprint: ", n, " characters, expected < ", sizeof buf);
     return buf;
 }
@@ -83,8 +87,9 @@ std::string Qwen4ExpBackend::describe() const {
     const StrixwFile &f = model_.weights().file();
     return "qwen4exp, " + std::to_string(model_.dims().layers) + " layers, layout " + f.meta("layout") + ", " +
            kernels::act_name(model_.act()) + ", capacity " + std::to_string(capacity()) + ", chunk " +
-           std::to_string(max_chunk()) +
-           (has_mtp() ? ", mtp (draft vocabulary " + std::to_string(session_.mtp_vocab()) + ")" : "") + [&] {
+           std::to_string(max_chunk()) + ", precision " + session_.precision().describe() +
+           (has_mtp() ? ", mtp (draft vocabulary " + std::to_string(session_.mtp_vocab()) + ")" : "") +
+           (model_.has_vision() ? ", vision tower on" : "") + [&] {
                const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
                return t ? ", n-gram row cache " + std::to_string(t->cache_rows()) + " rows" : std::string();
            }();
@@ -103,6 +108,28 @@ LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_lo
     else session_.want_candidates(n_valid);
     if (verify) session_.forward_verify(ids, n_logits);
     else session_.forward(ids, n_logits);
+    return candidate_rows(n_logits);
+}
+
+LogitRows Qwen4ExpBackend::forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &image,
+                                                 const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                                 int64_t n_valid, const LogitMasks *masks) {
+    STRIX_CHECK(model_.has_vision(), "Qwen4ExpBackend::forward_image_prefill: the model was loaded without "
+                "a vision.strixw - image prompts are refused (config vision)");
+    if (masks != nullptr)
+        masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_image_prefill");
+    session_.set_positions(pos3);  // the walk's triples for exactly this forward's rows (Phase A checks)
+    ImageInput in;
+    in.pixel_values = image.prefill.pixel_values;  // one copy per image forward (the block runs once)
+    in.grid_t = image.prefill.grid_t, in.grid_h = image.prefill.grid_h, in.grid_w = image.prefill.grid_w;
+    if (!cands || n_logits == 0) {
+        LogitRows l = LogitRows::from_full(session_.forward(ids, n_logits, &in), logits_row());
+        if (masks != nullptr) apply_masks(l, *masks);
+        return l;
+    }
+    if (masks != nullptr) session_.want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
+    else session_.want_candidates(n_valid);
+    session_.forward(ids, n_logits, &in);
     return candidate_rows(n_logits);
 }
 

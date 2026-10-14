@@ -9,6 +9,7 @@
 #include "serve/engine.hpp"
 #include "serve/grammar_cache.hpp"
 #include "serve/tokenizer.hpp"
+#include "serve/vision_request.hpp"
 
 #include <atomic>
 #include <memory>
@@ -28,8 +29,15 @@ struct ServerConfig {
     // Thinking for requests that don't say (no enable_thinking in any spelling, no reasoning_effort, no budget): false
     // renders them without the think block (config `thinking`).
     bool thinking_default = true;
+    // thinking-cap: the cap on thinking tokens for requests that name no budget of their own (0 = off). A request's own
+    // budget always wins. thinking-cap-grace: past the cap, at most this many more thinking tokens while the engine
+    // waits for a sentence end (GenerationRequest::thinking_budget_grace).
+    int64_t thinking_cap = 0, thinking_cap_grace = 0;
     double keepalive_s = 10;  // SSE comment interval while nothing else is sent
     size_t max_body_bytes = 64u << 20;
+    // Vision (Phase D): non-null when the server loaded with vision on - the image parts parse, preprocess
+    // (on the HTTP thread) and reach the engine; /health reports engine_.backend().has_vision().
+    const vision::ServedVision *vision = nullptr;
 };
 
 class HttpServer {

@@ -227,6 +227,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "converted weights (strixw); the shipping layout U - gdn_in - g128 by default"},
         {"ngram", K::Path, 0, 0, models_dir + "/converted/Qwen3.8-Flash-Next.ngram-q8/ngram.table",
          "the n-gram table (int8 rows)"},
+        {"vision", K::OnOff, 0, 0, "on",
+         "image input: load vision.strixw from the weights' directory, allow image parts "
+         "(data: URLs only); off keeps image parts the 400, loads no tower, and serves no image kernels"},
         {"tokenizer", K::Path, 0, 0, ckpt + "/tokenizer.json", "tokenizer.json"},
         {"generation-config", K::Path, 0, 0, ckpt + "/generation_config.json",
          "generation_config.json: the sampling defaults (temperature, top_k, top_p)"},
@@ -257,6 +260,11 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"prompt-cache-delta-max-tokens", K::Int, 0, 1 << 24, std::to_string(cache.delta_max_tokens),
          "a turn is saved as a delta on the whole entry it extends while it adds at most this many tokens (and a "
          "quarter of the base); 0 = every entry whole"},
+        {"gdn-precision", K::Text, 0, 0, "exact",
+         "prefill delta rule products: exact (BF16 hi + lo, near FP32) or fast (one BF16 product, ~3.5% faster prefill "
+         "at 120k, state error ~3e-3)"},
+        {"attention-precision", K::Text, 0, 0, "exact",
+         "prefill attention's P * V: exact (P as BF16 hi + lo) or fast (P as one BF16 term, as flash attention does)"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
         // MTP defaults: chained drafts at margin 2.0 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).
@@ -281,6 +289,15 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"think-nudge-wording", K::Text, 0, 0, "commit",
          "thinking nudge 1's text: commit (\"... commit to the most promising approach now\") or decide (\"... state my "
          "decision and the exact next command\")"},
+        {"placement", K::Text, 0, 0, "device",
+         "where the weights live: device, or host-experts (the expert stacks in pinned host RAM - for GPUs too small "
+         "for the model; slow, test machines only)"},
+        {"thinking-cap", K::Int, 0, 1 << 20, "2048",
+         "a cap on thinking tokens for requests that set no budget of their own (0 = off); the thinking budget's stop "
+         "closes the block and the model answers"},
+        {"thinking-cap-grace", K::Int, 0, 1 << 16, "256",
+         "past the thinking cap, wait at most this many more thinking tokens for a sentence end before the stop (0 = stop "
+         "at the cap)"},
         {"thinking", K::OnOff, 0, 0, "on",
          "thinking for requests that don't say (enable_thinking / thinking.type / reasoning_effort / a budget); off = "
          "rendered without the think block unless the request asks"},

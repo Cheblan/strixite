@@ -24,6 +24,8 @@
 
 #include "kernels/embedding.hpp"
 #include "kernels/logits_topk.hpp"
+#include "kernels/attention.hpp"  // AttnPrecision
+#include "kernels/gdn.hpp"        // DrPrecision
 #include "kernels/norm.hpp"  // Act
 #include "runtime/device_buffer.hpp"
 #include "runtime/ngram_rows.hpp"
@@ -32,7 +34,9 @@
 #include "runtime/q4_device.hpp"
 #include "runtime/qweight.hpp"
 #include "runtime/strixw_loader.hpp"
+#include "runtime/vision_tower.hpp"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -43,6 +47,7 @@
 #include <thread>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace strix {
@@ -72,6 +77,10 @@ struct Qwen4ExpDims {
     int64_t dense_key_limit() const { return qsa_budget + 3; }  // up to here the indexer keeps every key
 };
 
+// config.json image_token_id: the placeholder whose expanded copies mark the rows where the vision
+// tower's merged rows replace the token embeddings (the id is in the vocabulary, below vocab).
+constexpr int32_t kVisionImageTokenId = 248056;
+
 class Qwen4ExpModel {
 public:
     // weights: a weights.strixw with every decoder layer and the globals. ngram: where the PLE n-gram rows come from
@@ -83,14 +92,23 @@ public:
     // 262,144 * yarn_factor positions (kernels/rope.hpp rope_yarn) - every RoPE user (attention q/k, the QSA indexer,
     // MTP) then rotates with the YaRN table, so caches made under another factor don't match. placement: where the
     // weights live (runtime/strixw_loader.hpp; HostExperts is for test / bench tools, never the server).
+    // vision: a vision.strixw (the tower file the converter's --vision pass writes) to load the image tower
+    // behind, empty (the default, the served config) = no tower - nothing loaded, Qwen4ExpSession::forward's
+    // image overload refuses. Its source_fingerprint must match the text weights' (the same side-file rule the
+    // n-gram table follows), so both come from the same checkpoint.
     Qwen4ExpModel(const std::string &weights, const std::string &ngram, kernels::Act act,
                   bool allow_truncated = false, int64_t ngram_cache_rows = NgramTableRows::kDefaultCacheRows,
-                  float yarn_factor = 1.0f, WeightPlacement placement = WeightPlacement::Device);
+                  float yarn_factor = 1.0f, WeightPlacement placement = WeightPlacement::Device,
+                  const std::string &vision = "");
     const Qwen4ExpDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }
     const StrixwDevice &weights() const { return *w_; }
     bool truncated() const { return truncated_; }
     bool shared_separate() const { return shared_separate_; }
+    // The image tower: loaded only when the constructor got a vision file. vision() throws without one
+    // (no fallback path - the session's image forward is the only reader and it checks first).
+    bool has_vision() const { return vision_ != nullptr; }
+    const VisionTower &vision() const;
 
     struct Hc {
         QWeightView down;        // [r (+ H), 4d], hc_norm folded in; Q4 or Q8
@@ -158,6 +176,7 @@ private:
     Qwen4ExpDims dims_;
     kernels::Act act_;
     std::unique_ptr<StrixwDevice> w_;
+    std::unique_ptr<VisionTower> vision_;  // the constructor's vision file, empty = no tower
     std::unique_ptr<NgramRowSource> ngram_;
     std::vector<Layer> layers_;
     const uint16_t *embed_ = nullptr;
@@ -193,6 +212,19 @@ using Qwen4ExpProbe =
 // Decode (and forwards below kWmmaMinTokens / kGroupedMinTokens) is the same either way.
 enum class PrefillMath { F32, WmmaBf16 };
 
+// Per-step precision / speed choices (the server's gdn-precision and attention-precision). The defaults
+// are the exact math; every non-default choice changes the numbers a forward produces, so it is part of the prompt
+// cache's state fingerprint and of every logged result.
+struct PrecisionOptions {
+    kernels::DrPrecision gdn = kernels::DrPrecision::Exact;          // the prefill delta rule's products
+    kernels::AttnPrecision attention = kernels::AttnPrecision::Exact;  // the prefill attention's P * V
+    bool exact() const { return gdn == kernels::DrPrecision::Exact && attention == kernels::AttnPrecision::Exact; }
+    std::string describe() const;  // "gdn=exact attention=exact"
+};
+// "exact" / "fast" -> DrPrecision; anything else throws, naming the choices.
+kernels::DrPrecision parse_gdn_precision(const std::string &v);
+kernels::AttnPrecision parse_attention_precision(const std::string &v);
+
 // The sequence state at one position, for resuming there later (prompt reuse): every
 // GDN layer's conv + recurrent state, every attention layer's indexer tail (the incomplete QSA block's keys), the
 // PLE conv state and n-gram history. The KV cache and block keys below the position aren't copied - later calls only
@@ -200,9 +232,47 @@ enum class PrefillMath { F32, WmmaBf16 };
 // snapshot's position (Qwen4ExpSession::can_restore tracks that). With MTP on, also the MTP layer's indexer tail
 // and the trunk's streams after the last position (the next MTP row's input). ~110 MiB on the target, allocated
 // once by Qwen4ExpSession::make_snapshot and reused.
+// The first bytes of an exported state (export_state / import_state): version, then the mRoPE position state.
+// Version 1 is the first layout that carries it; a blob without the header (version 0, before Phase A) is
+// refused - the prompt cache's disk entries from before it are comparison-only and get dropped, never guessed
+// at (no fallback path). The header carries the state's rope_delta, whether its prefix contained image rows,
+// and the continuation rule of row n plus the last (up to 3) rows' triples - the same rule Qwen4ExpSnapshot
+// carries, and the same data an import needs to rope the first forward's block window exactly (import_state
+// accepts a uniform-tail state without the triples, an image-tail one with them, and refuses the rest -
+// restore's rule, which has the snapshot's tail already).
+struct Qwen4ExpStateHeader {
+    static constexpr uint32_t kMagic = 0x3165706D;  // bytes 'm','p','e','1': 829M, above any token id, so it can
+                                                     // never alias the version-0 blob's first word (the n-gram
+                                                     // history's int64 token id)
+    static constexpr uint32_t kVersion = 1;         // the state blob layout (this struct's presence and fields)
+    uint32_t magic = kMagic;
+    uint32_t version = kVersion;
+    int64_t rope_delta = 0;        // rows after the last image: rope angle at seq + delta
+    int64_t cont_t = 0, cont_h = 0, cont_w = 0;  // the (t,h,w) sections of row n (the state's continuation rule)
+    int64_t has_image = 0;         // 1: the prefix contained interleaved (image) rows
+    int64_t ntriples = 0;          // 0..3 trailing rows the triples array holds (valid when has_image)
+    int64_t triples[9] = {};       // their (t,h,w), oldest first: rows [n - ntriples, n)
+};
+static_assert(std::is_standard_layout_v<Qwen4ExpStateHeader> && std::is_trivially_copyable_v<Qwen4ExpStateHeader>,
+              "the state header is memcpy'd as raw bytes");
+
+// mRoPE (vision Phase A): the interleaved-position state at the saved position - rope_delta and the
+// continuation rule, plus the last 3 rows' section triples (enough to continue a uniform text span, the only
+// resume point until image serving: mid-image resume isn't a thing yet). has_triples(): the prefix ran
+// interleaved; restore() refuses a saved position whose last rows were image rows (with today's serve there are
+// no interleaved sessions at all - set_positions has no caller until Phase B - so no served snapshot carries
+// triples).
 class Qwen4ExpSnapshot {
 public:
     int64_t pos() const { return pos_; }  // -1 until saved
+    // the saved rope_delta (0 for a prefix without images) and the continuation rule for the first row after
+    // pos(): all three sections = pos() + rope_delta() when the saved span was uniform, the last saved row's
+    // +1 in (h, w) when it was an image row (an image-span resume - restore refuses those today).
+    int64_t rope_delta() const { return rope_delta_; }
+    const int64_t *first_continuation() const { return first_cont_.data(); }  // [3] for row pos()
+    bool has_triples() const { return ntriples_ > 0; }
+    int64_t ntriples() const { return ntriples_; }              // 0..3
+    const int64_t *triples() const { return triples_.data(); }  // last ntriples_ saved rows' [row][3]
 private:
     friend class Qwen4ExpSession;
     int64_t pos_ = -1;
@@ -211,6 +281,22 @@ private:
     std::vector<DeviceBuffer<float>> rec_;
     DeviceBuffer<uint8_t> ple_state_, mtp_tail_, mtp_prev_;
     PleHistory ple_hist_;
+    int64_t rope_delta_ = 0;
+    std::array<int64_t, 3> first_cont_{0, 0, 0};  // continuation sections of row pos_ (computed by save())
+    int64_t ntriples_ = 0;
+    std::vector<int64_t> triples_;  // ntriples_ * 3 host int64 (empty until a save with an interleaved prefix)
+};
+
+// One image for a forward (the vision build's forward extension): the tower's input rows, FP32 on the
+// host, [grid_t * grid_h * grid_w, in_channels x temporal_patch x patch x patch] in the processor's
+// merge-block order (the packing the tower is gated against - the preprocessing that produces it is a
+// later step), and the grid. grid_t must be 1 (images; video isn't built). forward() with an ImageInput
+// runs the tower over these rows and scatters its merged rows at the image_token_id positions of ids -
+// the caller expands the placeholders first and pairs the call with set_positions (the (t,h,w) triples
+// of the image rows: t = the block start, h/w its within-block indices, the walk's rule).
+struct ImageInput {
+    std::vector<float> pixel_values;  // host FP32, grid_t * grid_h * grid_w rows
+    int64_t grid_t = 0, grid_h = 0, grid_w = 0;
 };
 
 class Qwen4ExpSession {
@@ -220,6 +306,9 @@ public:
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
                     PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false);
     PrefillMath prefill_math() const { return prefill_math_; }
+    // The kernel-step precision choices for every forward from now on (default: all exact).
+    void set_precision(const PrecisionOptions &p);
+    const PrecisionOptions &precision() const { return precision_; }
     ~Qwen4ExpSession();
     Qwen4ExpSession(const Qwen4ExpSession &) = delete;
     Qwen4ExpSession &operator=(const Qwen4ExpSession &) = delete;
@@ -229,15 +318,39 @@ public:
     int64_t capacity() const { return capacity_; }
     int64_t max_tokens() const { return max_tokens_; }
 
+    // ---------------------------------------------------- interleaved mRoPE positions (the vision build plan step 3,
+    // Phase A). The trunk's rope is interleaved mRoPE: every row carries (t, h, w) section positions and pair j
+    // rotates with triple[j % 3] (kernels/rope.hpp MropePos). Text-only rows have all three sections equal and
+    // need no per-row data - after an image block the text rows continue at (max position of the image span + 1),
+    // which is a constant rope_delta = (continuation of the last row) - (sequence index of the next row) from
+    // then on. Until a caller sets positions (Phase B does, per image prompt) every session is text-only and
+    // this whole layer costs exactly nothing: no upload, the scalar kernels unchanged.
+    //
+    // pos3: 3 * rows host int64 (the (t,h,w) section positions of the next forward's rows, sequence order; not
+    // sequence indices). Empty (the default of every text-only call) = today's scalar pos() + t path. The rows
+    // must start exactly at pos() (a partial image row is never a forward's row 0) and every section value must
+    // be a position the model can represent. set_positions before forward / forward_verify consumes it; before
+    // any of the other calls that touch position (forward_mtp, save, import_state) it is refused.
+    void set_positions(std::vector<int64_t> pos3);
+    int64_t rope_delta() const { return rope_delta_; }  // rows after the last image: rope angle at seq + delta
+    // The rope angle position of sequence position seq on the scalar path (seq + rope_delta). Sequence-index
+    // uses (cache rows, QSA block counts, dense-limit checks) stay seq - only rope angles use this.
+    int64_t rope_pos(int64_t seq) const { return seq + rope_delta_; }
+
     // Snapshots (Qwen4ExpSnapshot): make one (allocates), save the state at pos() into it, and later restore it -
     // which needs every rewind since the save (reset() or a restore()) to have gone no lower than its position.
     Qwen4ExpSnapshot make_snapshot() const;
     void save(Qwen4ExpSnapshot &s);
     bool can_restore(const Qwen4ExpSnapshot &s) const;
-    void restore(const Qwen4ExpSnapshot &s);  // throws unless can_restore(s); pos() = s.pos() after
+    // throws unless can_restore(s); pos() = s.pos() after. An interleaved snapshot whose saved rows end inside an
+    // image span (has_triples, continuation != uniform) is refused: mid-image resume isn't a thing yet
+    // (vision Phase A); a snapshot ended after the image resumes at rope_delta as if it had
+    // always been scalar.
+    void restore(const Qwen4ExpSnapshot &s);
 
-    // Host export / import of a whole state, for the disk prompt cache: the n-gram
-    // history, then per layer - attention: K and V rows [0, n), block keys of the n / 4 complete blocks
+    // Host export / import of a whole state, for the disk prompt cache: the mRoPE header (Qwen4ExpStateHeader:
+    // version, rope_delta, has_image, the continuation rule for row n) first, then the n-gram history, then per
+    // layer - attention: K and V rows [0, n), block keys of the n / 4 complete blocks
     // (packed [chunk][block][8]; on the device they're chunk-major with the capacity as the stride), the indexer
     // tail; GDN: conv and recurrent state - then the PLE conv state; with MTP on, then the MTP layer's K and V rows,
     // block keys and indexer tail, and the trunk's streams after position n - 1. state_bytes(n) is its size.
@@ -270,6 +383,15 @@ public:
     // 131.3 vs 97.4 - so 12.
     static constexpr int64_t kWmmaMinTokens = 12;
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe = nullptr);
+    // The image forward (the vision build's forward extension): runs the tower over the image and
+    // scatters its merged rows at the image_token_id positions of ids, then forwards exactly like the
+    // overload above - which itself is this one with no image (the text path stays bit-identical and
+    // touches nothing new). Needs a model loaded with a vision file. The checks that refuse a mismatch:
+    // the tower's rows must equal the ids' image_token_id count; grid_t must be 1; and the call must
+    // carry its set_positions triples (the image rows' (t,h,w) - set_positions already validated they
+    // continue the walk), so an image can't forward with plain scalar positions by mistake.
+    std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const ImageInput *image,
+                               const Qwen4ExpProbe &probe = nullptr);
     // The next forward / forward_verify (one call) reduces its logits rows on the GPU to each row's top
     // kernels::kLogitCands candidates over ids [0, n_valid) (kernels/logits_topk) and copies only those back: it
     // returns an empty vector, candidates() holds them. n_valid: 1..vocab. Measured reason: the host
@@ -288,7 +410,11 @@ public:
     // set (the ones before it kept); then exactly one of keep_verify() (the spare set becomes current: as if it were
     // forward()) or drop_verify() (the session is back where it was before the call - position, GDN, PLE, indexer
     // tails, MTP state), before any other call. The spare set (~110 MiB) is allocated on the first use.
-    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits);
+    // pos3 (mRoPE): interleaved triples for the verify's rows (set_positions semantics; consumed here instead of
+    // by the next forward). The engine passed them to the draft forwards the tokens were produced with, so it
+    // knows them; keep_verify_prefix / drop_verify truncate the history with them.
+    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
+                                      const std::vector<int64_t> &pos3 = {});
     void keep_verify();
     void drop_verify();
     // The third way out of a verify: keep only its first `rows` (1 <= rows < its size) - the state as if forward()
@@ -350,6 +476,7 @@ private:
     // and pos_ still there (any forward moves it; restores need snapshots, which an import invalidates).
     int64_t imported_at_ = -1;
     PrefillMath prefill_math_;
+    PrecisionOptions precision_;
     hipStream_t stream_ = nullptr;
     // Per-layer state (empty buffers for the other kind).
     std::vector<DeviceBuffer<uint8_t>> k_cache_, v_cache_, block_keys_, tail_[2], conv_state_;
@@ -415,6 +542,62 @@ private:
     DeviceBuffer<float> group_partial_;
     size_t group_ws_bytes_ = 0;
     DeviceBuffer<kernels::EmbeddingError> emb_err_;
+    // ---------------------------------------- interleaved mRoPE position state (vision Phase A)
+    // rope_delta_ / history_ever_interleaved_ are the scalars; pos3_host_ holds the (t,h,w) triples of every row
+    // from the first interleaved forward on (rows before it are uniform at rope_delta 0 - never stored). The
+    // upload array covers a forward's block span [4*(pos_/4), pos_+T): the jobs read it at an offset (their rows
+    // start at pos_), qsa_block_keys needs the block's first key's triple, which can be a tail row before pos_.
+    // Never touched (not one byte uploaded) while no positions are set - the text path's cost is two int64 adds.
+    int64_t rope_delta_ = 0;
+    bool history_ever_interleaved_ = false;  // the current prefix contains interleaved (image) rows
+    // History rows [pos3_start_, pos3Hend()), pos3Hend() == pos_ always once non-empty: the full spans from the
+    // first interleaved forward on, or (after a restore) the snapshot's last 3 rows - only the rows at or near
+    // pos_ are ever read back. 3 int64 (t,h,w) per row.
+    int64_t pos3_start_ = 0;
+    std::vector<int64_t> pos3_host_;
+    int64_t pos3Hend() const { return pos3_start_ + (int64_t)pos3_host_.size() / 3; }  // == pos_ when non-empty
+    std::vector<int64_t> pending3_;          // set_positions payload for the next forward (empty = scalar path)
+    DeviceBuffer<int64_t> pos3_dev_;         // the upload array, 3 * capacity_ int64, allocated on first use
+    // The spans prepare_positions() last prepared (see .cpp): mk_block_'s rows start at 4*(seq/4), mk_jobs_'s at
+    // seq; both null while the last prepared forward is on today's scalar path.
+    kernels::MropePos mk_block_{}, mk_jobs_{};
+    std::vector<int64_t> stage3_;            // host staging for the upload (no allocation on the scalar path)
+    // forward_verify's mRoPE bookkeeping: the history / delta / image flag as they were before it (drop_verify
+    // restores them; keep_verify keeps, keep_verify_prefix truncates the forward-appended rows in place).
+    std::vector<int64_t> verify_hist_before_;
+    int64_t verify_hist_start_before_ = 0, verify_delta_before_ = 0;
+    bool verify_ever_before_ = false;
+    // Upload probe for tests (STRIX_POS_PROBE=<dir> env, read once): appends one UploadTrace per prepared span
+    // per forward to <dir>/uploads.bin - lets a test see exactly what the kernels would receive, including that
+    // a text-only forward prepares nothing. Null when unset (the normal path; the only per-forward extra is a
+    // pointer test).
+    struct UploadTrace {
+        int64_t seq, n;
+        int64_t block_base, block_rows;  // -1: scalar path (null)
+        int64_t jobs_base, jobs_rows;
+    };
+    void trace_upload(const UploadTrace &p) const;
+    // Point pos3_dev_ at the forward's block span [4*(seq/4), seq+n) (uploading whenever a window row differs
+    // from the scalar values or the session has a rope_delta) and set mk_block_ / mk_jobs_. Called by every
+    // forward body (trunk + MTP parts, after its pending rows joined the history), by keep_verify_prefix and
+    // by run_mtp; the scalar kernels' angle base gets rope_delta added by the callers.
+    void prepare_positions(int64_t seq, int64_t n);
+    // ---------------------------------------- image forward (vision Phase B): the tower's scratch and the
+    // one image's tower run + scatter. The scratch starts empty and only ever serves an image forward -
+    // a text-only session allocates nothing for it (the text path stays byte-identical, upload_probe
+    // included). Sized for the largest grid seen (grow-on-larger; a grid past the attention cap is
+    // refused before anything is touched), so a session that has seen a 1080p screenshot holds ~280 MB
+    // of tower scratch at the 8192-patch cap - the accepted cost of vision = on.
+    DeviceBuffer<uint8_t> vis_pv_, vis_x_, vis_conv_, vis_ln_, vis_proj_, vis_qkv_, vis_mlp_, vis_merg_,
+        vis_merged_;
+    DeviceBuffer<int32_t> vis_idx_, vis_rows_;
+    DeviceBuffer<float> vis_w_;
+    int64_t vis_patches_ = 0;  // the scratch's patch count (0: never allocated)
+    void ensure_vision_scratch(int64_t grid_h, int64_t grid_w);
+    // Validates the image against the model and the id stream, runs the tower, and scatters its rows
+    // over the embedding's rows in x_ at the image_token_id positions. Called from forward_impl right
+    // after the embedding launch.
+    void run_tower_and_scatter(const std::vector<int32_t> &ids, const ImageInput &image);
     // Pinned: the error words at 0 (router, experts, attention - 3 words each), the embedding slot at
     // kReadbackEmbAt, the logits from kReadbackLogitsAt. read_back fills and checks it at the end of a forward.
     static constexpr size_t kReadbackEmbAt = 64, kReadbackLogitsAt = 128;

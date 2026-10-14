@@ -19,6 +19,7 @@
 // so the score kernel's lanes (one block each) read one contiguous run per 16-byte load.
 
 #include "kernels/norm.hpp"  // Act
+#include "kernels/rope.hpp"  // MropePos
 
 #include "common/hip_runtime.hpp"
 
@@ -34,10 +35,13 @@ constexpr int64_t kQsaBlock = 4;  // tokens per indexer block (indexer_compress_
 // position order; unused when pos0 % 4 == 0); tail_out receives those of 4*((pos0+T)/4) .. pos0+T-1 - a
 // separate buffer (another block may still read tail_in). Writes the block keys of every block completing
 // in this call. k_norm [D] FP32 (1 + w); inv_freq: rot_dim/2 device floats (rope_inv_freq or rope_yarn);
-// cos_sin_scale: YaRN's attention factor (kernels/rope.hpp), 1 = plain RoPE.
+// cos_sin_scale: YaRN's attention factor (kernels/rope.hpp), 1 = plain RoPE. pos3 (kernels/rope.hpp MropePos):
+// interleaved-mRoPE section triples for the sequence positions the block keys rope at (each block's first key),
+// base = 4*(pos0/4), null = scalar (text-only, today's values bit for bit).
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
-                    void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale = 1.0f);
+                    void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,
+                    const MropePos &pos3 = {});
 
 // q: normed + roped indexer queries, (t, h, d) at q[t*q_ts + h*q_hs + d], H heads (<= 8) x D (% 8 == 0,
 // <= 256). scores [T, ld] F32: row t has its (pos0 + t + 1) / 4 complete blocks' scores; the rest of the

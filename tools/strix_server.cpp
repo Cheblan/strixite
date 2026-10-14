@@ -19,6 +19,8 @@
 #include "serve/qwen4exp_backend.hpp"
 #include "serve/server_config.hpp"
 #include "serve/tokenizer.hpp"
+#include "serve/vision_request.hpp"
+#include "kernels/vision.hpp"  // kernels::kMaxVisionSeq (the attention cap = the resize clamp)
 
 #include <chrono>
 #include <atomic>
@@ -107,6 +109,9 @@ int run(int argc, char **argv) {
     cache_opts.checkpoints_per_chain = (int)settings.integer("prompt-cache-checkpoints");
     cache_opts.delta_max_tokens = settings.integer("prompt-cache-delta-max-tokens");
     cache_opts.disk_free_margin = (uint64_t)settings.integer("prompt-cache-disk-free-gib") << 30;
+    PrecisionOptions precision;
+    precision.gdn = parse_gdn_precision(settings.text("gdn-precision"));  // an unknown value fails startup
+    precision.attention = parse_attention_precision(settings.text("attention-precision"));
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
@@ -122,10 +127,40 @@ int run(int argc, char **argv) {
     const std::string nudge_wording = settings.text("think-nudge-wording");
     think_nudge1_text(nudge_wording);  // an unknown wording fails startup, naming the choices
     cfg.thinking_default = settings.on("thinking");
+    cfg.thinking_cap = settings.integer("thinking-cap");
+    cfg.thinking_cap_grace = settings.integer("thinking-cap-grace");
+    if (cfg.thinking_cap > 0)
+        slog(LogLevel::Info, "startup: thinking capped at %lld tokens (then up to %lld more to a sentence end)",
+             (long long)cfg.thinking_cap, (long long)cfg.thinking_cap_grace);
     cfg.defaults = sampling_defaults(gen_config);
     const Tokenizer tok(tokenizer);
     slog(LogLevel::Info, "startup: tokenizer %s (%d tokens)", tokenizer.c_str(), tok.size());
-    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows, yarn_factor);
+    const WeightPlacement placement = parse_weight_placement(settings.text("placement"), "placement");
+    // Vision: the tower file is a sibling of the served weights; the preprocessor values come
+    // from the checkpoint's own files next to the tokenizer (the producer is JSON-free, this is where
+    // the JSON lives). vision = off (the served default): no tower loaded, image parts stay a 400.
+    const bool vision = settings.on("vision");
+    const std::string vision_weights = [&] {
+        if (!vision) return std::string();
+        const size_t slash = weights.rfind('/');
+        STRIX_CHECK(slash != std::string::npos && slash > 0, "strix_server: --weights '", weights,
+                    "' is not a plain path - can't find the sibling vision.strixw");
+        return weights.substr(0, slash) + "/vision.strixw";
+    }();
+    // Before the ~30 s weight load: a missing tower file is a setup mistake, named with both ways out.
+    if (vision) {
+        const size_t ts = tokenizer.rfind('/');
+        const std::string pp = ts == std::string::npos ? std::string("preprocessor_config.json")
+                                                       : tokenizer.substr(0, ts) + "/preprocessor_config.json";
+        for (const std::string &need : {vision_weights, pp})
+            STRIX_CHECK(std::filesystem::is_regular_file(need), "strix_server: vision = on but ", need,
+                        " is missing - download it from the weights repo (re-running the download fetches only the new "
+                        "files), or set vision = off");
+    }
+    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows, yarn_factor,
+                        placement, vision_weights);
+    if (placement != WeightPlacement::Device)
+        slog(LogLevel::Info, "startup: placement %s (test machines only)", weight_placement_name(placement));
     if (yarn_factor > 1.0f)
         slog(LogLevel::Info, "startup: YaRN factor %g: %lld positions (%lld trained), cos/sin factor %.4f",
              (double)yarn_factor, (long long)model.dims().max_positions(), (long long)model.dims().trained_positions,
@@ -141,7 +176,26 @@ int run(int argc, char **argv) {
              (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab);
+    std::unique_ptr<vision::ServedVision> served_vision;
+    if (vision) {
+        STRIX_CHECK(model.has_vision(), "strix_server: vision = on but the model loaded without a tower");
+        const size_t slash = tokenizer.rfind('/');
+        STRIX_CHECK(slash != std::string::npos && slash > 0, "strix_server: --tokenizer '", tokenizer,
+                    "' is not a plain path - can't find the checkpoint's config files");
+        served_vision = std::make_unique<vision::ServedVision>(vision::load_vision_config(
+            tokenizer.substr(0, slash) + "/preprocessor_config.json", tokenizer.substr(0, slash) + "/config.json",
+            kernels::kMaxVisionSeq));
+        served_vision->vision_weights = vision_weights;
+        cfg.vision = served_vision.get();
+        slog(LogLevel::Info, "startup: vision on - tower %s (image_token_id %d, resize clamp %lld patches, "
+                     "mean %.2f/%.2f/%.2f std %.2f/%.2f/%.2f)",
+             vision_weights.c_str(), (int)served_vision->image_token_id, (long long)served_vision->cfg.max_patches,
+             served_vision->cfg.mean[0], served_vision->cfg.mean[1], served_vision->cfg.mean[2],
+             served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2]);
+    }
+    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision);
+    slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
+         precision.exact() ? "" : " (faster, less exact math than the default)");
     {
         // Where the GPU memory went (all of it is system RAM here - the prompt cache's RAM tier gets what's left).
         const auto tally = GpuMemoryTally::snapshot();

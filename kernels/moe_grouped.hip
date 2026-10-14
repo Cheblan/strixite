@@ -315,14 +315,20 @@ __global__ void __launch_bounds__(kWmmaThreads)
 // (Loading each wave's rows straight from memory instead was 1.65x slower: scattered code and 2-byte scale loads,
 // what costs is cache lines touched, not bytes.)
 using f16x2 = wmma_f16x2;  // kernels/wmma_gemm.hpp's F16 helpers
+__device__ inline float silu_f32(float v) { return v / (1.0f + expf(-v)); }  // the form in kernels/swiglu.hip
 __device__ inline void q4_word_to_f16(uint32_t w, f16x2 s, f16x2 m, uint32_t *out) { wmma_q4_word_to_f16(w, s, m, out); }
 __device__ inline f16x2 bf16_bits_to_f16x2(uint16_t b) { return wmma_bf16_bits_to_f16x2(b); }
 
-template <typename T, int G, bool COMBINE, int TR>
+// SWI (gather only): the block's waves 0..3 compute gate columns [j0, j0 + 64) and waves 4..7 the matching up columns
+// [I + j0, ...) of the stacked gate_up rows (N = 2I); the epilogue meets them in LDS and stores h = silu(g) u [slot, I]
+// directly - SwiGLU from the FP32 accumulators, rounded once, instead of storing gu and running kernels/swiglu.
+template <typename T, int G, bool COMBINE, int TR, bool SWI = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                             const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
     static_assert(TR == RW, "the route kernel's WMMA tile size");
+    static_assert(!(SWI && COMBINE), "SwiGLU fuses into the gather only");
+    constexpr int kHalf = kWmmaBN / 2;  // SWI: h columns a block
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 32-code half-step lies in one group");
     constexpr int TM = TR / 16;
     // LDS: x as F16 [TR][kWmmaLd]; the step's codes packed [kWmmaBN rows][2 x 16 bytes + 16 pad] (coalesced global
@@ -332,6 +338,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     __shared__ uint4 cs[kWmmaBN * kCodeLd];
     __shared__ uint16_t sw[kWmmaBN * kWin], mw[kWmmaBN * kWin];
     __shared__ int64_t xoff[TR], ooff[TR];
+    __shared__ float ub[SWI ? TR * (kHalf + 1) : 1];  // SWI: the up waves' accumulators for the gate waves
     const int32_t S = ws[1], E = ws[2], n_tiles = ws[3];
     const int64_t tile = blockIdx.y;
     if (tile >= n_tiles) return;  // uniform per block, before any barrier
@@ -343,11 +350,23 @@ __global__ void __launch_bounds__(kWmmaThreads)
     if ((int)threadIdx.x < rows) {
         const int64_t slot = slots[st + threadIdx.x];
         xoff[threadIdx.x] = (COMBINE ? slot : slot / A) * K;
-        ooff[threadIdx.x] = slot * N;
+        ooff[threadIdx.x] = slot * (SWI ? N / 2 : N);
     }
     __syncthreads();
-    const int64_t n0 = (int64_t)blockIdx.x * kWmmaBN;
-    const int rows_w = (int)(N - n0 < kWmmaBN ? N - n0 : kWmmaBN), wave = threadIdx.x / 32;
+    // SWI: n0 is the block's first h column j0 and rows_w its h columns; otherwise its first and count of output columns.
+    constexpr int kCols = SWI ? kHalf : kWmmaBN;
+    const int64_t n0 = (int64_t)blockIdx.x * kCols, Nh = SWI ? N / 2 : N;
+    const int rows_w = (int)(Nh - n0 < kCols ? Nh - n0 : kCols), wave = threadIdx.x / 32;
+    // The expert's weight row (from its first) behind staged row r of kWmmaBN, clamped to a valid row: SWI rows
+    // [0, 64) are gate rows n0 + r, rows [64, 128) the up rows N / 2 + n0 + r - 64.
+    auto wrow = [&](int r) -> int64_t {
+        if constexpr (SWI) {
+            const int rr = r % kHalf;
+            return (r < kHalf ? 0 : N / 2) + n0 + (rr < rows_w ? rr : 0);
+        } else {
+            return n0 + (r < rows_w ? r : 0);
+        }
+    };
     if (bucket == E) {  // invalid ids: NaN outputs (err was set by moe_group_routes)
         for (int i = threadIdx.x; i < rows * rows_w; i += kWmmaThreads) {
             const int r = i / rows_w, c = i % rows_w;
@@ -356,14 +375,14 @@ __global__ void __launch_bounds__(kWmmaThreads)
         }
         return;
     }
-    const int64_t row0 = (int64_t)bucket * N + n0, n_groups = K / G;
+    const int64_t row0 = (int64_t)bucket * N, n_groups = K / G;
     // Global fetch (prefetched a step ahead): thread t, code row t / 2 (clamped to a valid row), 16-byte half t % 2;
     // at a window start, kWin (scale, min) of kWmmaBN * kWin / kWmmaThreads rows - consecutive threads read
     // consecutive groups of a row (a 16-byte run), not one scattered 2-byte value per lane.
     static_assert(kWmmaBN * 2 == kWmmaThreads, "one 16-byte code load per thread and step");
     constexpr int kWinLoads = kWmmaBN * kWin / kWmmaThreads;
     const int crow = (int)threadIdx.x / 2, chalf = (int)threadIdx.x % 2;
-    const uint8_t *cptr = q + (row0 + (crow < rows_w ? crow : 0)) * (K / 2) + chalf * 16;
+    const uint8_t *cptr = q + (row0 + wrow(crow)) * (K / 2) + chalf * 16;
     uint4 cq;
     uint16_t fs[kWinLoads], fm[kWinLoads];
     auto wfetch = [&](int64_t k0) {
@@ -373,7 +392,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
 #pragma unroll
             for (int i = 0; i < kWinLoads; ++i) {
                 const int e = (int)threadIdx.x + i * kWmmaThreads, r = e / kWin;
-                const int64_t g = g0 + e % kWin, row = row0 + (r < rows_w ? r : 0);
+                const int64_t g = g0 + e % kWin, row = row0 + wrow(r);
                 fs[i] = g < n_groups ? scale[row * n_groups + g] : 0;
                 fm[i] = g < n_groups ? minv[row * n_groups + g] : 0;
             }
@@ -433,16 +452,35 @@ __global__ void __launch_bounds__(kWmmaThreads)
             }
             __syncthreads();
         }
+        if constexpr (SWI) {
+            const int c = (wave % 4) * 16 + (int)threadIdx.x % 16;
+            if (wave >= 4)
 #pragma unroll
-        for (int i = 0; i < TMA; ++i)
+                for (int i = 0; i < TMA; ++i)
 #pragma unroll
-            for (int v = 0; v < 8; ++v) {
-                const int r = 16 * i + wmma_c_row(v), c = wave * 16 + (int)threadIdx.x % 16;
-                if (r < rows && c < rows_w) {
-                    if (COMBINE) put_partial(partial, ooff[r] + n0 + c, acc[i][v], pbf16);
-                    else store(y, ooff[r] + n0 + c, acc[i][v]);
+                    for (int v = 0; v < 8; ++v) ub[(16 * i + wmma_c_row(v)) * (kHalf + 1) + c] = acc[i][v];
+            __syncthreads();
+            if (wave < 4)
+#pragma unroll
+                for (int i = 0; i < TMA; ++i)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const int r = 16 * i + wmma_c_row(v);
+                        if (r < rows && c < rows_w)
+                            store(y, ooff[r] + n0 + c, silu_f32(acc[i][v]) * ub[r * (kHalf + 1) + c]);
+                    }
+        } else {
+#pragma unroll
+            for (int i = 0; i < TMA; ++i)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const int r = 16 * i + wmma_c_row(v), c = wave * 16 + (int)threadIdx.x % 16;
+                    if (r < rows && c < rows_w) {
+                        if (COMBINE) put_partial(partial, ooff[r] + n0 + c, acc[i][v], pbf16);
+                        else store(y, ooff[r] + n0 + c, acc[i][v]);
+                    }
                 }
-            }
+        }
     };
     static_assert(TM == 4, "the dispatch below covers 1..4 active tiles");
     switch (tm) {  // uniform per block
@@ -505,10 +543,12 @@ void check_no_overlap(const char *fn, const char *a_name, const void *a, int64_t
                 a_bytes, " B) overlaps ", b_name, " [", b, ", +", b_bytes, " B)");
 }
 
-template <typename T, bool COMBINE, int HB>
+template <typename T, bool COMBINE, int HB, bool SWI = false>
 void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws, int64_t M, int64_t A, T *y,
                     float *partial, MoeMath math, hipStream_t stream) {
     const int64_t N = w.N / E;
+    STRIX_CHECK(!SWI || (math == MoeMath::WmmaF16 && N % 2 == 0), "moe grouped (SwiGLU): needs MoeMath::WmmaF16 and an ",
+                "even gate_up width, got math ", (int)math, ", N = ", N);
     const auto *wsi = static_cast<const int32_t *>(ws);
     if (math == MoeMath::WmmaF16) {
         STRIX_CHECK(HB == 0, "moe grouped (WMMA F16): Q4 experts only (Q5 runs on MoeMath::WmmaBf16)");
@@ -516,11 +556,12 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA F16): needs wave32 (gfx11 WMMA)");
         const int64_t tiles = route_layout(M, A, E).WTmax;
         STRIX_CHECK(tiles <= 65535, "moe grouped (WMMA F16): ", tiles, " tile slots exceed the grid");
-        dim3 grid((unsigned)((N + kWmmaBN - 1) / kWmmaBN), (unsigned)tiles), block(kWmmaThreads);
+        const int64_t cols = SWI ? N / 2 : N, per_block = SWI ? kWmmaBN / 2 : kWmmaBN;  // SWI: h columns
+        dim3 grid((unsigned)((cols + per_block - 1) / per_block), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
-            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW, SWI><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW, SWI><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW, SWI><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
@@ -596,6 +637,24 @@ void experts_gather_grouped(const char *fn, const void *x, const Q4DeviceView &w
                            E, " N=", N, " K=", w.K, " G=", w.G);
 }
 
+void experts_gather_grouped_swiglu(const char *fn, const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
+                                   size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
+                                   hipStream_t stream) {
+    check_common(fn, x, w, E, M, A, ws, ws_bytes, h, act);
+    STRIX_CHECK(math == MoeMath::WmmaF16, fn, ": the fused SwiGLU runs on MoeMath::WmmaF16 only, got ", (int)math);
+    const int64_t es = act == Act::F32 ? 4 : 2, N = w.N / E;
+    STRIX_CHECK(N % 2 == 0, fn, ": gate_up has ", N, " rows an expert, expected an even count (gate rows then up rows)");
+    check_no_overlap(fn, "h", h, M * A * (N / 2) * es, "x", x, M * w.K * es);
+    if (act == Act::F32)
+        launch_grouped<float, false, 0, true>(static_cast<const float *>(x), w, E, ws, M, A, static_cast<float *>(h),
+                                              nullptr, math, stream);
+    else
+        launch_grouped<uint16_t, false, 0, true>(static_cast<const uint16_t *>(x), w, E, ws, M, A,
+                                                 static_cast<uint16_t *>(h), nullptr, math, stream);
+    STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " wmma-f16 M=", M, " A=", A, " E=", E, " N=", N, " K=", w.K,
+                           " G=", w.G);
+}
+
 template <int HB>
 void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                              const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M, int64_t A,
@@ -629,6 +688,13 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                       hipStream_t stream) {
     experts_gather_grouped<0>("linear_q4_experts_gather_grouped", x, w, E, ws, ws_bytes, M, A, y, act, math, stream);
+}
+
+void linear_q4_experts_gather_grouped_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
+                                              size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
+                                              hipStream_t stream) {
+    experts_gather_grouped_swiglu("linear_q4_experts_gather_grouped_swiglu", x, w, E, ws, ws_bytes, M, A, h, act, math,
+                                  stream);
 }
 
 void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,

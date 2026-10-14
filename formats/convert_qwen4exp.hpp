@@ -17,6 +17,17 @@
 
 namespace strix {
 
+// The vision tower's config.json "vision_config" fields the converter validates the checkpoint's
+// model.visual.* tensors against. Filled from config.json by the caller (the tool, the test) - this
+// library stays JSON-free; the raw JSON goes into the output's index as-is. The only precision choice
+// here is that everything is copied as exact BF16 (the tower runs
+// once per image; quantizing it saves memory nobody asked about and buys no time).
+struct VisionDims {
+    int64_t depth = 0, hidden_size = 0, num_heads = 0, intermediate_size = 0, in_channels = 0, patch_size = 0,
+            temporal_patch_size = 0, spatial_merge_size = 0, out_hidden_size = 0, num_position_embeddings = 0;
+    std::string hidden_act;  // must be "gelu_pytorch_tanh" (what this checkpoint has; anything else is refused)
+};
+
 struct ConvertOptions {
     std::string src_dir;      // HF checkpoint directory (*.safetensors + model.safetensors.index.json)
     std::string out_dir;      // created if missing; must not already hold weights.strixw
@@ -28,8 +39,23 @@ struct ConvertOptions {
     std::vector<int64_t> layers;  // decoder layers to convert; empty = all
     bool globals = true;          // embedding, LM head, final HC mixer
     bool mtp = true;              // the MTP head
+    // A safetensors file whose tensors replace the checkpoint's same-named mtp.* tensors (a fine-tuned draft head):
+    // every tensor in it must be an mtp.* tensor the checkpoint has, same dtype and shape. The trunk still comes from
+    // src_dir, so source_fingerprint stays the checkpoint's (it pairs with the n-gram table); the metadata records
+    // the file and its fingerprint as mtp_source. Empty: none.
+    std::string mtp_from;
     bool plan_only = false;       // log the plan and stop (reads headers only)
     FILE *console = stderr;       // log sink besides out_dir/convert.log (nullptr: file only)
+    // Vision tower: additionally write out_dir/vision.strixw,
+    // every model.visual.* tensor as an exact BF16 copy, validated against vision_dims. weights.strixw is
+    // unchanged either way (the text file never carries the tower, so existing downloads stay valid).
+    bool vision = false;
+    // Tower only: write exactly that file and nothing else - the path to add a tower to an output
+    // directory converted before --vision existed (the text plan is not read, its refusal of an existing
+    // weights.strixw does not apply; the tower file's own existence still stops it).
+    bool tower_only = false;
+    VisionDims vision_dims;
+    std::string vision_config_json;  // the raw "vision_config" object text, stored in the new file's index
 };
 
 enum class ConvertOp { Q4Merge, Q4FoldHC, Q4ChunkMajor, BF16Rows, F32Widen, I64Copy };
@@ -52,6 +78,7 @@ struct ConvertPlan {
 // Summary of a finished (or planned) run.
 struct ConvertResult {
     std::string weights_path;
+    std::string vision_path;  // "" unless ConvertOptions::vision
     uint64_t source_bytes = 0, output_bytes = 0;
     size_t tensors = 0;
     double seconds = 0;

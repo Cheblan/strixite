@@ -53,6 +53,13 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                       hipStream_t stream);
 
+// The gather with SwiGLU fused (MoeMath::WmmaF16, Q4 only): h [M*A, N/2] = silu(gate) * up of the stacked gate_up
+// rows (each expert's N rows: N/2 gate rows, then N/2 up rows), from the FP32 accumulators, rounded once to the
+// activation dtype - in place of the gather into gu [M*A, N] and kernels/swiglu. h must not overlap x.
+void linear_q4_experts_gather_grouped_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
+                                             size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
+                                             hipStream_t stream);
+
 // Combine over grouped routes. partial: M*A*N FP32 scratch (device) - MoeMath::WmmaF16 stores its partials as BF16
 // in the first half of it (moe_grouped.hip, put_partial). ids: the same ids (the reduction checks
 // them per token); coef [M, A] F32. h 16-byte aligned; y must not overlap h or partial.

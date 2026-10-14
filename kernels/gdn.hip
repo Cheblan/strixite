@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <iterator>
+#include <type_traits>
 #include <utility>
 
 namespace strix::kernels {
@@ -379,13 +380,16 @@ __device__ inline uint16_t wg_bf16(float f) {  // round to nearest even (finite 
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 __device__ inline float wg_f32(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
-__device__ inline void wg_split(float f, uint16_t &hi, uint16_t &lo) {
+// One = false (gdn-precision exact): f as BF16 hi + lo. One = true (fast): hi only - the lo halves are neither
+// written nor read, and their LDS buffers are not allocated.
+template <bool One> __device__ inline void wg_split(float f, uint16_t &hi, uint16_t &lo) {
     hi = wg_bf16(f);
-    lo = wg_bf16(f - wg_f32(hi));
+    if constexpr (!One) lo = wg_bf16(f - wg_f32(hi));
+    else (void)lo;
 }
 // C tile (16 x 16 FP32, element v = row 2v + lane / 16, column lane % 16) -> the B fragment of its transpose view:
 // column lane % 16 with rows 0..15 as the K run (lanes 16..31 the same), as hi and lo BF16.
-__device__ inline void wg_c_to_b(const wmma_f32x8 &c, wmma_bf16x16 &hi, wmma_bf16x16 &lo) {
+template <bool One> __device__ inline void wg_c_to_b(const wmma_f32x8 &c, wmma_bf16x16 &hi, wmma_bf16x16 &lo) {
     const bool upper = (threadIdx.x % 32) >= 16;
     wmma_u32x8 h, l;
 #pragma unroll
@@ -393,23 +397,35 @@ __device__ inline void wg_c_to_b(const wmma_f32x8 &c, wmma_bf16x16 &hi, wmma_bf1
         const float own = c[v], other = __shfl_xor(own, 16, 32);
         const float even = upper ? other : own, odd = upper ? own : other;  // rows 2v, 2v + 1
         uint16_t eh, el, oh, ol;
-        wg_split(even, eh, el);
-        wg_split(odd, oh, ol);
+        wg_split<One>(even, eh, el);
+        wg_split<One>(odd, oh, ol);
         h[v] = (uint32_t)eh | ((uint32_t)oh << 16);
         l[v] = (uint32_t)el | ((uint32_t)ol << 16);
     }
     hi = __builtin_bit_cast(wmma_bf16x16, h);
-    lo = __builtin_bit_cast(wmma_bf16x16, l);
+    if constexpr (!One) lo = __builtin_bit_cast(wmma_bf16x16, l);
+    else (void)l;
 }
-// acc += a b with hi / lo terms (the lo x lo term dropped: ~2^-18).
+// acc += a b: One = false with hi / lo terms (the lo x lo term dropped: ~2^-18); One = true hi x hi only.
+template <bool One>
 __device__ inline wmma_f32x8 wg_mma3(const wmma_bf16x16 &ah, const wmma_bf16x16 &al, const wmma_bf16x16 &bh,
                                      const wmma_bf16x16 &bl, wmma_f32x8 acc) {
     acc = wmma_bf16(ah, bh, acc);
-    acc = wmma_bf16(ah, bl, acc);
-    return wmma_bf16(al, bh, acc);
+    if constexpr (One) {
+        (void)al, (void)bl;
+        return acc;
+    } else {
+        acc = wmma_bf16(ah, bl, acc);
+        return wmma_bf16(al, bh, acc);
+    }
+}
+// The lo half of a fragment from LDS; One = true never reads it.
+template <bool One> __device__ inline wmma_bf16x16 wg_load_lo(const uint16_t *p, int ld) {
+    if constexpr (One) return wmma_bf16x16{};
+    else return wmma_load_rows(p, ld);
 }
 
-template <typename T>
+template <typename T, bool One>
 __global__ void __launch_bounds__(kWgWaves * 32)
     delta_rule_wmma_kernel(const T *qkv, const float *beta, const float *g, const float *state_in, float *state_out,
                            T *out, DrParams p) {
@@ -417,10 +433,11 @@ __global__ void __launch_bounds__(kWgWaves * 32)
     const int64_t h = blockIdx.x, kh = h / (p.Hv / p.Hk);
     const int tid = threadIdx.x, lane = tid % 32, w = tid / 32, col = lane % 16, half = lane / 16, v_w = 16 * w;
 
-    __shared__ __attribute__((aligned(16))) uint16_t Kh[kWgC * kWgLd], Kl[kWgC * kWgLd];
-    __shared__ __attribute__((aligned(16))) uint16_t Qh[kWgC * kWgLd], Ql[kWgC * kWgLd];  // later: K~^T [k][t]
-    __shared__ __attribute__((aligned(16))) uint16_t Th[kWgC * kWgLdT], Tl[kWgC * kWgLdT];
-    __shared__ __attribute__((aligned(16))) uint16_t Ph[kWgC * kWgLdT], Pl[kWgC * kWgLdT];
+    // One (gdn-precision fast): the lo buffers are a token 8 elements, never written or read.
+    __shared__ __attribute__((aligned(16))) uint16_t Kh[kWgC * kWgLd], Kl[One ? 8 : kWgC * kWgLd];
+    __shared__ __attribute__((aligned(16))) uint16_t Qh[kWgC * kWgLd], Ql[One ? 8 : kWgC * kWgLd];  // later: K~^T [k][t]
+    __shared__ __attribute__((aligned(16))) uint16_t Th[kWgC * kWgLdT], Tl[One ? 8 : kWgC * kWgLdT];
+    __shared__ __attribute__((aligned(16))) uint16_t Ph[kWgC * kWgLdT], Pl[One ? 8 : kWgC * kWgLdT];
     __shared__ float Am[kWgC][kWgC + 1];
     __shared__ float G[kWgC], eG[kWgC], B[kWgC], eL[kWgC];
     uint16_t *KTh = Qh, *KTl = Ql;  // K~^T [128][kWgLdKT], reusing the Q buffers
@@ -474,8 +491,8 @@ __global__ void __launch_bounds__(kWgWaves * 32)
 #pragma unroll
             for (int e = 0; e < 16; ++e) {
                 const int d = part * 16 + e;
-                wg_split(qv[e] * iq, Qh[r * kWgLd + d], Ql[r * kWgLd + d]);
-                wg_split(kv[e] * ik, Kh[r * kWgLd + d], Kl[r * kWgLd + d]);
+                wg_split<One>(qv[e] * iq, Qh[r * kWgLd + d], Ql[r * kWgLd + d]);
+                wg_split<One>(kv[e] * ik, Kh[r * kWgLd + d], Kl[r * kWgLd + d]);
             }
         }
         // G = cumsum(g) (padding rows keep the last real G), e^G, beta, e^(G_last - G): wave 0, one token per lane, the
@@ -503,10 +520,10 @@ __global__ void __launch_bounds__(kWgWaves * 32)
 #pragma unroll
             for (int d0 = 0; d0 < D; d0 += 16) {
                 const wmma_bf16x16 ah = wmma_load_rows(Xh + ti * 16 * kWgLd + d0, kWgLd),
-                                   al = wmma_load_rows(Xl + ti * 16 * kWgLd + d0, kWgLd);
+                                   al = wg_load_lo<One>(Xl + ti * 16 * kWgLd + d0, kWgLd);
                 const wmma_bf16x16 bh = wmma_load_rows(Kh + tj * 16 * kWgLd + d0, kWgLd),
-                                   bl = wmma_load_rows(Kl + tj * 16 * kWgLd + d0, kWgLd);
-                acc = wg_mma3(ah, al, bh, bl, acc);
+                                   bl = wg_load_lo<One>(Kl + tj * 16 * kWgLd + d0, kWgLd);
+                acc = wg_mma3<One>(ah, al, bh, bl, acc);
                 __builtin_amdgcn_sched_barrier(0);
             }
 #pragma unroll
@@ -514,7 +531,7 @@ __global__ void __launch_bounds__(kWgWaves * 32)
                 const int t = ti * 16 + 2 * v + half, s2 = tj * 16 + col;
                 const float decay = s2 <= t ? expf(G[t] - G[s2]) : 0.0f;
                 if (isA) Am[t][s2] = s2 < t ? B[t] * decay * acc[v] : 0.0f;
-                else wg_split(decay * acc[v], Ph[t * kWgLdT + s2], Pl[t * kWgLdT + s2]);
+                else wg_split<One>(decay * acc[v], Ph[t * kWgLdT + s2], Pl[t * kWgLdT + s2]);
             }
         }
         __syncthreads();
@@ -531,19 +548,19 @@ __global__ void __launch_bounds__(kWgWaves * 32)
                 x[t] = t < j ? 0.0f : v;
             }
 #pragma unroll
-            for (int t = 0; t < kWgC; ++t) wg_split(x[t], Th[t * kWgLdT + j], Tl[t * kWgLdT + j]);
+            for (int t = 0; t < kWgC; ++t) wg_split<One>(x[t], Th[t * kWgLdT + j], Tl[t * kWgLdT + j]);
         }
         // W = K S and QS = Q S (two 16-row tiles of tokens each), S's tiles as B fragments one k tile at a time.
         wmma_f32x8 W[2] = {}, QS[2] = {};
 #pragma unroll
         for (int rt = 0; rt < D / 16; ++rt) {
             wmma_bf16x16 bh, bl;
-            wg_c_to_b(S[rt], bh, bl);
+            wg_c_to_b<One>(S[rt], bh, bl);
 #pragma unroll
             for (int ti = 0; ti < 2; ++ti) {
                 const int off = ti * 16 * kWgLd + rt * 16;
-                W[ti] = wg_mma3(wmma_load_rows(Kh + off, kWgLd), wmma_load_rows(Kl + off, kWgLd), bh, bl, W[ti]);
-                QS[ti] = wg_mma3(wmma_load_rows(Qh + off, kWgLd), wmma_load_rows(Ql + off, kWgLd), bh, bl, QS[ti]);
+                W[ti] = wg_mma3<One>(wmma_load_rows(Kh + off, kWgLd), wg_load_lo<One>(Kl + off, kWgLd), bh, bl, W[ti]);
+                QS[ti] = wg_mma3<One>(wmma_load_rows(Qh + off, kWgLd), wg_load_lo<One>(Ql + off, kWgLd), bh, bl, QS[ti]);
             }
             __builtin_amdgcn_sched_barrier(0);  // keep each tile's loads with its tile: hoisting them all spilled
         }
@@ -562,32 +579,32 @@ __global__ void __launch_bounds__(kWgWaves * 32)
         // K~^T [k][t] = (e^(G_last - G_t) K[t][k]) into Q's buffer, hi / lo: 256 threads x 16 elements.
         for (int i = tid; i < D * kWgC; i += kWgWaves * 32) {
             const int k = i / kWgC, t = i % kWgC;
-            const float kv = wg_f32(Kh[t * kWgLd + k]) + wg_f32(Kl[t * kWgLd + k]);
-            wg_split(eL[t] * kv, KTh[k * kWgLdKT + t], KTl[k * kWgLdKT + t]);
+            const float kv = wg_f32(Kh[t * kWgLd + k]) + (One ? 0.0f : wg_f32(Kl[t * kWgLd + k]));
+            wg_split<One>(eL[t] * kv, KTh[k * kWgLdKT + t], KTl[k * kWgLdKT + t]);
         }
         // U = T R: A = T rows (t), K = s (2 steps); B = R's tiles.
         wmma_bf16x16 rbh[2], rbl[2];
-        wg_c_to_b(R[0], rbh[0], rbl[0]);
-        wg_c_to_b(R[1], rbh[1], rbl[1]);
+        wg_c_to_b<One>(R[0], rbh[0], rbl[0]);
+        wg_c_to_b<One>(R[1], rbh[1], rbl[1]);
         wmma_f32x8 U[2] = {};
 #pragma unroll
         for (int ti = 0; ti < 2; ++ti)
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int off = ti * 16 * kWgLdT + ks * 16;
-                U[ti] = wg_mma3(wmma_load_rows(Th + off, kWgLdT), wmma_load_rows(Tl + off, kWgLdT), rbh[ks], rbl[ks], U[ti]);
+                U[ti] = wg_mma3<One>(wmma_load_rows(Th + off, kWgLdT), wg_load_lo<One>(Tl + off, kWgLdT), rbh[ks], rbl[ks], U[ti]);
             }
         // O = e^G QS + P U, stored.
         wmma_bf16x16 ubh[2], ubl[2];
-        wg_c_to_b(U[0], ubh[0], ubl[0]);
-        wg_c_to_b(U[1], ubh[1], ubl[1]);
+        wg_c_to_b<One>(U[0], ubh[0], ubl[0]);
+        wg_c_to_b<One>(U[1], ubh[1], ubl[1]);
 #pragma unroll
         for (int ti = 0; ti < 2; ++ti) {
             wmma_f32x8 PU = {};
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int off = ti * 16 * kWgLdT + ks * 16;
-                PU = wg_mma3(wmma_load_rows(Ph + off, kWgLdT), wmma_load_rows(Pl + off, kWgLdT), ubh[ks], ubl[ks], PU);
+                PU = wg_mma3<One>(wmma_load_rows(Ph + off, kWgLdT), wg_load_lo<One>(Pl + off, kWgLdT), ubh[ks], ubl[ks], PU);
             }
 #pragma unroll
             for (int v = 0; v < 8; ++v) {
@@ -605,7 +622,7 @@ __global__ void __launch_bounds__(kWgWaves * 32)
 #pragma unroll
             for (int ks = 0; ks < 2; ++ks) {
                 const int off = rt * 16 * kWgLdKT + ks * 16;
-                S[rt] = wg_mma3(wmma_load_rows(KTh + off, kWgLdKT), wmma_load_rows(KTl + off, kWgLdKT), ubh[ks], ubl[ks], S[rt]);
+                S[rt] = wg_mma3<One>(wmma_load_rows(KTh + off, kWgLdKT), wg_load_lo<One>(KTl + off, kWgLdKT), ubh[ks], ubl[ks], S[rt]);
             }
             __builtin_amdgcn_sched_barrier(0);
         }
@@ -696,10 +713,13 @@ void gdn_front(const void *in_proj, const GdnFrontShape &s, const float *conv_w,
 }
 
 void delta_rule(const void *qkv, const float *beta, const float *g, const DeltaRuleShape &s, const float *state_in,
-                float *state_out, bool reset_state, void *out, Act act, hipStream_t stream, DeltaRulePath path) {
+                float *state_out, bool reset_state, void *out, Act act, hipStream_t stream, DeltaRulePath path,
+                DrPrecision precision) {
     STRIX_CHECK(path == DeltaRulePath::Auto || path == DeltaRulePath::PerToken || path == DeltaRulePath::Chunked ||
                     path == DeltaRulePath::ChunkedWmma,
                 "delta_rule: unknown path ", (int)path);
+    STRIX_CHECK(precision == DrPrecision::Exact || precision == DrPrecision::Fast, "delta_rule: unknown precision ",
+                (int)precision);
     STRIX_CHECK(qkv && beta && g && (state_in || reset_state) && state_out && out, "delta_rule: null pointer (qkv=", qkv,
                 ", beta=", beta, ", g=", g, ", state_in=", state_in, " - may be null only with reset_state, state_out=",
                 state_out, ", out=", out, ")");
@@ -746,13 +766,19 @@ void delta_rule(const void *qkv, const float *beta, const float *g, const DeltaR
     if (path == DeltaRulePath::ChunkedWmma) {
         STRIX_CHECK(wsize == 32, "delta_rule (WMMA): needs wave32 (gfx11 WMMA), wave size ", wsize);
         dim3 grid((unsigned)s.Hv), block(kWgWaves * 32);
-        if (act == Act::F32)
-            delta_rule_wmma_kernel<float><<<grid, block, 0, stream>>>(static_cast<const float *>(qkv), beta, g, state_in,
-                                                                      state_out, static_cast<float *>(out), p);
-        else
-            delta_rule_wmma_kernel<uint16_t><<<grid, block, 0, stream>>>(static_cast<const uint16_t *>(qkv), beta, g,
-                                                                         state_in, state_out,
-                                                                         static_cast<uint16_t *>(out), p);
+        auto launch = [&](auto one) {
+            constexpr bool One = decltype(one)::value;
+            if (act == Act::F32)
+                delta_rule_wmma_kernel<float, One><<<grid, block, 0, stream>>>(static_cast<const float *>(qkv), beta, g,
+                                                                               state_in, state_out,
+                                                                               static_cast<float *>(out), p);
+            else
+                delta_rule_wmma_kernel<uint16_t, One><<<grid, block, 0, stream>>>(static_cast<const uint16_t *>(qkv), beta,
+                                                                                  g, state_in, state_out,
+                                                                                  static_cast<uint16_t *>(out), p);
+        };
+        if (precision == DrPrecision::Fast) launch(std::true_type{});
+        else launch(std::false_type{});
     } else if (chunked) {
         dim3 grid((unsigned)(s.Hv * (D / kCkCols))), block(kThreads);
         if (act == Act::F32)

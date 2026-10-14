@@ -163,7 +163,7 @@ std::string error_body(const std::string &message, const std::string &type, cons
     return b.dump();
 }
 
-ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &defaults) {
+ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &defaults, bool vision_enabled) {
     if (!body.is_object()) bad("", std::string("the request body must be a JSON object, got ") + json::type_name(body.type()));
     ChatRequest r;
     r.sampling = defaults;
@@ -173,13 +173,37 @@ ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &de
     r.messages = merge_leading_system(*messages);
     for (size_t k = 0; k < r.messages.as_array("messages").size(); ++k) {
         const json::Value &m = r.messages.as_array("messages")[k];
+        const std::string mp = "messages[" + std::to_string(k) + "].content";
         const json::Value *c = m.is_object() ? m.find("content") : nullptr;
         if (c && c->is_array())
             for (const json::Value &part : c->as_array("content")) {
                 const json::Value *type = part.is_object() ? part.find("type") : nullptr;
-                if (type && type->is_string() && type->as_string("type") != "text")
-                    bad("messages[" + std::to_string(k) + "].content",
-                        "content part type '" + type->as_string("type") + "' is not supported (text only; no vision)");
+                if (!(type && type->is_string() && type->as_string("type") != "text")) continue;  // text / shapeless
+                const std::string t = type->as_string("type");
+                if (t == "image_url" || t == "image") {
+                    if (!vision_enabled)
+                        bad(mp, "content part type '" + t + "' is not supported (text only; no vision)");
+                    // The URL: image_url.url (the OpenAI shape; also a bare image_url string) or image (the
+                    // HF shape the template also accepts).
+                    const json::Value *iu = part.find("image_url"), *im = part.find("image");
+                    std::string url;
+                    if (im && im->is_string()) url = im->as_string(mp + ".image");
+                    else if (iu && iu->is_object() && iu->find("url") && iu->find("url")->is_string())
+                        url = iu->find("url")->as_string(mp + ".image_url.url");
+                    else if (iu && iu->is_string())
+                        url = iu->as_string(mp + ".image_url");  // the lax shape some clients send
+                    else
+                        bad(mp, "an " + t + " part needs image_url.url (a data: URL string)");
+                    try {
+                        r.images.push_back(vision::parse_data_url(url, mp));
+                    } catch (const Error &e) {
+                        bad(mp, e.what());
+                    }
+                    continue;
+                }
+                if (t == "video")
+                    bad(mp, "content part type 'video' is not supported (videos are not served)");
+                bad(mp, "content part type '" + t + "' is not supported (text only; no vision)");
             }
     }
     parse_common(body, r, /*legacy_completions=*/false);

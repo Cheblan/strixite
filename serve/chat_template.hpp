@@ -35,7 +35,11 @@ struct ChatTemplateOptions {
 // (an opencode tool result holding "<|im_end|>" otherwise ended up as a real end of turn in the prompt). Assistant
 // content and reasoning are left out: the model wrote those, and a special token it emitted there must re-encode
 // as that token (the session / prompt cache resume on the exact ids).
+// vision (default off - the v1 refusal stands): image content parts render as the template's
+// vision triplet (vision_start / image_pad / vision_end - server control tokens, kept outside the
+// plain spans); the single pad per image is the processor's contract, expanded to the merged-token
+// count by the caller (serve/vision_request.cpp). Videos stay refused.
 std::string render_chat(const json::Value &messages, const json::Value *tools, const ChatTemplateOptions &opt,
-                        std::vector<std::pair<size_t, size_t>> *plain_spans = nullptr);
+                        std::vector<std::pair<size_t, size_t>> *plain_spans = nullptr, bool vision = false);
 
 }  // namespace strix

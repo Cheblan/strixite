@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -47,6 +48,22 @@ struct BackendStats {
     int64_t ngram_rows_prefetched = 0;
     int64_t ple_gathers = 0, ple_waits = 0, ple_prefetches = 0, ple_prefetch_skipped = 0;
     double ple_gather_seconds = 0, ple_wait_seconds = 0, ple_wait_max_seconds = 0, ple_prefetch_seconds = 0;
+};
+
+// One tower input for an image prefill (vision): the rows the tower runs over (FP32,
+// the producer is serve/vision_preprocess) and the grid. Deliberately model-agnostic types (floats + ints) -
+// the engine passes these to the backend, never interprets them.
+struct VisionPrefill {
+    std::vector<float> pixel_values;
+    int64_t grid_t = 1, grid_h = 0, grid_w = 0;
+};
+
+// One image at its row span in the prompt (stream order). row_start is the first image_token_id row, rows the
+// merged count - the engine aligns prefill chunk boundaries to these spans and hands each image to exactly
+// one forward (Phase B's one-image-per-forward contract).
+struct PrefillImage {
+    VisionPrefill prefill;
+    int64_t row_start = -1, rows = 0;
 };
 
 class LmBackend {
@@ -105,6 +122,20 @@ public:
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
     }
+    // Vision (image prompts). max_positions: the model's position ceiling
+    // (the walk refuses past it; 0 = unknown, the check skips). has_vision: image requests may be built at all
+    // (the HTTP layer's gate and /health). forward_image_prefill: one prefill forward carrying one image (the
+    // block's rows, pos3 the walk's triples for these rows) with the logits as forward_rows takes them. The
+    // default refuses naming the missing tower - a text-only backend never runs one.
+    virtual bool has_vision() const { return false; }
+    virtual int64_t max_positions() const { return 0; }
+    virtual LogitRows forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &image,
+                                            const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                            int64_t n_valid, const LogitMasks *masks = nullptr) {
+        (void)ids, (void)image, (void)pos3, (void)n_logits, (void)cands, (void)n_valid, (void)masks;
+        STRIX_FAIL("the backend ", describe(), " has no vision tower - the image prompt is refused");
+    }
+
     virtual BackendStats backend_stats() const { return {}; }
     // A hint (Qwen4ExpSession::prefetch_ple): the next forward starts with ids (while a verify awaits its outcome:
     // ids start where the verify did); fetch the inputs of ids[first, size) it reads from slow storage now. Changes
@@ -143,12 +174,25 @@ public:
 
 struct GenerationRequest {
     std::vector<int32_t> prompt;
+    // Image prompt (vision): per prompt row the (t, h, w) section positions of the mRoPE walk
+    // (serve/vision_request.cpp, the get_rope_index rule) and the images with their spans, stream
+    // order. Both empty: a text prompt - today's path, bit-identical, zero cost. The
+    // engine refuses them on a backend without a tower (submit-time check) and re-checks spans vs ids rows.
+    std::vector<int64_t> image_pos3;
+    std::vector<PrefillImage> prefill_images;
+    // The stream resume / prompt-cache matching runs on: prompt with each image's pad run replaced by its
+    // content-derived pseudo ids (serve/vision_request.cpp). Empty = text prompt (prompt is used as is).
+    std::vector<int32_t> cache_key;
     int64_t max_tokens = 0;  // >= 1; prompt + max_tokens <= capacity (the API layer clamps)
     SamplingParams sampling;
     OutputParser::Config parser;  // parser.tools must outlive the request
     // Reasoning tokens allowed before the engine closes the think block itself (feeding kThinkingStop); -1 =
     // no budget. The API layer sets it (an explicit budget, or the answer room).
     int64_t thinking_budget = -1;
+    // Past the budget, at most this many more reasoning tokens while the engine waits for the end of a sentence
+    // (ends_sentence) before it feeds the stop; 0 = the stop right at the budget. The server's thinking cap sets it
+    // (config thinking-cap-grace); a request's own budget leaves it 0.
+    int64_t thinking_budget_grace = 0;
     // The prompt's last message is the user's (not tool results): the prefix up to that message's start goes to
     // the disk cache as a checkpoint (PromptCache::Kind::Checkpoint), kept when later turns extend it.
     bool user_turn = false;
@@ -169,6 +213,13 @@ struct GenerationRequest {
 constexpr const char *kThinkingStop =
     "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly "
     "now.\n</think>\n\n";
+
+// The reasoning text so far (its tail - the last few hundred bytes are enough) ends a sentence: it ends in a newline,
+// or in . ! ? (closing quotes / brackets / * after it allowed) right after a letter, `)` or a closing quote, outside
+// inline code (an even number of backticks since the last newline). Digits before the stop don't count ("version 3."
+// may go on "3.14"), nor does a dot inside a name the next token continues ("engine." + "cpp" - most such names
+// tokenize as "engine" + ".cpp", so the dot never ends the tail).
+bool ends_sentence(std::string_view tail);
 
 // What the engine feeds ahead of a tool call begun inside the think block (Engine::Options::think_close_on_call):
 // the template's think close; the newline before it is the model's own.

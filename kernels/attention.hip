@@ -33,9 +33,13 @@ template <> __device__ inline float round_act<uint16_t>(float v) { return rope_m
 
 // One head: zero-centred RMSNorm (1 + w), then RoPE on the first 2 * half dims, written to o. Shared by the
 // single-call and the multi-job kernel, so both compute exactly the same values.
+// triple: this row's interleaved-mRoPE (t, h, w) section positions (kernels/rope.hpp MropePos), or null for
+// the scalar pos (text-only: all sections equal pos, and pair j's angle is pos * inv_freq[j] as ever -
+// bit-identical, the branch is outside the rotation math).
 template <typename T>
 __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *w, float eps, int64_t half, int64_t pos,
-                                      const float *inv_freq, float cos_sin_scale, float *row, float *red) {
+                                      const int64_t *triple, const float *inv_freq, float cos_sin_scale, float *row,
+                                      float *red) {
     constexpr bool kBF16 = sizeof(T) == 2;
     // Same reduction shape as rmsnorm_zc (strided partials, tree), same per-element formula.
     float ss = 0.f;
@@ -55,7 +59,7 @@ __device__ inline void norm_rope_head(const T *x, T *o, int64_t D, const float *
     for (int64_t j = threadIdx.x; j < D; j += blockDim.x) {
         if (j < half) {
             float c, s, y0, y1;
-            rope_math::cos_sin<kBF16>(pos, inv_freq[j], cos_sin_scale, c, s);
+            rope_math::cos_sin<kBF16>(triple ? triple[j % 3] : pos, inv_freq[j], cos_sin_scale, c, s);
             rope_math::rotate<kBF16>(row[j], row[j + half], c, s, y0, y1);
             store(o, j, y0);
             store(o, j + half, y1);
@@ -69,11 +73,11 @@ template <typename T>
 __global__ void __launch_bounds__(kNormThreads)
     qk_norm_rope_kernel(const T *in, int64_t in_ts, int64_t in_hs, T *out, int64_t out_ts, int64_t out_hs,
                         int64_t heads, int64_t D, const float *w, float eps, int64_t half, int64_t pos0,
-                        const float *inv_freq, float cos_sin_scale) {
+                        const int64_t *pos3, const float *inv_freq, float cos_sin_scale) {
     extern __shared__ float row[];  // D normalized values, then kNormThreads partial sums
     const int64_t t = blockIdx.x / heads, h = blockIdx.x % heads;
-    norm_rope_head(in + t * in_ts + h * in_hs, out + t * out_ts + h * out_hs, D, w, eps, half, pos0 + t, inv_freq,
-                   cos_sin_scale, row, row + D);
+    norm_rope_head(in + t * in_ts + h * in_hs, out + t * out_ts + h * out_hs, D, w, eps, half, pos0 + t,
+                   pos3 ? pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale, row, row + D);
 }
 
 // Multi-job: blocks job-major, T * heads of each; a job without w copies its heads verbatim.
@@ -81,6 +85,7 @@ struct NormRopeJobsArg {
     NormRopeJob j[kMaxNormRopeJobs];
     int n;
     int64_t max_d;
+    const int64_t *pos3 = nullptr;  // interleaved-mRoPE triples for rows 0..T-1 (null: scalar pos0 + t)
 };
 
 template <typename T>
@@ -99,7 +104,8 @@ __global__ void __launch_bounds__(kNormThreads)
         for (int64_t j = threadIdx.x; j < jb.D; j += blockDim.x) o[j] = x[j];
         return;
     }
-    norm_rope_head(x, o, jb.D, jb.w, eps, half, pos0 + t, inv_freq, cos_sin_scale, row, row + a.max_d);
+    norm_rope_head(x, o, jb.D, jb.w, eps, half, pos0 + t, a.pos3 ? a.pos3 + 3 * t : nullptr, inv_freq, cos_sin_scale,
+                   row, row + a.max_d);
 }
 
 // ---- attention: partial softmax per (key split, KV head, token), one wave per query head --------
@@ -307,7 +313,8 @@ __device__ __forceinline__ void lds_barrier() {
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
-template <bool GATHER>
+// One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied.
+template <bool GATHER, bool One>
 __global__ void __launch_bounds__(kWWaves * 32)
     attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, const uint16_t *kc,
                                   const uint16_t *vc, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
@@ -457,7 +464,8 @@ __global__ void __launch_bounds__(kWWaves * 32)
             const uint16_t hi = (uint16_t)((hb + 0x7fffu + ((hb >> 16) & 1u)) >> 16);  // p >= 0, finite: RNE
             const uint32_t lb = __float_as_uint(p - __uint_as_float((uint32_t)hi << 16));
             ph[r * kTLd + col] = hi;
-            pl[r * kTLd + col] = (uint16_t)((lb + 0x7fffu + ((lb >> 16) & 1u)) >> 16);
+            if constexpr (!One) pl[r * kTLd + col] = (uint16_t)((lb + 0x7fffu + ((lb >> 16) & 1u)) >> 16);
+            else (void)lb;
             if (col == 0) s_alpha[r] = alpha;
         }
         lds_barrier();  // P and the rescale factors complete
@@ -467,12 +475,14 @@ __global__ void __launch_bounds__(kWWaves * 32)
 #pragma unroll
             for (int j = 0; j < kDW / 16; ++j) o[j][v] *= alpha;
         }
-        const wmma_bf16x16 a_hi = wmma_load_rows(ph, kTLd), a_lo = wmma_load_rows(pl, kTLd);
+        const wmma_bf16x16 a_hi = wmma_load_rows(ph, kTLd);
+        wmma_bf16x16 a_lo{};
+        if constexpr (!One) a_lo = wmma_load_rows(pl, kTLd);
 #pragma unroll
         for (int j = 0; j < kDW / 16; ++j) {
             const wmma_bf16x16 b = wmma_load_rows(vtw + j * 16 * kTLd, kTLd);
             o[j] = wmma_bf16(a_hi, b, o[j]);
-            o[j] = wmma_bf16(a_lo, b, o[j]);
+            if constexpr (!One) o[j] = wmma_bf16(a_lo, b, o[j]);
         }
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");  // V reads done before this wave's next V writes
         __builtin_amdgcn_wave_barrier();
@@ -532,7 +542,8 @@ void check_shape(const AttentionShape &s) {
 
 void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64_t out_ts, int64_t out_hs, int64_t T,
                   int64_t heads, int64_t D, const float *w, float eps, int64_t rot_dim, int64_t pos0,
-                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale) {
+                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale, const MropePos &pos3) {
+    const char *fn = "qk_norm_rope";
     STRIX_CHECK(in != nullptr && out != nullptr && w != nullptr && inv_freq != nullptr,
                 "qk_norm_rope: null pointer (in=", in, ", out=", out, ", w=", (const void *)w,
                 ", inv_freq=", (const void *)inv_freq, ")");
@@ -545,6 +556,10 @@ void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64
                 "qk_norm_rope: cos_sin_scale = ", cos_sin_scale, ", expected finite, 1..2 (YaRN's attention factor)");
     STRIX_CHECK(pos0 >= 0 && pos0 + T <= kMaxPos, "qk_norm_rope: positions [", pos0, ", ", pos0 + T, ") outside [0, ",
                 kMaxPos, ")");
+    if (pos3.pos3 != nullptr)
+        STRIX_CHECK(pos3.rows >= T && pos3.base == pos0 && reinterpret_cast<uintptr_t>(pos3.pos3) % 8 == 0, fn,
+                    ": mRoPE positions cover rows [", pos3.base, ", ", pos3.base + pos3.rows, "), expected to start at ",
+                    pos0, " and cover ", T, " (aligned to ", 8, " B)");
     for (auto [ts, hs, what] : {std::tuple{in_ts, in_hs, "in"}, std::tuple{out_ts, out_hs, "out"}})
         STRIX_CHECK((heads == 1 || hs >= D) && hs >= 0 && ts >= (heads - 1) * hs + D, "qk_norm_rope: ", what,
                     " strides (token ", ts, ", head ", hs, ") overlap for ", heads, " heads of ", D);
@@ -563,16 +578,18 @@ void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64
     if (act == Act::F32)
         qk_norm_rope_kernel<float><<<grid, block, lds, stream>>>(static_cast<const float *>(in), in_ts, in_hs,
                                                                  static_cast<float *>(out), out_ts, out_hs, heads, D, w,
-                                                                 eps, rot_dim / 2, pos0, inv_freq, cos_sin_scale);
+                                                                 eps, rot_dim / 2, pos0, pos3.pos3, inv_freq,
+                                                                 cos_sin_scale);
     else
         qk_norm_rope_kernel<uint16_t><<<grid, block, lds, stream>>>(static_cast<const uint16_t *>(in), in_ts, in_hs,
                                                                     static_cast<uint16_t *>(out), out_ts, out_hs, heads,
-                                                                    D, w, eps, rot_dim / 2, pos0, inv_freq, cos_sin_scale);
+                                                                    D, w, eps, rot_dim / 2, pos0, pos3.pos3, inv_freq,
+                                                                    cos_sin_scale);
     STRIX_HIP_CHECK_LAUNCH("qk_norm_rope ", act_name(act), " T=", T, " heads=", heads, " D=", D);
 }
 
 void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int64_t rot_dim, int64_t pos0,
-                       const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale) {
+                       const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale, const MropePos &pos3) {
     const char *fn = "qk_norm_rope_jobs";
     STRIX_CHECK(jobs != nullptr && n >= 1 && n <= kMaxNormRopeJobs, fn, ": ", n, " jobs (", (const void *)jobs,
                 "), expected 1..", kMaxNormRopeJobs);
@@ -583,6 +600,10 @@ void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int
     STRIX_CHECK(std::isfinite(cos_sin_scale) && cos_sin_scale >= 1.0f && cos_sin_scale <= 2.0f, fn,
                 ": cos_sin_scale = ", cos_sin_scale, ", expected finite, 1..2 (YaRN's attention factor)");
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
+    if (pos3.pos3 != nullptr)
+        STRIX_CHECK(pos3.rows >= T && pos3.base == pos0 && reinterpret_cast<uintptr_t>(pos3.pos3) % 8 == 0, fn,
+                    ": mRoPE positions cover rows [", pos3.base, ", ", pos3.base + pos3.rows, "), expected to start at ",
+                    pos0, " and cover ", T, " (aligned to ", 8, " B)");
     const int64_t es = act == Act::F32 ? 4 : 2;
     NormRopeJobsArg a{};
     a.n = n;
@@ -626,6 +647,7 @@ void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int
             STRIX_CHECK(k == m || disjoint(outs[k], outs[m]), fn, ": jobs ", k, " and ", m, " write overlapping outputs");
         }
     STRIX_CHECK(blocks <= 0x7fffffff, fn, ": ", blocks, " blocks");
+    a.pos3 = pos3.pos3;  // validated above; the rows start at pos0, as the kernel indexes them
     const size_t lds = (size_t)(a.max_d + kNormThreads) * 4;
     if (act == Act::F32)
         qk_norm_rope_jobs_kernel<float><<<(unsigned)blocks, kNormThreads, lds, stream>>>(a, T, eps, rot_dim / 2, pos0,
@@ -765,20 +787,28 @@ void report_attention_error(const uint32_t e[3], const char *what) {
 namespace {
 void wmma_attention_launch(bool gather, const void *q, const void *gate, const void *k_cache, const void *v_cache,
                            const AttentionShape &s, int64_t n, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
-                           float scale, void *out, float *workspace, uint32_t *err, hipStream_t stream) {
+                           float scale, void *out, float *workspace, uint32_t *err, hipStream_t stream,
+                           AttnPrecision precision) {
     const int64_t kps = keys_per_split(s, n), splits = (n + kps - 1) / kps;
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block(kWWaves * 32);
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const auto *qb = static_cast<const uint16_t *>(q), *kb = static_cast<const uint16_t *>(k_cache),
                *vb = static_cast<const uint16_t *>(v_cache);
-    if (gather)
-        attention_partial_wmma_kernel<true><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq, s.Hk, s.pos0,
-                                                                        kps, scale, workspace, splits, sel, nsel,
-                                                                        sel_ld, err);
-    else
-        attention_partial_wmma_kernel<false><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq, s.Hk,
-                                                                         s.pos0, kps, scale, workspace, splits,
-                                                                         nullptr, nullptr, 0, nullptr);
+    auto partial = [&](auto one) {
+        constexpr bool One = decltype(one)::value;
+        if (gather)
+            attention_partial_wmma_kernel<true, One><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq, s.Hk,
+                                                                                 s.pos0, kps, scale, workspace, splits,
+                                                                                 sel, nsel, sel_ld, err);
+        else
+            attention_partial_wmma_kernel<false, One><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq,
+                                                                                  s.Hk, s.pos0, kps, scale, workspace,
+                                                                                  splits, nullptr, nullptr, 0, nullptr);
+    };
+    STRIX_CHECK(precision == AttnPrecision::Exact || precision == AttnPrecision::Fast,
+                "attention (WMMA): unknown precision ", (int)precision);
+    if (precision == AttnPrecision::Fast) partial(std::true_type{});
+    else partial(std::false_type{});
     attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                      static_cast<const uint16_t *>(gate), s.q_ts,
                                                                      s.q_hs, s.Hq, static_cast<uint16_t *>(out));
@@ -816,13 +846,13 @@ size_t attention_wmma_workspace_bytes(const AttentionShape &s) {
 
 void attention_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
                     const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
-                    hipStream_t stream) {
+                    hipStream_t stream, AttnPrecision precision) {
     const char *fn = "attention_wmma";
     wmma_attention_checks(fn, q, gate, k_cache, v_cache, out, workspace, capacity, s, scale, act);
     const size_t need = attention_wmma_workspace_bytes(s);
     STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
     wmma_attention_launch(false, q, gate, k_cache, v_cache, s, s.pos0 + s.T, nullptr, nullptr, 0, scale, out, workspace,
-                          nullptr, stream);
+                          nullptr, stream, precision);
     STRIX_HIP_CHECK_LAUNCH(fn, " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
 }
 
@@ -836,7 +866,7 @@ size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t 
 void attention_gathered_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache,
                              int64_t capacity, const AttentionShape &s, const int32_t *sel, const int32_t *nsel,
                              int64_t sel_ld, float scale, void *out, float *workspace, size_t workspace_bytes,
-                             uint32_t *err, Act act, hipStream_t stream) {
+                             uint32_t *err, Act act, hipStream_t stream, AttnPrecision precision) {
     const char *fn = "attention_gathered_wmma";
     wmma_attention_checks(fn, q, gate, k_cache, v_cache, out, workspace, capacity, s, scale, act);
     STRIX_CHECK(sel != nullptr && nsel != nullptr && err != nullptr, fn, ": null pointer (sel=", (const void *)sel,
@@ -844,7 +874,7 @@ void attention_gathered_wmma(const void *q, const void *gate, const void *k_cach
     const size_t need = attention_gathered_wmma_workspace_bytes(s, sel_ld);
     STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
     wmma_attention_launch(true, q, gate, k_cache, v_cache, s, gathered_max_keys(s, sel_ld), sel, nsel, sel_ld, scale,
-                          out, workspace, err, stream);
+                          out, workspace, err, stream, precision);
     STRIX_HIP_CHECK_LAUNCH(fn, " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
 }
 

@@ -20,6 +20,10 @@ if(NOT EXISTS "${STRIX_ROCM_ROOT}/include/hip/hip_runtime.h")
                         "include/hip/hip_runtime.h - expected an extracted TheRock tarball there. Point at yours with "
                         "-DSTRIX_ROCM_ROOT=PATH or the STRIX_ROCM_ROOT environment variable.")
 endif()
+# C (only the vendored libwebp decoder, third_party/libwebp): the same TheRock clang, never the system cc.
+if(NOT DEFINED CACHE{CMAKE_C_COMPILER})
+    set(CMAKE_C_COMPILER "${STRIX_ROCM_ROOT}/lib/llvm/bin/clang")
+endif()
 if(NOT DEFINED CACHE{CMAKE_CXX_COMPILER})
     set(CMAKE_CXX_COMPILER "${STRIX_ROCM_ROOT}/lib/llvm/bin/clang++")
     if(NOT EXISTS "${CMAKE_CXX_COMPILER}")
@@ -53,7 +57,7 @@ else()
     set(strix_stdlib_from "the GCC install clang found")
 endif()
 
-project(strix-infer LANGUAGES CXX)
+project(strix-infer LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -149,6 +153,7 @@ target_include_directories(strix_formats PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_formats PUBLIC Threads::Threads)
 
 add_executable(convert_qwen4exp tools/convert_qwen4exp.cpp)
+target_sources(convert_qwen4exp PRIVATE serve/json.cpp)  # --vision: config.json's vision_config (json.cpp is self-contained)
 target_link_libraries(convert_qwen4exp PRIVATE strix_formats)
 
 add_executable(convert_ngram_table tools/convert_ngram_table.cpp)
@@ -174,12 +179,12 @@ add_library(strix_kernels STATIC)
 strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/linear.hip kernels/linear_q4.hip kernels/linear_q56.hip kernels/linear_q8.hip
     kernels/swiglu.hip kernels/rope.hip kernels/attention.hip kernels/gdn.hip
     kernels/residual.hip kernels/moe_router.hip kernels/moe_grouped.hip kernels/wmma.hip kernels/linear_wmma.hip kernels/hc_wmma.hip kernels/hc.hip kernels/ple.hip kernels/qsa.hip
-    kernels/mtp_pick.hip kernels/logits_topk.hip)
+    kernels/mtp_pick.hip kernels/logits_topk.hip kernels/vision.hip)
 target_include_directories(strix_kernels PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 
-add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/strixw_loader.cpp
-    runtime/ngram_rows.cpp runtime/ngram_table.cpp)
+add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/vision_tower.cpp
+    runtime/strixw_loader.cpp runtime/ngram_rows.cpp runtime/ngram_table.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.
 option(STRIX_ROCTX "Compile in ROCTX ranges (forward / layer / sublayer) for rocprofv3 --marker-trace" OFF)
@@ -212,10 +217,29 @@ add_library(strix_serve STATIC
     serve/prompt_cache.cpp
     serve/resume_loss.cpp
     serve/capture.cpp
-    serve/host_buffer.cpp)
+    serve/host_buffer.cpp
+    serve/vision_preprocess.cpp
+    serve/vision_request.cpp)
 target_include_directories(strix_serve PUBLIC "${CMAKE_SOURCE_DIR}")
-target_include_directories(strix_serve SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
-target_link_libraries(strix_serve PUBLIC strix_formats Threads::Threads)
+target_include_directories(strix_serve SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib"
+                                             "${CMAKE_SOURCE_DIR}/third_party/stb")
+target_link_libraries(strix_serve PUBLIC strix_formats Threads::Threads strix_stb_impl strix_webp)
+
+# The vendored stb implementations, compiled once (third_party/stb/README.md). The test-only define
+# additionally compiles stb_image_write's (the tests' encode side; the engine never links it).
+add_library(strix_stb_impl STATIC third_party/stb_impl/stb_impl.cpp)
+target_include_directories(strix_stb_impl PUBLIC "${CMAKE_SOURCE_DIR}/third_party/stb")
+target_compile_definitions(strix_stb_impl PRIVATE STRIX_STB_IMPL_TEST_ONLY)
+set_source_files_properties(third_party/stb_impl/stb_impl.cpp PROPERTIES COMPILE_OPTIONS
+    "-Wno-missing-field-initializers")  # the vendored headers' own designated-init style (unmodified)
+
+# The vendored libwebp decoder (third_party/libwebp/README.strix.md): exactly the decoder subset of libwebp 1.6.0's
+# own makefile.unix lists, x86 only, unmodified, built as C11.
+file(GLOB strix_webp_sources CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/third_party/libwebp/src/*/*.c")
+add_library(strix_webp STATIC ${strix_webp_sources})
+target_include_directories(strix_webp SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/third_party/libwebp")
+set_target_properties(strix_webp PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+target_compile_options(strix_webp PRIVATE -O2 -w)  # third-party code kept unmodified, warnings included
 
 # The server on the real model (HIP runtime via strix_model).
 add_library(strix_serve_model STATIC serve/qwen4exp_backend.cpp)

@@ -92,6 +92,10 @@ constexpr int64_t kDeltaRuleChunkMinT = INT64_MAX;  // chunked not faster yet (s
 //              every product as BF16 hi + lo on both operands): prefill. Not bit-identical to the others (FP32
 //              rounding-level differences), so MTP rollback must not mix it with PerToken for one step.
 enum class DeltaRulePath { Auto, PerToken, Chunked, ChunkedWmma };
+// ChunkedWmma's products (config gdn-precision): Exact - BF16 hi + lo on both
+// operands, three products (state rel RMS vs the FP32 per-token kernel ~6e-6 after 4096 tokens); Fast - one BF16
+// product (~40% less kernel time, state rel RMS ~3e-3). The other paths are FP32 and ignore it.
+enum class DrPrecision { Exact, Fast };
 
 struct DeltaRuleShape {
     int64_t T = 0;
@@ -102,6 +106,6 @@ struct DeltaRuleShape {
 // Buffers must not overlap, except state_in == state_out.
 void delta_rule(const void *qkv, const float *beta, const float *g, const DeltaRuleShape &s, const float *state_in,
                 float *state_out, bool reset_state, void *out, Act act, hipStream_t stream,
-                DeltaRulePath path = DeltaRulePath::Auto);
+                DeltaRulePath path = DeltaRulePath::Auto, DrPrecision precision = DrPrecision::Exact);
 
 }  // namespace strix::kernels

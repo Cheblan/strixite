@@ -8,6 +8,7 @@
 #include "common/check.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <cmath>
@@ -18,6 +19,19 @@ namespace strix {
 namespace {
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 }  // namespace
+
+bool ends_sentence(std::string_view tail) {
+    if (tail.empty()) return false;
+    if (tail.back() == '\n') return true;
+    const size_t line = tail.rfind('\n');
+    const std::string_view cur = line == std::string_view::npos ? tail : tail.substr(line + 1);
+    if (std::count(cur.begin(), cur.end(), '`') % 2 != 0) return false;  // inside inline code
+    size_t n = cur.size();
+    while (n > 0 && std::string_view(")]\"'*").find(cur[n - 1]) != std::string_view::npos) --n;  // closing marks
+    if (n < 2 || std::string_view(".!?").find(cur[n - 1]) == std::string_view::npos) return false;
+    const unsigned char before = (unsigned char)cur[n - 2];
+    return std::isalpha(before) || before == ')' || before == '`' || before == '"' || before == '\'' || before >= 0x80;
+}
 
 Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     : be_(backend),
@@ -87,6 +101,9 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
     STRIX_CHECK(sink != nullptr, "Engine::submit: null sink");
     STRIX_CHECK(!req.prompt.empty(), "Engine::submit: empty prompt");
     STRIX_CHECK(req.thinking_budget >= -1, "Engine::submit: thinking budget ", req.thinking_budget, " (-1 = none)");
+    STRIX_CHECK(req.thinking_budget_grace >= 0 && (req.thinking_budget_grace == 0 || req.thinking_budget >= 0),
+                "Engine::submit: thinking budget grace ", req.thinking_budget_grace, " (expected >= 0, and 0 without a budget: ",
+                req.thinking_budget, ")");
     STRIX_CHECK(req.max_tokens >= 1 && (int64_t)req.prompt.size() + req.max_tokens <= capacity_,
                 "Engine::submit: prompt ", req.prompt.size(), " + max_tokens ", req.max_tokens, " exceed the capacity ",
                 capacity_, " (the API layer clamps)");
@@ -385,14 +402,48 @@ void Engine::run(Job &job) {
     };
     try {
         sink.on_start();
-        const std::vector<int32_t> &prompt = req.prompt;
+        // Image prompt (vision, Phase D): resume / cache matching and seq_ run on the key stream (image_pad
+        // runs replaced by content-derived pseudo ids, serve/vision_request.cpp), the forwards on the real
+        // ids. Text prompts: both are req.prompt - the path is bit-identical and allocation-free.
+        const bool has_images = !req.image_pos3.empty();
+        STRIX_CHECK(req.prefill_images.empty() == !has_images,
+                    "Engine::run: ", req.prefill_images.size(), " prefill images with ",
+                    req.image_pos3.size() / 3, " triple rows - an image prompt carries both");
+        if (has_images) {
+            STRIX_CHECK(be_.has_vision(), "Engine::run: an image prompt on a backend without a vision tower");
+            STRIX_CHECK(req.image_pos3.size() == 3 * req.prompt.size(),
+                        "Engine::run: ", req.image_pos3.size() / 3, " walk rows for a prompt of ",
+                        req.prompt.size());
+            STRIX_CHECK(!req.cache_key.empty() && req.cache_key.size() == req.prompt.size(),
+                        "Engine::run: an image prompt must carry its cache-key stream (",
+                        req.cache_key.size(), " ids for a prompt of ", req.prompt.size(), ")");
+            for (const PrefillImage &im : req.prefill_images)
+                STRIX_CHECK(im.row_start >= 0 && im.rows >= 1 && im.row_start + im.rows <= (int64_t)req.prompt.size() &&
+                                im.prefill.grid_t == 1 && im.prefill.grid_h >= 2 && im.prefill.grid_w >= 2,
+                            "Engine::run: image block rows [", im.row_start, ", ", im.row_start + im.rows,
+                            ") outside the prompt of ", req.prompt.size(), " (grid ", im.prefill.grid_h, "x",
+                            im.prefill.grid_w, ")");
+        }
+        const std::vector<int32_t> &prompt = has_images ? req.cache_key : req.prompt;
         const int64_t P = (int64_t)prompt.size();
         bool from_disk = false, from_ram = false;
         int64_t live_common = 0;  // before resume_point moves the live session
         while (live_common < (int64_t)seq_.size() && live_common < P && seq_[(size_t)live_common] == prompt[(size_t)live_common])
             ++live_common;
         const int64_t live_n = (int64_t)seq_.size();
-        const int64_t start = resume_point(prompt, req.id, from_disk, from_ram);
+        int64_t start = resume_point(prompt, req.id, from_disk, from_ram);
+        if (has_images && start > 0) {  // a state saved mid-image (or a key collision): the image rows would
+            bool mid_image = false;     // not be in it - prefill the whole prompt instead
+            for (const PrefillImage &im : req.prefill_images)
+                mid_image |= start > im.row_start && start < im.row_start + im.rows;
+            if (mid_image) {
+                be_.reset();
+                seq_.clear();
+                slog_row(LogLevel::Info, "resume", "lost: a saved state ends inside an image block - all %s "
+                         "tokens prefilled", fmt_n(P).c_str());
+                start = 0;
+            }
+        }
         report_resume_loss(prompt, start, live_common, live_n, req.id);
         res.cached_tokens = start;
         // Snapshot points: the prompt's last <|im_start|> (where the generation prompt begins; the next turn resumes
@@ -434,11 +485,31 @@ void Engine::run(Job &job) {
             return &row_masks;
         };
         // A chunk ends at the backend's max chunk, and at the turn / user-start / system snapshot points.
+        // An image prompt (Phase D) also ends at the image block edges: one forward carries one whole block
+        // (Phase B's one-image-per-forward contract), and a block ends at a max-chunk multiple before any
+        // forward can start inside it - so every image forward is exactly the block, the text before it in
+        // the forward it follows.
+        auto block_for = [&](int64_t pos) -> const PrefillImage * {
+            for (const PrefillImage &im : req.prefill_images)
+                if (im.row_start <= pos && pos < im.row_start + im.rows) return &im;
+            return nullptr;
+        };
         auto chunk_end = [&](int64_t pos) {
             int64_t end = std::min(P, pos + be_.max_chunk());
             if (cut > pos && cut < end) end = cut;
             if (ust > pos && ust < end) end = ust;
             if (save_sys && sys > pos && sys < end) end = sys;
+            if (has_images) {
+                if (const PrefillImage *im = block_for(pos)) {
+                    const int64_t blk_end = im->row_start + im->rows;
+                    STRIX_CHECK(blk_end <= end, "Engine::run: the image block at row ", im->row_start,
+                                " ends at ", blk_end, ", past the forward end ", end, " (max chunk ",
+                                be_.max_chunk(), ") - the block must fit one forward");
+                    end = blk_end;
+                }
+                for (const PrefillImage &im : req.prefill_images)
+                    if (im.row_start > pos && im.row_start < end) end = im.row_start;
+            }
             return end;
         };
         const double t_prefill = now_s();
@@ -448,10 +519,22 @@ void Engine::run(Job &job) {
             be_.save_snapshot(LmBackend::kUserSlot);
         for (int64_t pos = start; pos < P;) {
             const int64_t end = chunk_end(pos);
-            if (end < P)
-                be_.set_lookahead(std::vector<int32_t>(prompt.begin() + end, prompt.begin() + chunk_end(end)));
-            logits = be_.forward_rows(std::vector<int32_t>(prompt.begin() + pos, prompt.begin() + end), end == P ? 1 : 0,
-                                      cands, n_valid, end == P ? masks_for({}) : nullptr);
+            if (end < P)  // the real ids: the lookahead feeds ple_ngram_ids, and the negative cache-key ids
+                be_.set_lookahead(std::vector<int32_t>(req.prompt.begin() + end,  // are matchers, never model
+                                  req.prompt.begin() + chunk_end(end)));          // inputs (vision)
+            if (const PrefillImage *im = block_for(pos)) {  // the whole block (chunk_end checked), in one forward
+                STRIX_CHECK(pos == im->row_start && end == im->row_start + im->rows,
+                            "Engine::run: the image forward covers rows [", pos, ", ", end, "), the block is [",
+                            im->row_start, ", ", im->row_start + im->rows, ")");
+                logits = be_.forward_image_prefill(
+                    std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end), *im,
+                    std::vector<int64_t>(req.image_pos3.begin() + 3 * pos, req.image_pos3.begin() + 3 * end),
+                    end == P ? 1 : 0, cands, n_valid, end == P ? masks_for({}) : nullptr);
+            } else {
+                logits = be_.forward_rows(std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end),
+                                          end == P ? 1 : 0, cands, n_valid,
+                                          end == P ? masks_for({}) : nullptr);
+            }
             seq_.insert(seq_.end(), prompt.begin() + pos, prompt.begin() + end);
             pos = end;
             if (pos == cut) be_.save_snapshot(LmBackend::kTurnSlot);
@@ -500,8 +583,25 @@ void Engine::run(Job &job) {
                 ++res.think_end_blocked;
         };
         // A sampled token just fed to the parser: the nudge watch follows the reasoning ones.
+        // think_tail: the reasoning text's last bytes, for the budget's sentence-end wait (ends_sentence).
+        std::string think_tail;
         const auto watch_tok = [&](int32_t t) {
-            if (options_.think_nudge && parser.in_reasoning()) watch.observe(t, tok_.decode({t}));
+            if (!parser.in_reasoning()) return;
+            const std::string piece = tok_.decode({t});
+            if (options_.think_nudge) watch.observe(t, piece);
+            if (req.thinking_budget_grace > 0) {
+                think_tail += piece;
+                if (think_tail.size() > 512) think_tail.erase(0, think_tail.size() - 256);
+            }
+        };
+        // The thinking budget's stop is due: the budget spent and - with a grace - the reasoning at a sentence end, or
+        // the grace spent too.
+        const auto stop_due = [&] {
+            if (req.thinking_budget < 0 || res.thinking_budget_hit || !parser.in_reasoning()) return false;
+            const int64_t n = parser.reasoning_tokens();
+            if (n < req.thinking_budget) return false;
+            return req.thinking_budget_grace == 0 || n >= req.thinking_budget + req.thinking_budget_grace ||
+                   ends_sentence(think_tail);
         };
         std::vector<OutputEvent> events;
         std::string reason;
@@ -550,8 +650,7 @@ void Engine::run(Job &job) {
             // alone first - the old rollback path, for this step only - so the injection lands after it. Waiting for a
             // step without a carry instead could wait for ever: with every draft rejected, every step carries one.
             if (carry >= 0) {
-                const bool budget_due = req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
-                                        parser.reasoning_tokens() >= req.thinking_budget;
+                const bool budget_due = stop_due();
                 const bool nudge_due = options_.think_nudge && parser.in_reasoning() && watch.due() != 0;
                 if (budget_due || nudge_due) {
                     ++res.decode_forwards;
@@ -563,8 +662,7 @@ void Engine::run(Job &job) {
             }
             // Thinking budget spent: the engine closes the think block itself (fed, not sampled), then goes on sampling. Never
             // while a carried token waits (flushed just above when due): the injection would be forwarded ahead of it.
-            if (carry < 0 && req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
-                parser.reasoning_tokens() >= req.thinking_budget) {
+            if (carry < 0 && stop_due()) {
                 const int64_t n = (int64_t)thinking_stop_.size();
                 if (res.completion_tokens + n >= req.max_tokens) {  // no room left for it and an answer
                     reason = "length";
@@ -645,8 +743,9 @@ void Engine::run(Job &job) {
 
             // MTP: up to mtp_draft greedy drafts from the head (chained), each while its top-1 margin reaches
             // mtp_margin (and no end-of-turn); one verify forward of id + the drafts. Each position's token is still
-            // sampled from the trunk's own logits (row j) - a draft only saves the forward when it matches.
-            if (be_.has_mtp()) {
+            // sampled from the trunk's own logits (row j) - a draft only saves the forward when it matches. No drafts
+            // when id brought the budget's stop due: the stop follows id directly.
+            if (be_.has_mtp() && !stop_due()) {
                 const int64_t room = req.max_tokens - res.completion_tokens;  // >= 1 here
                 const int64_t steps = std::min(options_.mtp_draft, room);
                 std::vector<int32_t> ids{id};
@@ -680,7 +779,7 @@ void Engine::run(Job &job) {
                     // Accept drafts while the sampled token is the draft.
                     int64_t j = 0;
                     int32_t v = -1;
-                    bool ended = false;
+                    bool ended = false, cut = false;
                     for (; j < k; ++j) {
                         guard(ml, j);
                         v = sampler.sample(ml, j);
@@ -696,6 +795,21 @@ void Engine::run(Job &job) {
                             ++j;
                             break;
                         }
+                        // The budget's stop due after this draft, with drafts after it still unchecked: keep id and the
+                        // j + 1 accepted drafts and stop accepting, so the stop lands right here (at a sentence end)
+                        // rather than after the rest of the chain. Row j + 1 is the logits after the last kept draft.
+                        if (j + 1 < k && stop_due()) {
+                            ++j;
+                            cut = true;
+                            break;
+                        }
+                    }
+                    if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
+                        be_.keep_verify_prefix(ids, j + 1);
+                        seq_.insert(seq_.end(), ids.begin(), ids.begin() + j + 1);
+                        step(k, j, j + 1);
+                        logits = ml.row_of(j);
+                        continue;
                     }
                     if (ended) {  // keep id + the j accepted drafts in the session, drop the rest
                         if (j < k) be_.keep_verify_prefix(ids, j + 1);
@@ -778,7 +892,9 @@ void Engine::run(Job &job) {
             slog_row(LogLevel::Info, "guard", "end of turn blocked inside the think block or a tool call %s time%s (it was the top token)",
                      fmt_n(res.think_end_blocked).c_str(), res.think_end_blocked == 1 ? "" : "s");
         finish(reason);
-        if (!options_.capture_dir.empty() && reason != "cancelled") capture(req, steps, reason);
+        // Captures replay token streams - an image prompt's stream carries image_pad rows without their
+        // pixels, so image requests are not captured.
+        if (!options_.capture_dir.empty() && reason != "cancelled" && !has_images) capture(req, steps, reason);
         // After the response: the new prefixes go to the prompt cache's RAM tier (the disk only later, if at all).
         if (cache_ && reason != "cancelled") {
             const double t0 = now_s();

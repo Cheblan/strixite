@@ -184,6 +184,35 @@ public:
     size_t shards() const { return files_.size(); }
     uint64_t bytes() const { return bytes_; }
     const std::string &fingerprint() const { return fingerprint_; }
+    // Point the checkpoint's mtp.* tensors named in `path` at that file instead (Options::mtp_from). Returns the
+    // file's fingerprint (its size and header) and the count replaced.
+    std::pair<std::string, size_t> override_mtp(const std::string &path) {
+        STRIX_CHECK(fs::is_regular_file(path), "convert: --mtp-from '", path, "' is not a file");
+        files_.push_back(std::make_unique<SafetensorsFile>(path));
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        STRIX_CHECK(fd >= 0, "convert: open '", path, "' failed: ", std::strerror(errno));
+        fds_.push_back(fd);
+        size_t n = 0;
+        for (const TensorInfo &ti : files_.back()->tensors()) {
+            STRIX_CHECK(ti.name.rfind("mtp.", 0) == 0, "convert: --mtp-from '", path, "' holds '", ti.name,
+                        "' - only mtp.* tensors may be replaced");
+            auto it = where_.find(ti.name);
+            STRIX_CHECK(it != where_.end(), "convert: --mtp-from tensor '", ti.name, "' isn't in the checkpoint");
+            const TensorInfo &orig = *it->second.second;
+            STRIX_CHECK(orig.dtype == ti.dtype && orig.shape == ti.shape, "convert: --mtp-from '", ti.name, "' is ",
+                        dtype_name(ti.dtype), " ", shape_str(ti.shape), ", the checkpoint's ", dtype_name(orig.dtype),
+                        " ", shape_str(orig.shape));
+            it->second = std::make_pair(files_.size() - 1, &ti);
+            ++n;
+        }
+        STRIX_CHECK(n > 0, "convert: --mtp-from '", path, "' holds no tensors");
+        uint64_t hlen = 0;
+        STRIX_CHECK(::pread(fd, &hlen, 8, 0) == 8 && hlen < (1ull << 30), "convert: bad header length in '", path, "'");
+        std::string h(hlen, '\0');
+        STRIX_CHECK(::pread(fd, h.data(), hlen, 8) == (ssize_t)hlen, "convert: short header read in '", path, "'");
+        const std::string fp = std::to_string(files_.back()->file_size()) + ":" + h;
+        return {hex64(strix_hash64(fp.data(), fp.size())), n};
+    }
     bool has(const std::string &name) const { return where_.count(name) != 0; }
     const TensorInfo &info(const std::string &name) const {
         auto it = where_.find(name);
@@ -560,7 +589,9 @@ ConvertPlan make_plan(const Source &src, const ConvertOptions &opt) {
         p.layer("mtp.layers.0.", -2);
     }
     for (const std::string &n : src.names())
-        if (n.rfind("model.visual.", 0) == 0) p.plan.skipped.emplace_back(n, "vision tower: not loaded (text only)");
+        if (n.rfind("model.visual.", 0) == 0)
+            p.plan.skipped.emplace_back(n, opt.vision ? "vision tower: not in this file (written to vision.strixw)"
+                                                       : "vision tower: not loaded (text only)");
     // A full conversion accounts for every source tensor; anything unplanned is a spec gap, not a skip.
     const bool full = opt.layers.empty() && opt.globals && opt.mtp;
     if (full) {
@@ -775,6 +806,158 @@ std::string unit_name(int64_t unit, int64_t layers_total, const ConvertPlan &pla
            (full ? " - full attention (QSA)" : " - linear attention (GDN)");
 }
 
+// ---------------------------------------------------------------- vision tower (vision.strixw)
+
+// One expected vision tensor: checkpoint name and shape.
+struct VisionTensor {
+    std::string name;
+    std::vector<int64_t> shape;
+};
+
+// Validate the config.json "vision_config" fields and list every tensor the tower must have, in a stable
+// order (patch embed, position table, blocks in order, merger). The shapes are re-derived from the
+// config, not trusted from the checkpoint: a checkpoint whose tensors disagree with its own config is
+// an error below, and the loader later reads only this file.
+std::vector<VisionTensor> vision_expected(const VisionDims &vd) {
+    const auto pos = [&](int64_t v, const char *what) {
+        STRIX_CHECK(v > 0, "convert --vision: ", what, " = ", v, ", expected > 0 (from config.json vision_config)");
+    };
+    pos(vd.depth, "depth");
+    pos(vd.hidden_size, "hidden_size");
+    pos(vd.num_heads, "num_heads");
+    pos(vd.intermediate_size, "intermediate_size");
+    pos(vd.in_channels, "in_channels");
+    pos(vd.patch_size, "patch_size");
+    pos(vd.temporal_patch_size, "temporal_patch_size");
+    pos(vd.spatial_merge_size, "spatial_merge_size");
+    pos(vd.out_hidden_size, "out_hidden_size");
+    pos(vd.num_position_embeddings, "num_position_embeddings");
+    STRIX_CHECK(vd.hidden_size % vd.num_heads == 0, "convert --vision: hidden_size ", vd.hidden_size,
+                " is not a multiple of num_heads ", vd.num_heads);
+    STRIX_CHECK(vd.hidden_act == "gelu_pytorch_tanh", "convert --vision: hidden_act '", vd.hidden_act,
+                "' - only gelu_pytorch_tanh is known for this tower; a different activation needs a new spec");
+    const int64_t h = vd.hidden_size, inter = vd.intermediate_size;
+    const int64_t m2 = vd.spatial_merge_size * vd.spatial_merge_size;
+    std::vector<VisionTensor> v;
+    v.push_back({"model.visual.patch_embed.proj.weight",
+                 {h, vd.in_channels, vd.temporal_patch_size, vd.patch_size, vd.patch_size}});
+    v.push_back({"model.visual.patch_embed.proj.bias", {h}});
+    v.push_back({"model.visual.pos_embed.weight", {vd.num_position_embeddings, h}});
+    for (int64_t b = 0; b < vd.depth; ++b) {
+        const std::string P = "model.visual.blocks." + std::to_string(b) + ".";
+        v.push_back({P + "attn.qkv.weight", {3 * h, h}});
+        v.push_back({P + "attn.qkv.bias", {3 * h}});
+        v.push_back({P + "attn.proj.weight", {h, h}});
+        v.push_back({P + "attn.proj.bias", {h}});
+        v.push_back({P + "mlp.linear_fc1.weight", {inter, h}});
+        v.push_back({P + "mlp.linear_fc1.bias", {inter}});
+        v.push_back({P + "mlp.linear_fc2.weight", {h, inter}});
+        v.push_back({P + "mlp.linear_fc2.bias", {h}});
+        v.push_back({P + "norm1.weight", {h}});
+        v.push_back({P + "norm1.bias", {h}});
+        v.push_back({P + "norm2.weight", {h}});
+        v.push_back({P + "norm2.bias", {h}});
+    }
+    v.push_back({"model.visual.merger.norm.weight", {h}});
+    v.push_back({"model.visual.merger.norm.bias", {h}});
+    v.push_back({"model.visual.merger.linear_fc1.weight", {h * m2, h * m2}});
+    v.push_back({"model.visual.merger.linear_fc1.bias", {h * m2}});
+    v.push_back({"model.visual.merger.linear_fc2.weight", {vd.out_hidden_size, h * m2}});
+    v.push_back({"model.visual.merger.linear_fc2.bias", {vd.out_hidden_size}});
+    return v;
+}
+
+// The tower tensors: every expected one present with exactly its BF16 dtype and shape, and nothing
+// visual in the checkpoint that isn't expected (an unaccounted-for tensor is a spec gap, same rule as
+// the text plan).
+std::vector<StrixwTensor> plan_vision(const Source &src, const VisionDims &vd) {
+    std::vector<StrixwTensor> out;
+    for (const VisionTensor &e : vision_expected(vd)) {
+        const TensorInfo &ti = src.info(e.name);  // throws, naming the checkpoint, if absent
+        STRIX_CHECK(ti.dtype == Dtype::BF16, "convert --vision: '", e.name, "' is ", dtype_name(ti.dtype),
+                    ", expected BF16");
+        STRIX_CHECK(ti.shape == e.shape, "convert --vision: '", e.name, "' has shape ", shape_str(ti.shape),
+                    ", config.json vision_config implies ", shape_str(e.shape));
+        StrixwTensor t;
+        t.name = e.name, t.encoding = StrixwEncoding::BF16, t.shape = e.shape;
+        out.push_back(std::move(t));
+    }
+    std::set<std::string> expected;
+    for (const StrixwTensor &t : out) expected.insert(t.name);
+    std::vector<std::string> extra;
+    for (const std::string &n : src.names())
+        if (n.rfind("model.visual.", 0) == 0 && !expected.count(n)) extra.push_back(n);
+    std::string list;
+    for (size_t i = 0; i < extra.size() && i < 10; ++i) list += "\n  " + extra[i];
+    STRIX_CHECK(extra.empty(), "convert --vision: ", extra.size(),
+                " checkpoint vision tensors aren't in the tower spec (vision_expected lists what must be there):",
+                list);
+    return out;
+}
+
+// vision.strixw: the whole tower as exact BF16 copies in its own strixw file:
+// weights.strixw never carries it, so existing downloads stay valid and the server loads it only with
+// vision = on. Written the same way as the text file: .partial, re-opened and component-hash verified,
+// then renamed.
+void write_vision_strixw(const Source &src, const ConvertOptions &opt, Log &log, int threads, ConvertResult &res) {
+    STRIX_CHECK(!opt.vision_config_json.empty(),
+                "convert --vision: vision_config_json is empty - the new file's index must carry the tower config");
+    const std::string final_path = opt.out_dir + "/vision.strixw", partial = final_path + ".partial";
+    std::vector<StrixwTensor> tensors = plan_vision(src, opt.vision_dims);
+    uint64_t out_bytes = 0, src_bytes = 0;
+    for (StrixwTensor &t : tensors) {
+        t.components = strixw_components(t);
+        out_bytes += t.bytes();
+        src_bytes += src.info(t.name).byte_length;
+    }
+    log.blank();
+    log.rule("vision tower \u00b7 " + fmt_bytes((double)src_bytes) + " of source");
+    log.note("bf16 exact: every model.visual.* tensor is copied bit for bit - the tower runs once per image, so "
+             "quantizing it saves memory, not time, and nothing measured asks for that yet.");
+    std::map<std::string, std::string> meta = {
+        {"arch", "qwen4exp"},
+        {"kind", "vision"},
+        {"layout", "bf16"},
+        {"source_dir", opt.src_dir},
+        {"source_fingerprint", src.fingerprint()},
+        {"converter_git", opt.git},
+        {"created", utc_now()},
+        {"vision_config", opt.vision_config_json},
+        {"depth", std::to_string(opt.vision_dims.depth)},
+        {"complete", "yes"},
+        {"format_note", "vision tower (0.45B): BF16 exact copies; the text weights file does not contain them"}};
+    StrixwWriter writer(partial, meta, tensors);
+    log("writing %s (%s, %zu tensors)", partial.c_str(), fmt_bytes((double)writer.file_bytes()).c_str(),
+        tensors.size());
+    const auto tv0 = Clock::now();
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const TensorInfo &ti = src.info(tensors[i].name);
+        std::vector<uint8_t> b(ti.byte_length);
+        src.read(tensors[i].name, 0, ti.byte_length, b.data());
+        writer.write(i, StrixwRole::Data, b.data(), b.size());
+        if (i < 3 || i + 1 == tensors.size() || (i + 1) % 100 == 0)
+            log("  %-8s %-56s %-16s %10s", "bf16", tensors[i].name.c_str(), shape_str(ti.shape).c_str(),
+                fmt_bytes((double)ti.byte_length).c_str());
+    }
+    writer.finish();
+    {
+        const StrixwFile check(partial);
+        STRIX_CHECK(check.tensors().size() == tensors.size(), "convert --vision: the written file has ",
+                    check.tensors().size(), " tensors, planned ", tensors.size());
+        STRIX_CHECK(check.meta("kind") == "vision", "convert --vision: kind metadata ", check.meta("kind"));
+        check.verify_hashes(threads);
+    }
+    if (const int fd = ::open(partial.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {  // don't leave it cached
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(fd);
+    }
+    fs::rename(partial, final_path);
+    res.vision_path = final_path;
+    res.output_bytes += out_bytes, res.source_bytes += src_bytes;
+    log("  \u2713 %s: %zu tensors, %s, verified, in %s", final_path.c_str(), tensors.size(),
+        fmt_bytes((double)out_bytes).c_str(), fmt_dur(std::chrono::duration<double>(Clock::now() - tv0).count()).c_str());
+}
+
 }  // namespace
 
 const char *convert_op_name(ConvertOp op) {
@@ -799,10 +982,29 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
     const int threads = opt.threads > 0 ? opt.threads : (int)std::max(1u, std::thread::hardware_concurrency());
     Log log(opt.console, t0);
     ConvertResult res;
+    if (opt.tower_only) {
+        STRIX_CHECK(opt.vision, "convert --tower-only: the tower file is exactly what --vision writes, "
+                    "set both (or run the full conversion with --vision)");
+        STRIX_CHECK(!opt.plan_only, "convert --tower-only --plan: --plan already logs the tower's tensors");
+        const std::string vpath = opt.out_dir + "/vision.strixw";
+        STRIX_CHECK(!fs::exists(vpath), "convert --tower-only: '", vpath, "' already exists - remove it "
+                    "first (the converter never overwrites a finished file)");
+        fs::create_directories(opt.out_dir);
+        Source tsrc(opt.src_dir);
+        log.rule("strix-infer converter \u00b7 tower only (vision.strixw)");
+        log("  %zu shards, %s of tensor data, fingerprint %s", tsrc.shards(),
+            fmt_bytes((double)tsrc.bytes()).c_str(), tsrc.fingerprint().c_str());
+        write_vision_strixw(tsrc, opt, log, threads, res);
+        res.seconds = log.elapsed();
+        return res;
+    }
     const std::string final_path = opt.out_dir + "/weights.strixw", partial = final_path + ".partial";
     if (!opt.plan_only) {
         STRIX_CHECK(!fs::exists(final_path), "convert: '", final_path,
                     "' already exists - remove it first (the converter never overwrites a finished file)");
+        if (opt.vision)
+            STRIX_CHECK(!fs::exists(opt.out_dir + "/vision.strixw"), "convert: '", opt.out_dir,
+                        "/vision.strixw' already exists - remove it first (the converter never overwrites a finished file)");
         const bool fresh = !fs::exists(opt.out_dir);
         fs::create_directories(opt.out_dir);
         log.open_file(opt.out_dir + "/convert.log");
@@ -813,7 +1015,14 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
     log("converter git %s, %d threads", opt.git.c_str(), threads);
 
     log("reading the checkpoint's headers from %s ...", opt.src_dir.c_str());
-    const Source src(opt.src_dir);
+    Source src(opt.src_dir);
+    std::string mtp_source;
+    if (!opt.mtp_from.empty()) {
+        STRIX_CHECK(opt.mtp, "convert: --mtp-from with --no-mtp - nothing would use it");
+        const auto [fp, n] = src.override_mtp(opt.mtp_from);
+        mtp_source = opt.mtp_from + " (fingerprint " + fp + ", " + std::to_string(n) + " tensors)";
+        log("  mtp.* override: %s", mtp_source.c_str());
+    }
     log("  %zu shards, %s of tensor data, fingerprint %s", src.shards(), fmt_bytes((double)src.bytes()).c_str(),
         src.fingerprint().c_str());
 
@@ -855,6 +1064,9 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
     if (opt.plan_only) {
         for (const ConvertStep &s : plan.steps)
             log("  %-9s %-62s %s", convert_op_name(s.op), s.out.name.c_str(), shape_str(s.out.shape).c_str());
+        if (opt.vision)
+            for (const StrixwTensor &t : plan_vision(src, opt.vision_dims))
+                log("  %-9s %-62s %s", "bf16-vis", t.name.c_str(), shape_str(t.shape).c_str());
         log("plan only: nothing written");
         res.seconds = log.elapsed();
         return res;
@@ -877,6 +1089,7 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
         {"layers", layer_list},
         {"globals", opt.globals ? "yes" : "no"},
         {"mtp", opt.mtp ? "yes" : "no"},
+        {"mtp_source", mtp_source.empty() ? "checkpoint" : mtp_source},
         {"complete", complete ? "yes" : "no"},
         {"format_note", "embedding BF16 (not layout A's int8); n-gram table not included (OPEN)"}};
     StrixwWriter writer(partial, meta, outs);
@@ -1086,6 +1299,7 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
         fmt_bytes((double)planned_out / std::max(1e-9, vt)).c_str());
     fs::rename(partial, final_path);
     res.weights_path = final_path;
+    if (opt.vision) write_vision_strixw(src, opt, log, threads, res);
     res.seconds = log.elapsed();
     log("\u2714 done: %s -> %s, %zu tensors, %s in %s", fmt_bytes((double)planned_src).c_str(), final_path.c_str(),
         plan.steps.size(), fmt_bytes((double)planned_out).c_str(), fmt_dur(res.seconds).c_str());

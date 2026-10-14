@@ -20,6 +20,7 @@
 // KV cache: [capacity, Hk, D] per layer for K and V, activation dtype.
 
 #include "kernels/norm.hpp"  // Act
+#include "kernels/rope.hpp"  // MropePos (interleaved mRoPE triples)
 
 #include "common/hip_runtime.hpp"
 
@@ -34,16 +35,20 @@ namespace strix::kernels {
 // In place (out == in with the same strides) is allowed; otherwise the two
 // must not overlap. BF16 rounds the norm output, then RoPE rounds as usual -
 // the same values as rmsnorm_zc followed by rope (cos_sin_scale as there: YaRN's attention factor, 1 = plain).
+// pos3 (kernels/rope.hpp MropePos): interleaved-mRoPE section positions for the rows, null = scalar pos0 + t
+// (the text path's default - a null pos3 keeps today's kernel and values bit-for-bit).
 void qk_norm_rope(const void *in, int64_t in_ts, int64_t in_hs, void *out, int64_t out_ts, int64_t out_hs, int64_t T,
                   int64_t heads, int64_t D, const float *w, float eps, int64_t rot_dim, int64_t pos0,
-                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f);
+                  const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,
+                  const MropePos &pos3 = {});
 
 // Several qk_norm_rope jobs (and verbatim head copies) in one launch, for T tokens at positions pos0 + t: an
 // attention layer's q (in place), k (into the K cache), v (copied into the V cache), the indexer queries and a verify's
 // raw indexer-key save.
 // Each job is (in, in_ts, in_hs) -> (out, out_ts, out_hs) over heads heads of D, normed with w then roped on
 // rot_dim dims exactly as qk_norm_rope; w = nullptr copies the heads unchanged. Outputs may not overlap any
-// input except a job's own exactly in place, nor each other.
+// input except a job's own exactly in place, nor each other. pos3: interleaved-mRoPE section positions for
+// rows [pos0, pos0 + T), null = scalar pos0 + t (the text path's default).
 struct NormRopeJob {
     const void *in = nullptr;
     int64_t in_ts = 0, in_hs = 0;
@@ -53,7 +58,8 @@ struct NormRopeJob {
 };
 constexpr int kMaxNormRopeJobs = 5;
 void qk_norm_rope_jobs(const NormRopeJob *jobs, int n, int64_t T, float eps, int64_t rot_dim, int64_t pos0,
-                       const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f);
+                       const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,
+                       const MropePos &pos3 = {});
 
 struct AttentionShape {
     int64_t T = 0;       // query tokens this step (1 for decode)
@@ -91,14 +97,18 @@ void report_attention_error(const uint32_t e[3], const char *what);
 // (token, KV head) the Hq/Hk query heads as one 16-row WMMA tile - S = q K^T over 16 keys at a time, online softmax
 // in FP32 as above, P * V with P as two BF16 terms (hi + lo: ~2^-17 of P), FP32 accumulation. q, K, V are BF16 bits
 // (act must be BF16); the combine and output are as above.
+// P * V's precision (config attention-precision): Exact - P as BF16 hi + lo (two
+// products); Fast - P as one BF16 term (one product, as flash attention and transformers' BF16 run do).
+enum class AttnPrecision { Exact, Fast };
 size_t attention_wmma_workspace_bytes(const AttentionShape &s);
 void attention_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
                     const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
-                    hipStream_t stream);
+                    hipStream_t stream, AttnPrecision precision = AttnPrecision::Exact);
 size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t sel_ld);
 void attention_gathered_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache,
                              int64_t capacity, const AttentionShape &s, const int32_t *sel, const int32_t *nsel,
                              int64_t sel_ld, float scale, void *out, float *workspace, size_t workspace_bytes,
-                             uint32_t *err, Act act, hipStream_t stream);
+                             uint32_t *err, Act act, hipStream_t stream,
+                             AttnPrecision precision = AttnPrecision::Exact);
 
 }  // namespace strix::kernels

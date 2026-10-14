@@ -31,11 +31,14 @@ template <> __device__ inline float round_act<float>(float v) { return v; }
 template <> __device__ inline float round_act<uint16_t>(float v) { return rm::rb(v); }
 
 // Workgroup b0 + blockIdx.x (< nblocks): one completed block's key. Workgroup nblocks: the tail copy.
+// pos3 (kernels/rope.hpp MropePos, may be null): interleaved-mRoPE section triples for the sequence positions
+// the block keys rope at - the block's first key, which for the first completed block can be a tail position.
+// base = tail0 = 4*(pos0/4); rows >= (pos0 + T) - base. Null = scalar 4b (text-only, today's values bit for bit).
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
     block_keys_kernel(const T *raw, int64_t raw_ts, int64_t T_, int64_t pos0, const T *tail_in, T *tail_out, int D,
                       const float *w, float eps, const float *inv_freq, float cos_sin_scale, int rot, T *bk,
-                      int64_t cap, int64_t b0, int64_t nblocks) {
+                      int64_t cap, int64_t b0, int64_t nblocks, const int64_t *pos3, int64_t p3base) {
     __shared__ float xs[kMaxD];
     __shared__ float red[kThreads];
     const int64_t tail0 = (pos0 / kQsaBlock) * kQsaBlock;  // first position held by tail_in
@@ -76,12 +79,13 @@ __global__ void __launch_bounds__(kThreads)
     __syncthreads();
     const int half = rot / 2;
     constexpr bool kBF16 = sizeof(T) == 2;
+    const int64_t *tr = pos3 ? pos3 + 3 * (b * kQsaBlock - p3base) : nullptr;  // the block's first key's triple
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
         float y = xs[d];
         if (d < rot) {
             const int i = d < half ? d : d - half;
             float c, s, y0, y1;
-            rm::cos_sin<kBF16>(b * kQsaBlock, inv_freq[i], cos_sin_scale, c, s);
+            rm::cos_sin<kBF16>(tr ? tr[i % 3] : b * kQsaBlock, inv_freq[i], cos_sin_scale, c, s);
             rm::rotate<kBF16>(xs[i], xs[i + half], c, s, y0, y1);
             y = d < half ? y0 : y1;
         }
@@ -862,7 +866,8 @@ bool overlaps(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
-                    void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale) {
+                    void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale,
+                    const MropePos &pos3) {
     const char *fn = "qsa_block_keys";
     const size_t es = act_bytes(fn, act);
     STRIX_CHECK(raw && k_norm && inv_freq && block_keys && tail_out && (tail_in || pos0 % kQsaBlock == 0), fn,
@@ -880,17 +885,24 @@ void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, co
     STRIX_CHECK(b1 <= cap_blocks, fn, ": block ", b1 - 1, " beyond the cache's ", cap_blocks, " blocks");
     STRIX_CHECK(tail_in == nullptr || !overlaps(tail_in, (size_t)(3 * D) * es, tail_out, (size_t)(3 * D) * es), fn,
                 ": tail_out overlaps tail_in (use two buffers: other workgroups may still read tail_in)");
+    if (pos3.pos3 != nullptr) {
+        const int64_t tail0 = b0 * kQsaBlock;  // the earliest position a completed block's key ropes at
+        STRIX_CHECK(pos3.base == tail0 && pos3.rows >= pos0 + T - tail0 &&
+                        reinterpret_cast<uintptr_t>(pos3.pos3) % 8 == 0,
+                    fn, ": mRoPE positions cover rows [", pos3.base, ", ", pos3.base + pos3.rows,
+                    "), expected to start at the block start ", tail0, " and reach pos0+T = ", pos0 + T);
+    }
     const unsigned grid = (unsigned)(nblocks + 1);
     if (act == Act::F32)
         block_keys_kernel<float><<<grid, kThreads, 0, stream>>>(
             static_cast<const float *>(raw), raw_ts, T, pos0, static_cast<const float *>(tail_in),
             static_cast<float *>(tail_out), (int)D, k_norm, eps, inv_freq, cos_sin_scale, (int)rot_dim, static_cast<float *>(block_keys),
-            cap_blocks, b0, nblocks);
+            cap_blocks, b0, nblocks, pos3.pos3, pos3.base);
     else
         block_keys_kernel<uint16_t><<<grid, kThreads, 0, stream>>>(
             static_cast<const uint16_t *>(raw), raw_ts, T, pos0, static_cast<const uint16_t *>(tail_in),
             static_cast<uint16_t *>(tail_out), (int)D, k_norm, eps, inv_freq, cos_sin_scale, (int)rot_dim,
-            static_cast<uint16_t *>(block_keys), cap_blocks, b0, nblocks);
+            static_cast<uint16_t *>(block_keys), cap_blocks, b0, nblocks, pos3.pos3, pos3.base);
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " pos0=", pos0, " blocks=", nblocks);
 }
 

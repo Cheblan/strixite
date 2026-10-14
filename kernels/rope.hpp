@@ -47,4 +47,22 @@ YarnRope rope_yarn(float theta, int64_t rot_dim, float factor, int64_t original_
 void rope(void *x, int64_t T, int64_t heads, int64_t token_stride, int64_t head_stride, int64_t rot_dim, int64_t pos0,
           const float *inv_freq, Act act, hipStream_t stream, float cos_sin_scale = 1.0f);
 
+// ---------------------------------------------------------------- interleaved mRoPE (vision, build plan step 3)
+// The trunk's rope is interleaved mRoPE (config rope_parameters: mrope_interleaved, mrope_section [11, 11, 10]
+// over the rot_dim/2 = 32 pairs): pair j takes its angle from position section j % 3 (0 = t, 1 = h, 2 = w - the
+// [11, 11, 10] split of the 32 pairs is exactly round-robin over j % 3, and the sections' order matches the
+// checkpoint's Qwen4ExpTextRotaryEmbedding.recomposition_frequencies). All three sections share one inv_freq
+// table. When a call's rows are all at (pos0 + t, pos0 + t, pos0 + t) - text-only - the interleaving is
+// invisible and the angle reduces to today's scalar pos0 + t, bit for bit: the pos3 pointers below are null
+// exactly in that case, so the text path pays nothing.
+//
+// A pos3 array is a device int64 [rows][3] of section positions, row-major, for a contiguous run of sequence
+// indices starting at a documented base; the consuming kernels (kernels/attention.hpp qk_norm_rope_jobs,
+// kernels/qsa.hpp qsa_block_keys) reject nulls, misaligned pointers and rows past kMaxPos.
+struct MropePos {
+    const int64_t *pos3 = nullptr;  // device [rows, 3]; null = scalar pos0 + t (text-only, today's kernel)
+    int64_t rows = 0;               // rows the array covers (checked against the call's needs)
+    int64_t base = 0;               // sequence index of array row 0 (checked against the call's pos0)
+};
+
 }  // namespace strix::kernels

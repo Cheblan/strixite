@@ -11,8 +11,9 @@ namespace strix {
 class Qwen4ExpBackend : public LmBackend {
 public:
     // mtp_vocab: the draft's vocabulary (Qwen4ExpSession::set_mtp_vocab), 0 = the whole one.
+    // precision: the kernel-step choices (runtime/qwen4exp.hpp PrecisionOptions; all exact by default).
     Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp = true,
-                    int64_t mtp_vocab = 0);
+                    int64_t mtp_vocab = 0, const PrecisionOptions &precision = {});
     int64_t capacity() const override { return session_.capacity(); }
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
@@ -48,6 +49,13 @@ public:
                                   const LogitMasks *masks = nullptr) override {
         return rows_of(ids, n_logits, cands, n_valid, masks, true);
     }
+    // Vision (Phase D): the model carries the tower when it was built with a vision.strixw; the image
+    // forward mirrors rows_of, with the block's triples set first (the session checks the continuation).
+    bool has_vision() const override { return model_.has_vision(); }
+    int64_t max_positions() const override { return model_.dims().max_positions(); }
+    LogitRows forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &image,
+                                    const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                    int64_t n_valid, const LogitMasks *masks = nullptr) override;
     void keep_verify() override { session_.keep_verify(); }
     void drop_verify() override { session_.drop_verify(); }
     BackendStats backend_stats() const override;
