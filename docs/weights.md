@@ -31,7 +31,8 @@ The numbers below are read from the published `weights.strixw` itself (`inspect_
 | **the weights file** | **128.4 B** | | | **4.41** | **65.9 GiB** |
 | n-gram table (separate file, on SSD) | 51.2 B | | 8-bit rows, one BF16 scale per row of 160 | 8.1 | 48.3 GiB |
 
-The vision tower isn't included - strixite is text only.
+The vision tower is a separate file, `vision.strixw` (~0.9 GB, BF16), used for image input (on by default)
+([images](images.md)).
 
 ```mermaid
 flowchart LR

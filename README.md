@@ -41,7 +41,9 @@ reference derived from the model's spec.
 
 - **OpenAI-compatible server** - chat completions with streaming, tool calls, reasoning and structured output
   ([what it accepts](docs/server.md))
-- **Multi-token prediction** - the model's own draft head, up to 5 tokens checked per step
+- **Images** - PNG, JPEG, WebP, GIF, BMP and TGA in chat requests, from a separate ~0.9 GB file in the weights repo
+  ([images](docs/images.md))
+- **Multi-token prediction** - the model's own draft head, up to 7 tokens checked per step
 - **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
 - **512k context** with YaRN, and attention that stays fast at depth
 

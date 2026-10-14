@@ -11,6 +11,18 @@ believe something here falls short of a license's terms, please open an issue an
 `third_party/cpp-httplib/httplib.h`, by Yuji Hirose, vendored unchanged; its license is in
 `third_party/cpp-httplib/LICENSE`. It serves strixite's HTTP API.
 
+## stb_image 2.30 and stb_image_write 1.16 - public domain (or MIT)
+
+`third_party/stb/stb_image.h` and `third_party/stb/stb_image_write.h`, by Sean Barrett and contributors, vendored
+unchanged from https://github.com/nothings/stb; the license is at the end of each file. stb_image decodes PNG, JPEG,
+GIF, BMP and TGA images; stb_image_write is used only by the tests.
+
+## libwebp 1.6.0 (decoder only) - BSD 3-clause, with an additional patent grant
+
+`third_party/libwebp/`, by Google, the decoder subset of the official release (signature-verified; sources listed in
+`third_party/libwebp/README.strix.md`), vendored unchanged; its license is in `third_party/libwebp/COPYING` and the
+patent grant in `third_party/libwebp/PATENTS`. It decodes WebP images.
+
 ## Unicode Character Database - Unicode License v3
 
 `serve/unicode_tables.inc` holds tables derived from the Unicode Character Database (general categories and

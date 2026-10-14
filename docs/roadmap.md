@@ -31,9 +31,6 @@ real use cases are what move items up.
 
 Ideas I want, but that wait for evidence that they're worth their cost, or for the items above.
 
-- **Vision (image input).** Planned, not yet. It will be opt-in, with the vision encoder as a separate download
-  (~0.9 GB) so existing weights stay as they are. First a quality check of this model's encoder on real screenshots
-  and diagrams.
 - **Two conversations at once.** Measured ~1.3x combined throughput with two agents, but in my use two requests are
   rarely in flight together, and a second slot's memory would cost every user.
 - **Changing settings without a restart**: an endpoint to change the server's settings while it runs - no 30-second
