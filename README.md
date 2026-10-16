@@ -6,7 +6,7 @@
   <a href="https://huggingface.co/wemoh/Qwen3.8-Flash-Next-strixw"><img alt="Weights on Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-ffcc4d"></a>
 </p>
 
-<h2 align="center">Nearly 50 tokens/s at half a million tokens of context.<br>On one mini PC.</h2>
+<h2 align="center">Over 50 tokens/s at half a million tokens of context.<br>On one mini PC.</h2>
 
 <p align="center">
 A ~180B-parameter model, a 512k context window, and decode speed that doesn't fall off as the conversation grows -<br>
@@ -15,9 +15,9 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 
 |  | on one AMD Strix Halo, 128 GB |
 |---|---|
-| **Decode, real agent use** | **~47-50 tokens/s, flat from 0 to 492k context** |
+| **Decode, real agent use** | **~52-56 tokens/s (median), flat from 0 to 490k context** |
 | **Context** | **512k tokens** |
-| **Prefill** | **~1,370 tokens/s** over a real 490k-token conversation |
+| **Prefill** | **~1,460 tokens/s** over a real 461k-token conversation |
 | **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
 > [!TIP]
@@ -44,6 +44,8 @@ reference derived from the model's spec.
 - **Images** - PNG, JPEG, WebP, GIF, BMP and TGA in chat requests, from a separate ~0.9 GB file in the weights repo
   ([images](docs/images.md))
 - **Multi-token prediction** - the model's own draft head, up to 7 tokens checked per step
+- **Thinking that ends** - reasoning is capped (2,048 tokens unless a request sets its own budget), so the model
+  answers instead of thinking in circles
 - **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
 - **512k context** with YaRN, and attention that stays fast at depth
 
@@ -157,3 +159,8 @@ Pull requests and issues are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 ## License
 
 [AGPL-3.0](LICENSE). The model weights are separate and under the Qwen Community License 1.0.
+
+## Support
+
+strixite is free, and donations are never expected - but they are appreciated. Whatever comes in goes straight into
+equipment that speeds up development and testing. [Buy me a coffee](https://buymeacoffee.com/wemo).
