@@ -56,19 +56,27 @@ bool ends_with(const std::string &s, const std::string &p) {
 }
 
 // The template's render_content macro, then |trim. With vision on, an image part renders as one
-// sentinel character (0x01 - NOT 0x1f: Python's str.strip() treats 0x1c..0x1f as whitespace and would
-// trim a sentinel at a content edge, while interior text is kept byte-exactly); render_chat expands
-// the sentinels as it appends text. With vision off the v1 refusal stands, word for word.
-constexpr char kVisionSentinel = '\x01';
+// placeholder byte in `text` (0x01 - NOT 0x1f: Python's str.strip() treats 0x1c..0x1f as whitespace and would
+// trim a placeholder at a content edge, while interior text is kept byte-exactly) and its offset goes in
+// `images`; render_chat expands only the recorded offsets. The request's own text may hold 0x01 too (a tool
+// result that printed a binary file): those bytes are plain text, never an image.
+// With vision off the v1 refusal stands, word for word.
+constexpr char kVisionPlaceholder = '\x01';
 constexpr const char *kVisionTokens = "<|vision_start|><|image_pad|><|vision_end|>";
 
-std::string content_of(const json::Value &msg, const std::string &path, bool is_system, bool vision) {
+struct Content {
+    std::string text;
+    std::vector<size_t> images;  // byte offsets in text of the image placeholders, ascending
+};
+
+Content content_of(const json::Value &msg, const std::string &path, bool is_system, bool vision) {
     const json::Value *c = msg.find("content");
-    if (!c || c->is_null()) return "";
-    if (c->is_string()) return unicode::python_strip(c->as_string(path));
+    if (!c || c->is_null()) return {};
+    if (c->is_string()) return {unicode::python_strip(c->as_string(path)), {}};
     STRIX_CHECK(c->is_array(), "chat template: '", path, "' must be a string, null or an array of parts, got ",
                 json::type_name(c->type()), " (Unexpected content type.)");
     std::string out;
+    std::vector<size_t> images;
     const auto &parts = c->as_array(path);
     for (size_t k = 0; k < parts.size(); ++k) {
         const std::string pp = path + "[" + std::to_string(k) + "]";
@@ -81,18 +89,29 @@ std::string content_of(const json::Value &msg, const std::string &path, bool is_
         STRIX_CHECK(!video, "chat template: '", pp, "' is a video part; videos are not served");
         if (image) {
             STRIX_CHECK(vision, "chat template: '", pp, "' is an image / video part; vision is not served (v1)");
-            out += kVisionSentinel;
+            images.push_back(out.size());
+            out += kVisionPlaceholder;
             continue;
         }
         const json::Value *text = part.find("text");
         STRIX_CHECK(text != nullptr, "chat template: '", pp, "' has no 'text' (Unexpected item type in content.)");
-        const std::string &txt = text->as_string(pp + ".text");
-        STRIX_CHECK(!vision || txt.find(kVisionSentinel) == std::string::npos, "chat template: '", pp,
-                    ".text' contains byte 0x01, the expansion sentinel - it would render as an extra "
-                    "vision token run; strip it (or send vision off)");
-        out += txt;
+        out += text->as_string(pp + ".text");
     }
-    return unicode::python_strip(out);
+    std::string text = unicode::python_strip(out);
+    if (images.empty()) return {std::move(text), {}};
+    // The placeholders are not whitespace, so the strip removed only a leading and a trailing run around them:
+    // the result starts at the first non-whitespace byte, where it is first found.
+    const size_t lead = out.find(text);
+    STRIX_CHECK(lead != std::string::npos && lead <= images.front() && images.back() < lead + text.size(),
+                "chat template: '", path, "': the trimmed content (", text.size(), " of ", out.size(),
+                " bytes, at ", lead, ") does not keep the image placeholders at ", images.front(), "..",
+                images.back());
+    for (size_t &at : images) {
+        at -= lead;
+        STRIX_CHECK(text[at] == kVisionPlaceholder, "chat template: '", path, "': image placeholder expected at byte ",
+                    at, " of the trimmed content, found byte ", (int)(unsigned char)text[at]);
+    }
+    return {std::move(text), std::move(images)};
 }
 
 const std::string &role_of(const json::Value &msg, const std::string &path) {
@@ -153,20 +172,22 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
 
     std::string out;
     // Appends request-supplied text, recording its span.
-    // Request text, span-marked - except where the sentinels expand: the template's own vision tokens go
-    // in UNMARKED (a plain span means "the user's text - never a control token"; these are the server's
-    // control tokens). Without the sentinel path the lambda is today's, byte-identical.
-    const auto plain = [&](const std::string &raw) {
+    // Request text, span-marked - except at the image offsets (content_of's `images`, ascending, each
+    // holding the placeholder byte): the template's own vision tokens go in UNMARKED (a plain span means
+    // "the user's text - never a control token"; these are the server's control tokens). Every other byte,
+    // 0x01 included, is the request's text. With no images the lambda is today's, byte-identical.
+    const auto plain = [&](const std::string &raw, const std::vector<size_t> &images = {}) {
         size_t at = 0;
-        while (at < raw.size()) {
-            const size_t nxt = vision ? raw.find(kVisionSentinel, at) : std::string::npos;
-            const std::string piece =
-                nxt == std::string::npos ? raw.substr(at) : raw.substr(at, nxt - at);
-            if (!piece.empty()) {
-                if (plain_spans) plain_spans->emplace_back(out.size(), out.size() + piece.size());
-                out += piece;
+        for (size_t k = 0; k <= images.size(); ++k) {
+            const size_t nxt = k < images.size() ? images[k] : raw.size();
+            STRIX_CHECK(nxt >= at && nxt <= raw.size() && (k == images.size() || raw[nxt] == kVisionPlaceholder),
+                        "chat template: image offset ", k, " of ", images.size(), " is ", nxt,
+                        " - expected ascending placeholder bytes inside the ", raw.size(), "-byte text (from ", at, ")");
+            if (nxt > at) {
+                if (plain_spans) plain_spans->emplace_back(out.size(), out.size() + (nxt - at));
+                out.append(raw, at, nxt - at);
             }
-            if (nxt == std::string::npos) break;
+            if (k == images.size()) break;
             out += kVisionTokens;
             at = nxt + 1;
         }
@@ -180,12 +201,12 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         out += "\n</tools>";
         out += kToolsFormat;
         if (roles[0] == "system") {
-            const std::string c = content_of(msgs[0], "messages[0].content", true, vision);
+            const std::string c = content_of(msgs[0], "messages[0].content", true, vision).text;
             if (!c.empty()) out += "\n\n", plain(c);
         }
         out += "<|im_end|>\n";
     } else if (roles[0] == "system") {
-        const std::string c = content_of(msgs[0], "messages[0].content", true, vision);
+        const std::string c = content_of(msgs[0], "messages[0].content", true, vision).text;
         if (!c.empty()) {
             out += "<|im_start|>system\n" + (reasoning.empty() ? "" : reasoning + "\n\n");
             plain(c);
@@ -200,7 +221,7 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
     long last_query = -1;
     for (size_t k = msgs.size(); k-- > 0;) {
         if (roles[k] != "user") continue;
-        const std::string c = content_of(msgs[k], "messages[" + std::to_string(k) + "].content", false, vision);
+        const std::string c = content_of(msgs[k], "messages[" + std::to_string(k) + "].content", false, vision).text;
         if (!(starts_with(c, "<tool_response>") && ends_with(c, "</tool_response>"))) {
             last_query = (long)k;
             break;
@@ -212,9 +233,10 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         const std::string path = "messages[" + std::to_string(k) + "]";
         const json::Value &m = msgs[k];
         const std::string &role = roles[k];
-        const std::string content = content_of(m, path + ".content", role == "system", vision);
+        const Content parsed = content_of(m, path + ".content", role == "system", vision);
+        const std::string &content = parsed.text;
         if (role == "assistant")
-            STRIX_CHECK(content.find(kVisionSentinel) == std::string::npos, "chat template: '", path,
+            STRIX_CHECK(parsed.images.empty(), "chat template: '", path,
                         ".content': assistant messages cannot contain image parts");
         if (role == "system") {
             STRIX_CHECK(k == 0, "chat template: '", path, "': System message must be at the beginning.");
@@ -224,10 +246,12 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
             const std::string open = "<tool_response>", close = "</tool_response>";
             if (content.size() >= open.size() + close.size() && starts_with(content, open.c_str()) && ends_with(content, close)) {
                 out += open;
-                plain(content.substr(open.size(), content.size() - open.size() - close.size()));
+                std::vector<size_t> inner = parsed.images;  // none sit in the wrapper: it is text at both ends
+                for (size_t &at : inner) at -= open.size();
+                plain(content.substr(open.size(), content.size() - open.size() - close.size()), inner);
                 out += close;
             } else {
-                plain(content);
+                plain(content, parsed.images);
             }
             out += "<|im_end|>\n";
         } else if (role == "assistant") {
@@ -270,7 +294,7 @@ std::string render_chat(const json::Value &messages, const json::Value *tools, c
         } else if (role == "tool") {
             if (k > 0 && roles[k - 1] != "tool") out += "<|im_start|>user";
             out += "\n<tool_response>\n";
-            plain(content);
+            plain(content, parsed.images);
             out += "\n</tool_response>";
             if (k + 1 == msgs.size() || roles[k + 1] != "tool") out += "<|im_end|>\n";
         } else {
