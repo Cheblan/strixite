@@ -20,6 +20,25 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 | **Prefill** | **~1,460 tokens/s** over a real 461k-token conversation |
 | **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
+Speed as the context grows - one request at a time through the server, a fresh prompt at each length, strixite
+v0.4.0:
+
+```mermaid
+xychart-beta
+    title "Prefill (tokens/s)"
+    x-axis ["8k", "32k", "64k", "120k", "240k", "360k", "481k"]
+    y-axis "tokens/s" 0 --> 1800
+    line [1639, 1698, 1674, 1631, 1576, 1530, 1484]
+```
+
+```mermaid
+xychart-beta
+    title "Decode (tokens/s)"
+    x-axis ["8k", "32k", "64k", "120k", "240k", "360k", "481k"]
+    y-axis "tokens/s" 0 --> 70
+    line [60.3, 62.6, 56.1, 59.4, 51.6, 54.1, 52.8]
+```
+
 > [!TIP]
 > **Curious how a mini PC runs a 180B-parameter model this fast?** No background needed:
 > [How strixite got fast](docs/how-it-got-fast.md) explains it in five simple ideas - smaller handwriting, guessing
