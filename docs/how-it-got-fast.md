@@ -95,18 +95,18 @@ accuracy for 5.6% fewer bytes: 1.9% less time per token.
 ## 3. More tokens per read: multi-token prediction
 
 The checkpoint ships a small extra layer trained to guess the token *after* the next one. strixite uses it to draft up
-to 5 tokens ahead, then checks them all with **one** pass of the full model. That pass reads the weights once for
-all the rows - and since decode is about reading weights, checking 5 tokens costs far less than generating 5.
+to 7 tokens ahead, then checks them all with **one** pass of the full model. That pass reads the weights once for
+all the rows - and since decode is about reading weights, checking 7 tokens costs far less than generating 7.
 
 ```mermaid
 sequenceDiagram
     participant E as engine
     participant H as draft head (small)
     participant M as full model
-    E->>H: draft d1, d2, ... d5 (while confident)
-    E->>M: one pass over [token, d1, ..., d5]
+    E->>H: draft d1, d2, ... d7 (while confident)
+    E->>M: one pass over [token, d1, ..., d7]
     alt all drafts match the model's own choices
-        M-->>E: 6 tokens committed for one pass
+        M-->>E: 8 tokens committed for one pass
     else a draft is wrong at position j
         M-->>E: keep the first j + 1, continue from there
     end

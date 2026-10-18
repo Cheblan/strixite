@@ -20,26 +20,39 @@ real use cases are what move items up.
 - **Less wasted thinking.** On agent benchmarks, most of the generated tokens are thinking, and much of it goes in
   circles. I'm measuring where it adds nothing to the answer, then tuning the thinking nudge and the think-block guard
   to cut it - the biggest speed lever left for agent work.
-- **Faster prefill at long context and on short prompts.** The sparse-attention scoring pass at depth, and the first
-  chunk of a prompt waiting on n-gram table reads from the SSD.
+- **Faster prefill at long context and on short prompts.** v0.4.0 is ~3% faster at 32k-120k and reads cold n-gram
+  rows ~1.25x faster; still to do: the sparse-attention scoring pass at depth, and the first chunk of a prompt waiting
+  on n-gram table reads from the SSD.
 
 ## Next
 
+- **A KV cache that grows with the conversation**: today the full context is reserved at startup, though most
+  conversations use a fraction of it. Reserving the address space and backing it as the conversation grows would
+  hand the unused part to the prompt cache, without slowing attention down. First a proof of concept that the GPU's
+  virtual memory works for this on Strix Halo.
+- **Say why a conversation was read again**: when a client changes the start of the prompt (a tool switched on, a
+  date in the system prompt), the log and the response will name the cause, so it's clear the server didn't lose it
+  ([why it happens](memory.md#when-the-client-changes-the-start-of-the-prompt)).
 - **`tool_choice: required` and a named tool**, enforced the way structured output is.
 
 ## Considering
 
 Ideas I want, but that wait for evidence that they're worth their cost, or for the items above.
 
-- **Two conversations at once.** Measured ~1.3x combined throughput with two agents, but in my use two requests are
-  rarely in flight together, and a second slot's memory would cost every user.
+- **Two conversations at once.** I built it and measured ~1.5x combined throughput with two conversations, but with
+  several agents sharing the GPU each one got slower, so it's not in v0.4.0. What it needs first: drafting for all
+  conversations in one pass instead of one after another, and the growing KV cache (Next) so a second conversation
+  doesn't reserve memory it isn't using.
 - **Changing settings without a restart**: an endpoint to change the server's settings while it runs - no 30-second
   reload of the weights, no emptied prompt cache.
 - **Sleep mode**: after a configurable idle time, free the GPU memory and reload on the next request - for machines
   that do other things between sessions.
 - **Smarter low-memory behaviour**: when memory is short, keep the prompt cache's RAM tier at whatever size fits
   instead of turning it off.
-- **Smaller state**: an 8-bit KV cache and a BF16 recurrent state - more room for the prompt cache, if quality holds.
+- **Smaller state**: the 8-bit KV cache shipped in v0.4.0; a BF16 recurrent state is next - more room for the
+  prompt cache, if quality holds.
+- **Responses API over WebSocket** ([#9](https://github.com/shawnshekari/strixite/issues/9)): a client sends each
+  step's new items instead of the whole history, so long agent sessions upload and parse far less.
 - **Calibrated 4-bit weights**: same size, possibly better quality - a new weights release if it measures better.
 - **Easier setup**: a `models-dir` setting next to the `STRIX_MODELS_DIR` variable, and a one-command build per
   distribution.

@@ -36,21 +36,21 @@ With the shipped settings (`capacity = 524288`, `chunk = 16384`) on my machine:
 
 | what | size | fixed or growing |
 |---|---|---|
-| **GPU buffers**: the weights (~66 GiB), the context's KV cache and state for 512k tokens, and the work buffers | 95.3 GiB | fixed at startup - nothing on the GPU grows afterwards |
+| **GPU buffers**: the weights (~66 GiB), the context's KV cache (8-bit) and state for 512k tokens, and the work buffers | 91.9 GiB | fixed at startup - nothing on the GPU grows afterwards |
 | **n-gram row cache** (`ngram-cache-rows = 8388608`) | 3.0 GiB | fixed at startup |
 | **prompt cache, RAM tier** | 0 at startup, grows with use | saved conversations, a few GB each |
 | **the margin** (`prompt-cache-ram-margin-gib = 4`) | 4 GiB | kept free for the kernel and everything else |
 | the operating system, services | a few GiB | |
 
-That leaves **19.1 GiB of MemAvailable** right after the server loads, with nothing else running. The prompt cache
+That leaves **about 22 GiB of MemAvailable** right after the server loads, with nothing else running. The prompt cache
 lives in what's left above the margin.
 
 ```mermaid
 flowchart LR
-    total["128 GB"] --> gpu["GPU buffers<br/>95.3 GiB<br/>(weights, 512k context)"]
+    total["128 GB"] --> gpu["GPU buffers<br/>91.9 GiB<br/>(weights, 512k context)"]
     total --> rows["n-gram row cache<br/>3.0 GiB"]
     total --> os["OS + services"]
-    total --> avail["MemAvailable after loading<br/>~19 GiB"]
+    total --> avail["MemAvailable after loading<br/>~22 GiB"]
     avail --> tier["prompt cache RAM tier<br/>grows with use, gives memory back"]
     avail --> margin["the margin<br/>4 GiB, never used by the cache"]
 ```
@@ -59,16 +59,16 @@ What each one is for:
 
 - **The context** (`capacity`): the KV cache and state for the longest conversation the server will hold. It's
   allocated in full at startup, so a 512k context costs its memory even when your conversations are short. Halving
-  it to 256k frees about 6.7 GiB.
+  it to 256k frees about 8.6 GiB (GPU buffers 83.3 GiB instead of 91.9).
 - **The n-gram row cache**: the model has a 51B-parameter n-gram table that stays on the SSD; the rows it actually
   uses are cached in RAM so a prompt reads less from disk. 8M rows (3 GiB) is enough for several long agent
   sessions to share. Shrinking it to 262,144 rows frees 2.9 GiB and only costs some extra SSD reads while reading a
   prompt.
 - **The prompt cache**: a coding agent sends the same long conversation again and again, a bit longer each turn,
   and often switches between conversations (the main session, a subagent, another project). Without a cache, every
-  switch means reading the whole conversation again - at ~1,400 tokens/s, a 200k-token conversation is over two
-  minutes. The prompt cache saves each conversation's state after a turn: a saved state is about 27 KiB per token
-  plus 0.12 GB, so ~2.8 GB for a 100k-token conversation and ~5.5 GB for 200k. Coming back to one from RAM takes
+  switch means reading the whole conversation again - at ~1,600 tokens/s, a 200k-token conversation is about two
+  minutes. The prompt cache saves each conversation's state after a turn: a saved state is about 17 KiB per token
+  plus 0.12 GB, so ~1.8 GB for a 100k-token conversation and ~3.6 GB for 200k. Coming back to one from RAM takes
   about a second; from disk, a few seconds. RAM is the fast tier; the disk (capped at 128 GiB) holds the rest and
   survives restarts.
 
@@ -110,26 +110,27 @@ can be bigger than 4 GiB at once. 8 GiB gives those bursts room without the cach
 
 After the weights are loaded, the server measures MemAvailable and checks that it covers **the margin plus one
 saved conversation at full capacity** - the biggest save it might ever have to make. With the shipped settings that's
-4 + 13.5 = 17.5 GiB, and my dedicated machine has 19.1. The startup log says so in one line:
+4 + 8.3 = 12.3 GiB, and my dedicated machine has about 22. The startup log says so in one line:
 
 ```
-startup: memory: MemAvailable 19.1 GiB after loading (GPU buffers 95.3 GiB, n-gram row cache 3.0 GiB); needs the
-prompt cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 13.5 GiB = 17.5 GiB
+startup: memory: MemAvailable 22.0 GiB after loading (GPU buffers 91.9 GiB, n-gram row cache 3.0 GiB); needs the
+prompt cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB
 ```
 
-That's only 1.6 GiB of slack, which is why "nothing else running" matters: restart the server while something else
-holds a couple of GB and it won't start.
+That's about 10 GiB of slack (v0.3, with a 16-bit KV cache, had 1.6), so a few GB held by something else no longer
+stops a restart. "Nothing else running" still matters for the prompt cache: everything other processes hold comes out
+of its RAM tier.
 
 `low-memory` decides what happens when it doesn't fit:
 
 - **`fail`** (the default): the server exits with status 4 and a message that says what it measured, what it needed
-  and which settings would fit. From my machine with ~8 GiB taken by something else:
+  and which settings would fit. From my machine with 12 GiB taken by something else:
 
   ```
-  fatal: not enough memory for these settings: MemAvailable 12.8 GiB after loading (...), short of the prompt
-  cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 13.5 GiB = 17.5 GiB by 4.7 GiB.
-  To fit: free memory (another process?), or change: capacity = 262144 (state 6.8 GiB, at least 6.7 GiB less GPU
-  memory), capacity = 131072 (state 3.5 GiB, at least 10.1 GiB less GPU memory), ngram-cache-rows = 262144 (frees
+  fatal: not enough memory for these settings: MemAvailable 9.8 GiB after loading (...), short of the prompt
+  cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB by 2.5 GiB.
+  To fit: free memory (another process?), or change: capacity = 262144 (state 4.2 GiB, at least 4.1 GiB less GPU
+  memory), capacity = 131072 (state 2.1 GiB, at least 6.1 GiB less GPU memory), ngram-cache-rows = 262144 (frees
   2.9 GiB), prompt-cache-gib = 0 (no prompt cache). Or set low-memory = adapt ...
   ```
 
@@ -162,9 +163,9 @@ capacity = 262144
 prompt-cache-ram-margin-gib = 8
 ```
 
-256k tokens is still a very long context - most agent sessions never get there. Halving it frees ~6.7 GiB of GPU
-memory and shrinks the biggest possible save from 13.5 to 6.8 GiB, so the startup check needs 8 + 6.8 = 14.8 GiB
-where ~26 GiB is available after loading: about 11 GiB left for the desktop, and the cache backs off from the 8 GiB
+256k tokens is still a very long context - most agent sessions never get there. Halving it frees ~8.6 GiB of GPU
+memory and shrinks the biggest possible save from 8.3 to 4.2 GiB, so the startup check needs 8 + 4.2 = 12.2 GiB
+where ~29 GiB is available after loading: about 17 GiB left for the desktop, and the cache backs off from the 8 GiB
 margin whenever the desktop needs more.
 
 ### Another model next to strixite
@@ -174,12 +175,13 @@ machine. At the defaults that leaves almost nothing - which is how it crashed. W
 
 | settings | MemAvailable after loading, minus 23 GiB | the check needs |
 |---|---|---|
-| defaults (512k) | 19.1 - 23 = below zero | 17.5 - no |
-| `capacity = 262144` | ~25.8 - 23 = ~2.8 | 4 + 6.8 = 10.8 - no |
-| `capacity = 131072` | ~29.2 - 23 = ~6.2 | 4 + 3.5 = 7.5 - no |
-| `capacity = 131072`, `ngram-cache-rows = 262144` | ~32.1 - 23 = ~9.1 | 7.5 - **yes**, ~1.6 GiB to spare |
+| defaults (512k) | 22.0 - 23 = below zero | 4 + 8.3 = 12.3 - no |
+| `capacity = 262144` | 29.3 - 23 = 6.3 | 4 + 4.2 = 8.2 - no |
+| `capacity = 131072` | ~33 - 23 = ~10 | 4 + 2.1 = 6.1 - **yes**, ~4 GiB to spare |
+| `capacity = 131072`, `ngram-cache-rows = 262144` | ~36 - 23 = ~13 | 6.1 - **yes**, ~7 GiB to spare |
 
-So: a 128k context and the small row cache, and keep the margin at 4 GiB - raising it would undo the fit. Start the
+So: a 128k context, and keep the margin at 4 GiB. With the 8-bit KV cache (v0.4.0) the default row cache fits too;
+the small one buys more room for the prompt cache. Start the
 other model first, so strixite's startup check measures the memory that's really left. If the other model grows
 while it runs, the background check moves strixite's saved conversations to disk to make room.
 
@@ -221,23 +223,23 @@ The prompt cache also uses the drive the models are on. Three settings bound it:
 to leave RAM for lack of memory, (2) after sitting in RAM unused for `prompt-cache-idle-s` (3600 s - it stays in RAM
 too, so a restart can pick it up), or (3) when the server stops cleanly, newest first. Most saves are deltas: a turn
 that extends a saved conversation by up to 64k tokens (and at most a quarter of its length) stores only the new
-tokens' state - ~27 KiB each plus ~0.12 GB - not the whole conversation again. Losing what wasn't written yet (a
+tokens' state - ~17 KiB each plus ~0.12 GB - not the whole conversation again. Losing what wasn't written yet (a
 power cut) only means reading that prompt again.
 
-**The write budget** exists for SSD wear. Saved states are big (a 200k-token conversation is ~5.5 GB), and an agent
+**The write budget** exists for SSD wear. Saved states are big (a 200k-token conversation is ~3.6 GB), and an agent
 working through many conversations at once could otherwise keep the drive writing all day for little benefit. The
 budget is a bucket: it starts full (one hour's worth), refills continuously at the hourly rate, and rules (1) and
 (2) spend from it; the shutdown write is free. When it's empty, an idle write simply waits - but a conversation that
 *has* to leave RAM and can't be written is dropped, and the log says so - for example:
 
 ```
-prompt cache: dropped a turn entry of 95,112 tokens, 2.7 GB (saved by Request 812, last used 4 min ago)
+prompt cache: dropped a turn entry of 95,112 tokens, 1.7 GB (saved by Request 812, last used 4 min ago)
               it had to leave RAM (MemAvailable 3.9 GiB, below the 4 GiB margin) and can't go to disk:
-              the write budget is spent (0.4 of 32 GiB left this hour, needs 2.7 GB: enough in 4 min)
+              the write budget is spent (0.4 of 32 GiB left this hour, needs 1.7 GB: enough in 3 min)
 ```
 
 A dropped conversation isn't lost work, just time: when the agent comes back to it, its prompt is read again
-(~1,400 tokens/s).
+(~1,600 tokens/s).
 
 **Why 32 GiB an hour.** I measured both sides. With 64 and no delta saves, a long session wrote 240 GB in ~3 hours
 for 3 conversations ever read back - wear for nothing. With 8, two deep agent sessions at once (~200k and ~95k
@@ -299,3 +301,24 @@ budgets keeps them.
 | "dropped a ... entry" warnings | a conversation had to leave RAM and couldn't be written (write budget or disk space) | it's read again when it comes back; if the reason is the budget and it happens a lot, raise `prompt-cache-write-gib-per-hour` ([Disk](#disk-the-prompt-caches-second-tier-and-its-write-budget)) |
 | switching conversations is slow | they're coming back from disk, not RAM | more free memory, or a lower `capacity` to leave the cache more room |
 | driver errors, `hipErrorOutOfMemory`, a crash, a hang | the machine ran out of memory | check the kernel parameters (Quick start step 1), then this page - the defaults assume nothing else is running |
+| a long conversation suddenly reads its whole prompt again; the log's `resume` line says the prompt differs "in message 1" (the system prompt) | the client changed the start of the prompt - usually its tool list (a tool or MCP server switched on or off) or a date in its system prompt | nothing on the server side; keep the tool set fixed during a long conversation ([why](#when-the-client-changes-the-start-of-the-prompt)) |
+
+### When the client changes the start of the prompt
+
+A saved conversation can only be resumed up to the first token where the new prompt differs from it: every later
+token's state was computed from everything before it, so a change near the start makes all of it stale. Chat clients
+put the tool definitions (and often the date) in the system prompt, at the very start. Switch a tool or an MCP server on
+or off in the middle of a long conversation, and the next request is a different prompt from token ~4,000 on - the
+server reads all of it again. From my own testing: a 185k-token conversation went from 21 tools to 26 between two turns,
+and that turn's first token took 118 s instead of about one; the turn after it resumed normally.
+
+The log says so in the request's block:
+
+```
+resume      none: no saved state is a prefix of this prompt - all 185,338 tokens prefilled
+resume      lost 4,178 tokens
+            the prompt differs from the prompt cache's system-prefix entry (RAM) (4,412 tokens) at token 4,178, in message 1 of 45 (the system prompt, tokens 0-6,222)
+```
+
+No server can avoid that and still give the same answers. What helps is on the client side: pick the tools and MCP
+servers before a long conversation starts and leave them, or start a new conversation when you change them.

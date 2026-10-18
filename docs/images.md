@@ -32,4 +32,10 @@ pixels become one token of the prompt: a 1080p screenshot is about 2,000 tokens,
 
 The vision encoder runs once per new image (about 0.2 s for a small image, 0.9 s for a full-size screenshot), then the image's
 tokens go through the model like any other prompt. Follow-up turns in the same conversation reuse them from the prompt
-cache, so a screenshot is paid for once, not every turn.
+cache, so a screenshot is paid for once, not every turn. From v0.4.0 the server also remembers each image it has
+already decoded, so an agent that resends 20 screenshots with every step no longer decodes them all again: in my test
+(20 known near-full-size screenshots + 1 new) image preparation went from 1.76 s to 0.07 s per request.
+
+Decoding and resizing an image takes up to a few hundred MB of RAM while it runs. `vision-preprocess-limit` (default
+2) is how many images may do that at once; an image request past the limit gets a 503 that says to retry, instead of
+pushing the machine into a low-memory stall.

@@ -35,6 +35,11 @@ thinking skipped, and `strix.thinking` says so.
 Server setting: `thinking = off` in the config makes requests that don't say either way run without thinking. I
 measured it on terminal-bench: the model took 4-7 times as many steps and was no faster, so the shipped default is on.
 
+Server setting: `thinking-cap = N` caps the thinking of every request that sets no budget of its own: past N tokens
+(and the end of the sentence it's in) the server closes the think block and the model answers. The shipped default
+is `0`, no cap. v0.3 shipped 2,048, and people told me the model seemed less smart with it, so from v0.4.0 the cap is
+yours to set. A request's own budget always wins.
+
 ## The thinking nudge
 
 Sometimes the model's thinking goes in circles - the same calculation, the same doubt, again and again. When the
