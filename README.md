@@ -20,24 +20,39 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 | **Prefill** | **~1,460 tokens/s** over a real 461k-token conversation |
 | **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
-Speed as the context grows - one request at a time through the server, a fresh prompt at each length, strixite
-v0.4.0:
+Speed by release as the context grows:
+![v0.1.0](https://img.shields.io/badge/v0.1.0-6f42c1)
+![v0.2.0](https://img.shields.io/badge/v0.2.0-9b87e8)
+![v0.3.0](https://img.shields.io/badge/v0.3.0-1abc9c)
+![v0.4.0](https://img.shields.io/badge/v0.4.0-3fe8d0)
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0"}}}}%%
 xychart-beta
     title "Prefill (tokens/s)"
-    x-axis ["8k", "32k", "64k", "120k", "240k", "360k", "481k"]
-    y-axis "tokens/s" 0 --> 1800
-    line [1639, 1698, 1674, 1631, 1576, 1530, 1484]
+    x-axis ["32k", "120k", "250k", "350k", "481k"]
+    y-axis "tokens/s" 1400 --> 1750
+    line [1547, 1494]
+    line [1602, 1555]
+    line [1638, 1583]
+    line [1693, 1630, 1570, 1533, 1484]
 ```
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"backgroundColor": "#0b0f14", "titleColor": "#e6edf3", "xAxisLabelColor": "#c9d1d9", "yAxisLabelColor": "#c9d1d9", "xAxisTitleColor": "#c9d1d9", "yAxisTitleColor": "#c9d1d9", "xAxisLineColor": "#3b4552", "yAxisLineColor": "#3b4552", "xAxisTickColor": "#3b4552", "yAxisTickColor": "#3b4552", "plotColorPalette": "#6f42c1, #9b87e8, #1abc9c, #3fe8d0"}}}}%%
 xychart-beta
     title "Decode (tokens/s)"
-    x-axis ["8k", "32k", "64k", "120k", "240k", "360k", "481k"]
-    y-axis "tokens/s" 0 --> 70
-    line [60.3, 62.6, 56.1, 59.4, 51.6, 54.1, 52.8]
+    x-axis ["32k", "120k", "250k", "350k", "481k"]
+    y-axis "tokens/s" 45 --> 65
+    line [54.8, 53.7]
+    line [57.6, 57.0]
+    line [59.0, 56.7]
+    line [57.7, 58.7, 56.4, 55.7, 52.8]
 ```
+
+Each release measured the same way: one request at a time through the server, a fresh prompt at each length. Releases
+before v0.4.0 were measured at 32k and 120k only; v0.4.0's 481k point is from a separate single run. The axes start
+near the data so the differences are visible.
 
 > [!TIP]
 > **Curious how a mini PC runs a 180B-parameter model this fast?** No background needed:
