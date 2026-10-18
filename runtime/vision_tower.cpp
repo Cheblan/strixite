@@ -1,5 +1,6 @@
 #include "runtime/vision_tower.hpp"
 
+#include "common/bf16.hpp"
 #include "common/check.hpp"
 #include "kernels/residual.hpp"
 #include "kernels/vision.hpp"
@@ -21,13 +22,6 @@ constexpr double kVisionRopeTheta = 1e4;  // vision_config rope_theta (the trunk
 constexpr int64_t kVisionHeads = 16;
 constexpr int64_t kElemsCap = 1ll << 40;  // same element-count ceiling the kernel launchers use
 
-float bf16_bits_to_f32(uint16_t bits) {
-    const uint32_t u = (uint32_t)bits << 16;
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
 std::string shape_str_local(const std::vector<int64_t> &v) {
     std::string out = "[";
     for (size_t i = 0; i < v.size(); ++i) out += (i ? " x " : "") + std::to_string(v[i]);
@@ -42,8 +36,7 @@ std::vector<float> widen_f32(const uint16_t *bits, int64_t n) {
 
 }  // namespace
 
-VisionTower::VisionTower(const std::string &path, const StrixwFile &text_weights, WeightPlacement placement,
-                         kernels::Act act)
+VisionTower::VisionTower(const std::string &path, const StrixwFile &text_weights, kernels::Act act)
     : path_(path), act_(act) {
     const char *fn = "VisionTower";
     STRIX_CHECK(act == kernels::Act::F32 || act == kernels::Act::BF16, fn, ": unsupported activation dtype ",
@@ -64,7 +57,6 @@ VisionTower::VisionTower(const std::string &path, const StrixwFile &text_weights
     // Always the plain Device placement, whatever the text model asked for: HostExperts is a loader
     // contract about the expert stacks (it refuses a file that has none), and the tower has no experts -
     // 856 MiB of BF16 is a device region on every machine.
-    (void)placement;
     w_ = std::make_unique<StrixwDevice>(path, 8, WeightPlacement::Device);
     const StrixwFile &f = w_->file();
 

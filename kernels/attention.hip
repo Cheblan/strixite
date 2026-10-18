@@ -1,6 +1,7 @@
 #include "kernels/attention.hpp"
 
 #include "common/hip_check.hpp"
+#include "kernels/kv8_math.hpp"
 #include "kernels/rope_math.hpp"
 #include "kernels/wmma.hpp"
 
@@ -133,8 +134,9 @@ __device__ inline void unpack<float>(const uint4 &u, float (&f)[4]) {
 // GATHER (QSA): query t attends to the tokens of its nsel[t] selected blocks sel[t * sel_ld + i] (4 each, in
 // list order) and then its (pos + 1) % 4 tail tokens - key index j of the query maps to a position; otherwise keys
 // 0..pos (dense, causal).
-template <typename T, bool GATHER>
-__global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs, const T *kc, const T *vc,
+// R: the K/V reader (kernels/kv8_math.hpp) - the BF16 / FP32 cache or the 8-bit one.
+template <typename T, bool GATHER, typename R>
+__global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs, R kv,
                                          int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
                                          float *ws, int64_t splits, const int32_t *sel, const int32_t *nsel,
                                          int64_t sel_ld, uint32_t *err) {
@@ -149,6 +151,7 @@ __global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs,
     const int64_t h = kh * G + wv;
     const int64_t pos = pos0 + t;
     const int64_t tail_n = (pos + 1) % kQsaTokens, tail0 = pos + 1 - tail_n;
+    const int64_t g0q = kv8_math::exact_from(pos);  // 8-bit K/V: the rows this query sees exact (kernels/kv8.hpp)
     // A selection outside the query's complete blocks (a bug upstream) sets err (err[1] = the token, err[2] = the
     // bad value; the first flag wins) and is clamped to a visible key, so nothing out of bounds is read and the
     // caller fails the request (check_attention_error).
@@ -193,9 +196,9 @@ __global__ void attention_partial_kernel(const T *q, int64_t q_ts, int64_t q_hs,
             const int j = i / kChunks, c = i % kChunks;
             uint4 kv4 = {0, 0, 0, 0}, vv4 = {0, 0, 0, 0};
             if (j < nk) {
-                const int64_t off = (key_pos(k0 + j) * Hk + kh) * kD + (int64_t)c * kVec;
-                kv4 = *reinterpret_cast<const uint4 *>(kc + off);
-                vv4 = *reinterpret_cast<const uint4 *>(vc + off);
+                const int64_t row = key_pos(k0 + j), col = kh * kD + (int64_t)c * kVec;
+                kv4 = kv.k(row, col, g0q);
+                vv4 = kv.v(row, col, g0q);
             }
             ks[j][c ^ (j % 16)] = kv4;
             vs[j][c ^ (j % 16)] = vv4;
@@ -314,10 +317,9 @@ __device__ __forceinline__ void lds_barrier() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 // One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied.
-template <bool GATHER, bool One>
+template <bool GATHER, bool One, typename R>
 __global__ void __launch_bounds__(kWWaves * 32)
-    attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, const uint16_t *kc,
-                                  const uint16_t *vc, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
+    attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, R kv, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
                                   float *ws, int64_t splits, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
                                   uint32_t *err) {
     __shared__ __attribute__((aligned(16))) float sp[kWWaves][8][32];  // S partials, [wave][element v][lane]
@@ -329,6 +331,7 @@ __global__ void __launch_bounds__(kWWaves * 32)
               half = lane / 16, d_w = w * kDW;
     const int64_t sp_i = blockIdx.x, kh = blockIdx.y, t = blockIdx.z, pos = pos0 + t;
     const int64_t tail_n = (pos + 1) % kQsaTokens, tail0 = pos + 1 - tail_n, complete = (pos + 1) / kQsaTokens;
+    const int64_t g0q = kv8_math::exact_from(pos);  // 8-bit K/V: the rows this query sees exact (kernels/kv8.hpp)
     auto flag = [&](int64_t value) {
         if (atomicCAS(err, 0u, 1u) == 0u) err[1] = (uint32_t)t, err[2] = (uint32_t)value;
     };
@@ -382,18 +385,16 @@ __global__ void __launch_bounds__(kWWaves * 32)
     constexpr int kKLoads = kDW / 8, kVLoads = kDW / 32;  // 16-byte loads per lane per tile
     uint4 kr[kKLoads], va_r[kVLoads], vb_r[kVLoads];
     auto load_tile = [&](int64_t t0) {
-        const bool kv = t0 + col < ke;
-        const uint16_t *krow = kc + ((kv ? kpos_of(t0 + col) : pos) * Hk + kh) * kD + d_w;
+        const int64_t krow = t0 + col < ke ? kpos_of(t0 + col) : pos, c0 = kh * kD + d_w;
 #pragma unroll
-        for (int i = 0; i < kKLoads; ++i) kr[i] = *reinterpret_cast<const uint4 *>(krow + 8 * i);
+        for (int i = 0; i < kKLoads; ++i) kr[i] = kv.k(krow, c0 + 8 * i, g0q);
         const int64_t ka = t0 + 2 * kp2, kb2 = ka + 1;
-        const uint16_t *va = ka < ke ? vc + (kpos_of(ka) * Hk + kh) * kD + d_w : nullptr;
-        const uint16_t *vb2 = kb2 < ke ? vc + (kpos_of(kb2) * Hk + kh) * kD + d_w : nullptr;
+        const int64_t ra = ka < ke ? kpos_of(ka) : -1, rb2 = kb2 < ke ? kpos_of(kb2) : -1;
 #pragma unroll
         for (int i = 0; i < kVLoads; ++i) {
             const int c = grp * 8 + 32 * i;
-            va_r[i] = va ? *reinterpret_cast<const uint4 *>(va + c) : make_uint4(0, 0, 0, 0);
-            vb_r[i] = vb2 ? *reinterpret_cast<const uint4 *>(vb2 + c) : make_uint4(0, 0, 0, 0);
+            va_r[i] = ra >= 0 ? kv.v(ra, c0 + c, g0q) : make_uint4(0, 0, 0, 0);
+            vb_r[i] = rb2 >= 0 ? kv.v(rb2, c0 + c, g0q) : make_uint4(0, 0, 0, 0);
         }
     };
     if (GATHER && kb < ke) fill_table(kb);
@@ -664,50 +665,120 @@ size_t attention_workspace_bytes(const AttentionShape &s) {
     return (size_t)(s.T * s.Hq * splits * (kD + 2)) * 4;
 }
 
-void attention(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
-               const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
-               hipStream_t stream) {
-    STRIX_CHECK(q != nullptr && gate != nullptr && k_cache != nullptr && v_cache != nullptr && out != nullptr &&
-                    workspace != nullptr,
-                "attention: null pointer (q=", q, ", gate=", gate, ", k=", k_cache, ", v=", v_cache, ", out=", out,
-                ", ws=", (const void *)workspace, ")");
-    check_shape(s);
-    STRIX_CHECK(capacity >= s.pos0 + s.T, "attention: KV cache capacity ", capacity, " < pos0 + T = ", s.pos0 + s.T);
-    STRIX_CHECK(std::isfinite(scale) && scale > 0, "attention: scale = ", scale);
-    STRIX_CHECK(act == Act::F32 || act == Act::BF16, "attention: unsupported activation dtype ", (int)act);
-    const size_t need = attention_workspace_bytes(s);
-    STRIX_CHECK(workspace_bytes >= need, "attention: workspace ", workspace_bytes, " bytes, need ", need);
+namespace {
+
+// The K/V a call reads: the BF16 / FP32 cache (k, v: [capacity, Hk, D]) or the 8-bit one (q8).
+struct KvArg {
+    const void *k = nullptr, *v = nullptr;
+    const Kv8View *q8 = nullptr;
+};
+
+// Pointers, alignment and - for the 8-bit view - that it holds every row [0, pos0 + T): storage below g0, the tail
+// from g0 on (at most kKv8Group rows).
+void check_kv(const char *fn, const KvArg &kv, int64_t capacity, const AttentionShape &s) {
+    if (kv.q8 == nullptr) {
+        STRIX_CHECK(kv.k != nullptr && kv.v != nullptr, fn, ": null K/V cache (k=", kv.k, ", v=", kv.v, ")");
+        STRIX_CHECK(reinterpret_cast<uintptr_t>(kv.k) % 16 == 0 && reinterpret_cast<uintptr_t>(kv.v) % 16 == 0, fn,
+                    ": K/V caches (", kv.k, ", ", kv.v, ") must be 16-byte aligned for vector loads");
+        STRIX_CHECK(capacity >= s.pos0 + s.T, fn, ": KV cache capacity ", capacity, " < pos0 + T = ", s.pos0 + s.T);
+        return;
+    }
+    const Kv8View &x = *kv.q8;
+    const bool need_tail = s.pos0 % kKv8Group != 0;
+    STRIX_CHECK(x.store != nullptr && x.k_new != nullptr && x.v_new != nullptr && (x.tail_in != nullptr || !need_tail),
+                fn, ": 8-bit K/V view with a null pointer (store=", (const void *)x.store, ", tail_in=", x.tail_in,
+                ", k_new=", x.k_new, ", v_new=", x.v_new, ")");
+    const auto a16 = [](const void *p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; };
+    STRIX_CHECK(a16(x.store) && a16(x.tail_in) && a16(x.k_new) && a16(x.v_new), fn,
+                ": 8-bit K/V store / tail / new rows must be 16-byte aligned (", (const void *)x.store, ", ", x.tail_in,
+                ", ", x.k_new, ", ", x.v_new, ")");
+    STRIX_CHECK(x.W == s.Hk * s.D, fn, ": 8-bit K/V view has rows of ", x.W, " values, the shape Hk * D = ", s.Hk * s.D);
+    STRIX_CHECK(x.capacity % kKv8Group == 0 && x.capacity >= s.pos0 + s.T, fn, ": 8-bit K/V capacity ", x.capacity,
+                ", expected a multiple of ", kKv8Group, " >= pos0 + T = ", s.pos0 + s.T);
+    STRIX_CHECK(x.pos0 == s.pos0, fn, ": 8-bit K/V view is for a call at ", x.pos0, ", the shape's pos0 is ", s.pos0);
+    STRIX_CHECK(x.new_ts >= x.W && x.new_ts % 8 == 0, fn, ": 8-bit K/V new-row stride ", x.new_ts,
+                ", expected >= W = ", x.W, " and a multiple of 8 (16-byte rows)");
+    if (x.staged_k || x.staged_v || x.staged_rows) {
+        const int64_t need = kv8_math::exact_from(s.pos0 + s.T - 1);
+        STRIX_CHECK(x.staged_k != nullptr && x.staged_v != nullptr, fn, ": 8-bit K/V view staged with a null pointer "
+                    "(staged_k=", x.staged_k, ", staged_v=", x.staged_v, ")");
+        STRIX_CHECK(a16(x.staged_k) && a16(x.staged_v), fn, ": staged K/V (", x.staged_k, ", ", x.staged_v,
+                    ") must be 16-byte aligned");
+        STRIX_CHECK(x.staged_rows >= need && x.staged_rows <= x.capacity, fn, ": 8-bit K/V view stages ",
+                    x.staged_rows, " rows, the call's last query needs ", need, " (capacity ", x.capacity, ")");
+    }
+}
+
+// Calls f(reader) with the reader type for kv and the element type T.
+template <typename T, typename F>
+void with_reader(const KvArg &kv, int64_t W, F &&f) {
+    if (kv.q8 && kv.q8->staged_k) f(kv8_math::StagedReader<T>(*kv.q8));
+    else if (kv.q8) f(kv8_math::Kv8Reader<T>(*kv.q8));
+    else f(kv8_math::PlainReader<T>{static_cast<const T *>(kv.k), static_cast<const T *>(kv.v), W});
+}
+
+int wave_size(const char *fn) {
     static const int warp = [] {
         int dev = 0, w = 0;
         STRIX_HIP_CHECK(hipGetDevice(&dev), "attention: current device");
         STRIX_HIP_CHECK(hipDeviceGetAttribute(&w, hipDeviceAttributeWarpSize, dev), "attention: warp size");
         return w;
     }();
-    STRIX_CHECK(warp == 32, "attention: built for wave32 (2 halves of D per key), device wave size ", warp);
-    STRIX_CHECK(reinterpret_cast<uintptr_t>(k_cache) % 16 == 0 && reinterpret_cast<uintptr_t>(v_cache) % 16 == 0,
-                "attention: K/V caches (", k_cache, ", ", v_cache, ") must be 16-byte aligned for vector loads");
+    STRIX_CHECK(warp == 32, fn, ": built for wave32 (2 halves of D per key), device wave size ", warp);
+    return warp;
+}
+
+void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t capacity, const AttentionShape &s,
+                    float scale, void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream) {
+    const char *fn = "attention";
+    STRIX_CHECK(q != nullptr && gate != nullptr && out != nullptr && workspace != nullptr, fn, ": null pointer (q=", q,
+                ", gate=", gate, ", out=", out, ", ws=", (const void *)workspace, ")");
+    check_shape(s);
+    check_kv(fn, kv, capacity, s);
+    STRIX_CHECK(std::isfinite(scale) && scale > 0, fn, ": scale = ", scale);
+    STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
+    const size_t need = attention_workspace_bytes(s);
+    STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
+    const int warp = wave_size(fn);
     const int64_t kps = keys_per_split(s, s.pos0 + s.T), splits = (s.pos0 + s.T + kps - 1) / kps;
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block((unsigned)(warp * (s.Hq / s.Hk)));
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
     if (act == Act::F32) {
-        attention_partial_kernel<float, false><<<grid, block, q_lds, stream>>>(
-            static_cast<const float *>(q), s.q_ts, s.q_hs, static_cast<const float *>(k_cache),
-            static_cast<const float *>(v_cache), s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
-            nullptr);
+        with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
+            attention_partial_kernel<float, false><<<grid, block, q_lds, stream>>>(
+                static_cast<const float *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits,
+                nullptr, nullptr, 0, nullptr);
+        });
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
                                                                       s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
     } else {
-        attention_partial_kernel<uint16_t, false><<<grid, block, q_lds, stream>>>(
-            static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, static_cast<const uint16_t *>(k_cache),
-            static_cast<const uint16_t *>(v_cache), s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr,
-            0, nullptr);
+        with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+            attention_partial_kernel<uint16_t, false><<<grid, block, q_lds, stream>>>(
+                static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace,
+                splits, nullptr, nullptr, 0, nullptr);
+        });
         attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                          static_cast<const uint16_t *>(gate), s.q_ts,
                                                                          s.q_hs, s.Hq, static_cast<uint16_t *>(out));
     }
-    STRIX_HIP_CHECK_LAUNCH("attention ", act_name(act), " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk,
-                           " splits=", splits);
+    STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq,
+                           " Hk=", s.Hk, " splits=", splits);
+}
+
+}  // namespace
+
+void attention(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
+               const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
+               hipStream_t stream) {
+    attention_impl(q, gate, KvArg{k_cache, v_cache, nullptr}, capacity, s, scale, out, workspace, workspace_bytes, act,
+                   stream);
+}
+
+void attention(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale, void *out,
+               float *workspace, size_t workspace_bytes, Act act, hipStream_t stream) {
+    attention_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, scale, out, workspace, workspace_bytes, act,
+                   stream);
 }
 
 namespace {
@@ -725,50 +796,63 @@ size_t attention_gathered_workspace_bytes(const AttentionShape &s, int64_t sel_l
     return (size_t)(s.T * s.Hq * splits * (kD + 2)) * 4;
 }
 
-void attention_gathered(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
-                        const AttentionShape &s, const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale,
-                        void *out, float *workspace, size_t workspace_bytes, uint32_t *err, Act act,
-                        hipStream_t stream) {
+namespace {
+void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, int64_t capacity,
+                             const AttentionShape &s, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
+                             float scale, void *out, float *workspace, size_t workspace_bytes, uint32_t *err, Act act,
+                             hipStream_t stream) {
     const char *fn = "attention_gathered";
-    STRIX_CHECK(q != nullptr && gate != nullptr && k_cache != nullptr && v_cache != nullptr && out != nullptr &&
-                    workspace != nullptr && sel != nullptr && nsel != nullptr && err != nullptr,
-                fn, ": null pointer (q=", q, ", gate=", gate, ", k=", k_cache, ", v=", v_cache, ", out=", out, ", ws=",
-                (const void *)workspace, ", sel=", (const void *)sel, ", nsel=", (const void *)nsel, ", err=",
-                (const void *)err, ")");
+    STRIX_CHECK(q != nullptr && gate != nullptr && out != nullptr && workspace != nullptr && sel != nullptr &&
+                    nsel != nullptr && err != nullptr,
+                fn, ": null pointer (q=", q, ", gate=", gate, ", out=", out, ", ws=", (const void *)workspace, ", sel=",
+                (const void *)sel, ", nsel=", (const void *)nsel, ", err=", (const void *)err, ")");
     check_shape(s);
-    STRIX_CHECK(capacity >= s.pos0 + s.T, fn, ": KV cache capacity ", capacity, " < pos0 + T = ", s.pos0 + s.T);
+    check_kv(fn, kv, capacity, s);
     STRIX_CHECK(std::isfinite(scale) && scale > 0, fn, ": scale = ", scale);
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
     const size_t need = attention_gathered_workspace_bytes(s, sel_ld);
     STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
-    int dev = 0, warp = 0;
-    STRIX_HIP_CHECK(hipGetDevice(&dev), fn, ": current device");
-    STRIX_HIP_CHECK(hipDeviceGetAttribute(&warp, hipDeviceAttributeWarpSize, dev), fn, ": warp size");
-    STRIX_CHECK(warp == 32, fn, ": built for wave32, device wave size ", warp);
-    STRIX_CHECK(reinterpret_cast<uintptr_t>(k_cache) % 16 == 0 && reinterpret_cast<uintptr_t>(v_cache) % 16 == 0, fn,
-                ": K/V caches (", k_cache, ", ", v_cache, ") must be 16-byte aligned for vector loads");
+    const int warp = wave_size(fn);
     const int64_t n = gathered_max_keys(s, sel_ld), kps = keys_per_split(s, n), splits = (n + kps - 1) / kps;
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block((unsigned)(warp * (s.Hq / s.Hk)));
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
     if (act == Act::F32) {
-        attention_partial_kernel<float, true><<<grid, block, q_lds, stream>>>(
-            static_cast<const float *>(q), s.q_ts, s.q_hs, static_cast<const float *>(k_cache),
-            static_cast<const float *>(v_cache), s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld,
-            err);
+        with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
+            attention_partial_kernel<float, true><<<grid, block, q_lds, stream>>>(
+                static_cast<const float *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits,
+                sel, nsel, sel_ld, err);
+        });
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
                                                                       s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
     } else {
-        attention_partial_kernel<uint16_t, true><<<grid, block, q_lds, stream>>>(
-            static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, static_cast<const uint16_t *>(k_cache),
-            static_cast<const uint16_t *>(v_cache), s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld,
-            err);
+        with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+            attention_partial_kernel<uint16_t, true><<<grid, block, q_lds, stream>>>(
+                static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace,
+                splits, sel, nsel, sel_ld, err);
+        });
         attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                          static_cast<const uint16_t *>(gate), s.q_ts,
                                                                          s.q_hs, s.Hq, static_cast<uint16_t *>(out));
     }
-    STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk,
-                           " splits=", splits);
+    STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq,
+                           " Hk=", s.Hk, " splits=", splits);
+}
+}  // namespace
+
+void attention_gathered(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
+                        const AttentionShape &s, const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale,
+                        void *out, float *workspace, size_t workspace_bytes, uint32_t *err, Act act,
+                        hipStream_t stream) {
+    attention_gathered_impl(q, gate, KvArg{k_cache, v_cache, nullptr}, capacity, s, sel, nsel, sel_ld, scale, out,
+                            workspace, workspace_bytes, err, act, stream);
+}
+
+void attention_gathered(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                        const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                        float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream) {
+    attention_gathered_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld, scale, out,
+                            workspace, workspace_bytes, err, act, stream);
 }
 
 void check_attention_error(const uint32_t *err, const char *what) {
@@ -785,49 +869,44 @@ void report_attention_error(const uint32_t e[3], const char *what) {
 
 
 namespace {
-void wmma_attention_launch(bool gather, const void *q, const void *gate, const void *k_cache, const void *v_cache,
-                           const AttentionShape &s, int64_t n, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
-                           float scale, void *out, float *workspace, uint32_t *err, hipStream_t stream,
-                           AttnPrecision precision) {
+void wmma_attention_launch(bool gather, const void *q, const void *gate, const KvArg &kv, const AttentionShape &s,
+                           int64_t n, const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                           float *workspace, uint32_t *err, hipStream_t stream, AttnPrecision precision) {
     const int64_t kps = keys_per_split(s, n), splits = (n + kps - 1) / kps;
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block(kWWaves * 32);
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
-    const auto *qb = static_cast<const uint16_t *>(q), *kb = static_cast<const uint16_t *>(k_cache),
-               *vb = static_cast<const uint16_t *>(v_cache);
-    auto partial = [&](auto one) {
-        constexpr bool One = decltype(one)::value;
-        if (gather)
-            attention_partial_wmma_kernel<true, One><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq, s.Hk,
-                                                                                 s.pos0, kps, scale, workspace, splits,
-                                                                                 sel, nsel, sel_ld, err);
-        else
-            attention_partial_wmma_kernel<false, One><<<grid, block, 0, stream>>>(qb, s.q_ts, s.q_hs, kb, vb, s.Hq,
-                                                                                  s.Hk, s.pos0, kps, scale, workspace,
-                                                                                  splits, nullptr, nullptr, 0, nullptr);
-    };
+    const auto *qb = static_cast<const uint16_t *>(q);
     STRIX_CHECK(precision == AttnPrecision::Exact || precision == AttnPrecision::Fast,
                 "attention (WMMA): unknown precision ", (int)precision);
-    if (precision == AttnPrecision::Fast) partial(std::true_type{});
-    else partial(std::false_type{});
+    with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+        using R = decltype(rd);
+        auto partial = [&](auto one) {
+            constexpr bool One = decltype(one)::value;
+            if (gather)
+                attention_partial_wmma_kernel<true, One, R><<<grid, block, 0, stream>>>(
+                    qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld, err);
+            else
+                attention_partial_wmma_kernel<false, One, R><<<grid, block, 0, stream>>>(
+                    qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
+                    nullptr);
+        };
+        if (precision == AttnPrecision::Fast) partial(std::true_type{});
+        else partial(std::false_type{});
+    });
     attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                      static_cast<const uint16_t *>(gate), s.q_ts,
                                                                      s.q_hs, s.Hq, static_cast<uint16_t *>(out));
 }
-void wmma_attention_checks(const char *fn, const void *q, const void *gate, const void *k_cache, const void *v_cache,
-                           const void *out, const float *workspace, int64_t capacity, const AttentionShape &s,
-                           float scale, Act act) {
-    STRIX_CHECK(q != nullptr && gate != nullptr && k_cache != nullptr && v_cache != nullptr && out != nullptr &&
-                    workspace != nullptr,
-                fn, ": null pointer (q=", q, ", gate=", gate, ", k=", k_cache, ", v=", v_cache, ", out=", out, ", ws=",
-                (const void *)workspace, ")");
+void wmma_attention_checks(const char *fn, const void *q, const void *gate, const KvArg &kv, const void *out,
+                           const float *workspace, int64_t capacity, const AttentionShape &s, float scale, Act act) {
+    STRIX_CHECK(q != nullptr && gate != nullptr && out != nullptr && workspace != nullptr, fn, ": null pointer (q=", q,
+                ", gate=", gate, ", out=", out, ", ws=", (const void *)workspace, ")");
     check_shape(s);
     STRIX_CHECK(act == Act::BF16, fn, ": BF16 activations only (got ", act_name(act), ")");
-    STRIX_CHECK(capacity >= s.pos0 + s.T, fn, ": KV cache capacity ", capacity, " < pos0 + T = ", s.pos0 + s.T);
+    check_kv(fn, kv, capacity, s);
     STRIX_CHECK(std::isfinite(scale) && scale > 0, fn, ": scale = ", scale);
     STRIX_CHECK(reinterpret_cast<uintptr_t>(q) % 16 == 0 && s.q_ts % 8 == 0 && s.q_hs % 8 == 0, fn, ": q ", q,
                 " and its strides (token ", s.q_ts, ", head ", s.q_hs, ") must be 16-byte aligned");
-    STRIX_CHECK(reinterpret_cast<uintptr_t>(k_cache) % 16 == 0 && reinterpret_cast<uintptr_t>(v_cache) % 16 == 0, fn,
-                ": K/V caches (", k_cache, ", ", v_cache, ") must be 16-byte aligned");
     int dev = 0, warp = 0;
     STRIX_HIP_CHECK(hipGetDevice(&dev), fn, ": current device");
     STRIX_HIP_CHECK(hipDeviceGetAttribute(&warp, hipDeviceAttributeWarpSize, dev), fn, ": warp size");
@@ -836,6 +915,33 @@ void wmma_attention_checks(const char *fn, const void *q, const void *gate, cons
 size_t wmma_workspace(const AttentionShape &s, int64_t n) {
     const int64_t kps = keys_per_split(s, n), splits = (n + kps - 1) / kps;
     return (size_t)(s.T * s.Hq * splits * (kD + 2)) * 4;
+}
+
+void attention_wmma_impl(const void *q, const void *gate, const KvArg &kv, int64_t capacity, const AttentionShape &s,
+                         float scale, void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
+                         AttnPrecision precision) {
+    const char *fn = "attention_wmma";
+    wmma_attention_checks(fn, q, gate, kv, out, workspace, capacity, s, scale, act);
+    const size_t need = attention_wmma_workspace_bytes(s);
+    STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
+    wmma_attention_launch(false, q, gate, kv, s, s.pos0 + s.T, nullptr, nullptr, 0, scale, out, workspace, nullptr,
+                          stream, precision);
+    STRIX_HIP_CHECK_LAUNCH(fn, kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
+}
+
+void attention_gathered_wmma_impl(const void *q, const void *gate, const KvArg &kv, int64_t capacity,
+                                  const AttentionShape &s, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
+                                  float scale, void *out, float *workspace, size_t workspace_bytes, uint32_t *err,
+                                  Act act, hipStream_t stream, AttnPrecision precision) {
+    const char *fn = "attention_gathered_wmma";
+    wmma_attention_checks(fn, q, gate, kv, out, workspace, capacity, s, scale, act);
+    STRIX_CHECK(sel != nullptr && nsel != nullptr && err != nullptr, fn, ": null pointer (sel=", (const void *)sel,
+                ", nsel=", (const void *)nsel, ", err=", (const void *)err, ")");
+    const size_t need = attention_gathered_wmma_workspace_bytes(s, sel_ld);
+    STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
+    wmma_attention_launch(true, q, gate, kv, s, gathered_max_keys(s, sel_ld), sel, nsel, sel_ld, scale, out, workspace,
+                          err, stream, precision);
+    STRIX_HIP_CHECK_LAUNCH(fn, kv.q8 ? " kv8" : "", " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
 }
 }  // namespace
 
@@ -847,13 +953,15 @@ size_t attention_wmma_workspace_bytes(const AttentionShape &s) {
 void attention_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
                     const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
                     hipStream_t stream, AttnPrecision precision) {
-    const char *fn = "attention_wmma";
-    wmma_attention_checks(fn, q, gate, k_cache, v_cache, out, workspace, capacity, s, scale, act);
-    const size_t need = attention_wmma_workspace_bytes(s);
-    STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
-    wmma_attention_launch(false, q, gate, k_cache, v_cache, s, s.pos0 + s.T, nullptr, nullptr, 0, scale, out, workspace,
-                          nullptr, stream, precision);
-    STRIX_HIP_CHECK_LAUNCH(fn, " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
+    attention_wmma_impl(q, gate, KvArg{k_cache, v_cache, nullptr}, capacity, s, scale, out, workspace, workspace_bytes,
+                        act, stream, precision);
+}
+
+void attention_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale,
+                    void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
+                    AttnPrecision precision) {
+    attention_wmma_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, scale, out, workspace, workspace_bytes,
+                        act, stream, precision);
 }
 
 size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t sel_ld) {
@@ -867,15 +975,16 @@ void attention_gathered_wmma(const void *q, const void *gate, const void *k_cach
                              int64_t capacity, const AttentionShape &s, const int32_t *sel, const int32_t *nsel,
                              int64_t sel_ld, float scale, void *out, float *workspace, size_t workspace_bytes,
                              uint32_t *err, Act act, hipStream_t stream, AttnPrecision precision) {
-    const char *fn = "attention_gathered_wmma";
-    wmma_attention_checks(fn, q, gate, k_cache, v_cache, out, workspace, capacity, s, scale, act);
-    STRIX_CHECK(sel != nullptr && nsel != nullptr && err != nullptr, fn, ": null pointer (sel=", (const void *)sel,
-                ", nsel=", (const void *)nsel, ", err=", (const void *)err, ")");
-    const size_t need = attention_gathered_wmma_workspace_bytes(s, sel_ld);
-    STRIX_CHECK(workspace_bytes >= need, fn, ": workspace ", workspace_bytes, " bytes, need ", need);
-    wmma_attention_launch(true, q, gate, k_cache, v_cache, s, gathered_max_keys(s, sel_ld), sel, nsel, sel_ld, scale,
-                          out, workspace, err, stream, precision);
-    STRIX_HIP_CHECK_LAUNCH(fn, " T=", s.T, " pos0=", s.pos0, " Hq=", s.Hq, " Hk=", s.Hk);
+    attention_gathered_wmma_impl(q, gate, KvArg{k_cache, v_cache, nullptr}, capacity, s, sel, nsel, sel_ld, scale, out,
+                                 workspace, workspace_bytes, err, act, stream, precision);
+}
+
+void attention_gathered_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                             const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                             float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream,
+                             AttnPrecision precision) {
+    attention_gathered_wmma_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld, scale, out,
+                                 workspace, workspace_bytes, err, act, stream, precision);
 }
 
 }  // namespace strix::kernels

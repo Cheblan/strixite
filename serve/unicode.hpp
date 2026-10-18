@@ -18,6 +18,10 @@ const char *nfc_version();      // Unicode version of nfc() / combining_class()
 
 // Throws (naming `what` and the byte offset) on malformed UTF-8.
 std::vector<uint32_t> decode_utf8(std::string_view s, const char *what);
+// s with every byte that doesn't start a valid UTF-8 character replaced by U+FFFD (Python's errors="replace", one
+// replacement a byte); *replaced (if given) = how many. For model output: byte tokens can be sampled in an order that
+// isn't UTF-8, and that must not fail the request.
+std::string replace_invalid_utf8(std::string_view s, int64_t *replaced);
 void append_utf8(std::string &out, uint32_t cp);
 std::string encode_utf8(const std::vector<uint32_t> &cps, size_t begin, size_t end);
 

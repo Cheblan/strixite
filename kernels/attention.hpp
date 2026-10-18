@@ -19,6 +19,7 @@
 //
 // KV cache: [capacity, Hk, D] per layer for K and V, activation dtype.
 
+#include "kernels/kv8.hpp"   // Kv8View
 #include "kernels/norm.hpp"  // Act
 #include "kernels/rope.hpp"  // MropePos (interleaved mRoPE triples)
 
@@ -77,6 +78,13 @@ size_t attention_workspace_bytes(const AttentionShape &s);
 void attention(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
                const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
                hipStream_t stream);
+// The same over the 8-bit K/V cache (kernels/kv8.hpp): kv holds rows [0, pos0 + T) - each query at position p
+// reads the groups complete at p from the 8-bit storage and rows from kv8_math::exact_from(p) on from the tail
+// before the call / the call's new rows - and kv.capacity stands for the cache's. Values read are the
+// dequantized ones rounded to the activation dtype, so the result equals attention() over a cache holding them.
+// Likewise for the three below.
+void attention(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale, void *out,
+               float *workspace, size_t workspace_bytes, Act act, hipStream_t stream);
 
 // QSA sparse attention (full attention with the QSA indexer): as attention(), but query t
 // attends only to the tokens of its selected blocks - sel [T, sel_ld] int32 block indices, nsel [T] their counts
@@ -89,6 +97,9 @@ void attention_gathered(const void *q, const void *gate, const void *k_cache, co
                         const AttentionShape &s, const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale,
                         void *out, float *workspace, size_t workspace_bytes, uint32_t *err, Act act,
                         hipStream_t stream);
+void attention_gathered(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                        const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                        float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream);
 void check_attention_error(const uint32_t *err, const char *what);
 // The same check on the 3 words already on the host (read back with the forward's one sync).
 void report_attention_error(const uint32_t e[3], const char *what);
@@ -104,11 +115,18 @@ size_t attention_wmma_workspace_bytes(const AttentionShape &s);
 void attention_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache, int64_t capacity,
                     const AttentionShape &s, float scale, void *out, float *workspace, size_t workspace_bytes, Act act,
                     hipStream_t stream, AttnPrecision precision = AttnPrecision::Exact);
+void attention_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale,
+                    void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
+                    AttnPrecision precision = AttnPrecision::Exact);
 size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t sel_ld);
 void attention_gathered_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache,
                              int64_t capacity, const AttentionShape &s, const int32_t *sel, const int32_t *nsel,
                              int64_t sel_ld, float scale, void *out, float *workspace, size_t workspace_bytes,
                              uint32_t *err, Act act, hipStream_t stream,
+                             AttnPrecision precision = AttnPrecision::Exact);
+void attention_gathered_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                             const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                             float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream,
                              AttnPrecision precision = AttnPrecision::Exact);
 
 }  // namespace strix::kernels

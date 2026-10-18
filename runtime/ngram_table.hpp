@@ -2,7 +2,7 @@
 
 // PLE n-gram rows for the forward. NgramRowSource is what Qwen4ExpModel reads rows through; two sources:
 //   NgramTableRows      - the converted table file (formats/ngram_table.hpp): rows read on demand from SSD
-//                         (the table stays on SSD), deduplicated and fetched with up to 32 concurrent preads, and an
+//                         (the table stays on SSD), deduplicated and fetched with up to 64 concurrent preads, and an
 //                         LRU cache of recently used rows (n-gram ids are heavily skewed - frequent n-grams repeat
 //                         across a conversation and its prefills).
 //   NgramRowsFromShards - interim (runtime/ngram_rows.hpp): straight from the HF checkpoint's shards.
@@ -37,6 +37,8 @@ public:
 // max_threads - 1 of a persistent pool of reader threads (shared by concurrent calls); returns when all n are done
 // and rethrows the first failure.
 void parallel_rows(size_t n, size_t max_threads, const std::function<void(size_t)> &fetch);
+// The reader pool's thread count (the value parallel_rows caps at; bench provenance fields record it).
+size_t ngram_read_threads();
 
 class NgramTableRows : public NgramRowSource {
 public:

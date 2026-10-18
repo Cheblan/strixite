@@ -96,6 +96,7 @@ struct PromptCacheStats {
     int64_t ram_only_dropped = 0;  // RAM-only entries that left RAM (never written, by design)
     int64_t rejected_space = 0, rejected_budget = 0, rejected_queue = 0;  // eviction writes refused, by reason
     int64_t room_refused = 0;  // make_room_for found no room: a save skipped or a disk load refused
+    int64_t room_waits = 0;    // make_room_for waited for evicted entries' writes to give their RAM back (polls)
     int64_t evicted = 0, replaced = 0, invalid = 0;  // disk LRU / replaced turns / damaged or foreign
     int64_t checkpoints_dropped = 0;                 // older Checkpoints over checkpoints_per_chain
     int64_t prefaulted = 0;                          // spares the writer populated ahead of an export
@@ -143,6 +144,9 @@ public:
         std::string status_note;            // appended to the periodic status line ("" = none): what adapt turned down
         uint64_t prefault_headroom = 256ull << 20;  // on top of the last saved state (a conversation grows)
         uint64_t max_pending_bytes = 0;  // the eviction write queue's cap; 0 = max(kMaxPendingBytes, 4 x last state)
+        // make_room_for waits up to this long for evicted entries still being written to give their RAM back before
+        // it refuses (a refused disk load re-prefills its whole prompt: 154 s at 239k; writes run at ~1 GB/s).
+        double room_wait_seconds = 20;
         // Memory and disk probes: /proc/meminfo MemAvailable and statvfs(dir) by default; tests fake them.
         std::function<uint64_t()> mem_available;
         std::function<uint64_t()> disk_free;
@@ -213,6 +217,9 @@ public:
     // buffer - the save is skipped, the load refused - so the margin holds at every allocation, not only after a put
     // (a whole 7.4 GB export a request, checked only afterwards, once took the machine to 0.5 GB and hung it).
     bool make_room_for(uint64_t bytes);
+    // What holds the RAM tier, for the line after a refusal: entries (in use by a reader or the writer / queued for a
+    // write / free to leave), spares, bytes still leaving. Free-to-leave entries left after a refusal are a bug.
+    std::string ram_summary() const;
     uint64_t mem_available_now() const { return mem_available(); }  // MemAvailable (or the test's probe), bytes
     uint64_t disk_free_now() const { return disk_free(); }          // free bytes on the directory's filesystem
     void give_back(HostBuffer b);
@@ -241,6 +248,7 @@ private:
         int readers = 0;           // with_state / the writer using ram (it must stay put)
         bool queued = false;       // a write is queued or running
         bool drop_ram = false;     // leave RAM once written (an eviction)
+        bool releasing = false;    // its RAM is given back as the writer writes it: unreadable (with_state waits)
         bool dead = false;         // removed from the index while in use; the last user cleans up
         bool no_room = false;      // the disk had no room for it (or evicted it): no idle write until it's used again
         bool ram_only = false;     // never written to disk (a one-shot request's); leaving RAM drops it
@@ -262,12 +270,15 @@ private:
     uint64_t write_bytes_locked(const Entry &e) const;
     int find_locked(const int32_t *tokens, int64_t n) const;
     int find_locked(const Entry *e) const;
-    void remove_locked(size_t i);                      // from the index: RAM and disk
+    // From the index: RAM and disk. to_spare: its RAM (and its deltas') becomes a spare buffer, else trash - the RAM
+    // rule passes false: its evictions must unmap (a spare keeps the memory the eviction was meant to free).
+    void remove_locked(size_t i, bool to_spare = true);
     void drop_ram_locked(Entry &e, bool to_spare);     // its buffer becomes a spare, or trash
     void release_locked(Entry &e);                     // a reader / the writer is done with e
     void unlink_locked(Entry &e);                      // its file
     void keep_spare_locked(HostBuffer b);
     void make_room_locked(uint64_t extra = 0);         // the RAM rule: MemAvailable >= ram_margin + extra
+    uint64_t leaving_bytes_locked() const;             // RAM of evicted entries not yet written (on its way out)
     // The writer's margin watch (Options::ram_watch_seconds): the RAM rule, its buffers unmapped outside the lock.
     void watch_margin(std::unique_lock<std::mutex> &lock);
     void evict_disk_locked(uint64_t need);

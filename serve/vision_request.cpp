@@ -10,6 +10,8 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -102,8 +104,9 @@ std::vector<uint8_t> base64_decode(const std::string &in, const std::string &whe
 }
 
 // One int32 pseudo id from a 64-bit hash slice, strictly negative (real token ids are >= 0).
+// -1 - x rather than -(x + 1): the latter negates INT_MIN when the low 31 bits are all ones (UB).
 int32_t pseudo_id(uint64_t h) {
-    return -(int32_t)((h & 0x7fffffffu) + 1u);  // -1 .. INT_MIN
+    return -1 - (int32_t)(h & 0x7fffffffu);  // -1 .. INT_MIN
 }
 
 }  // namespace
@@ -153,7 +156,10 @@ ServedVision load_vision_config(const std::string &preprocessor_config_path, con
     const json::Value *pad = cfg.find("image_token_id");
     STRIX_CHECK(pad != nullptr && pad->is_int(), fn, ": config.json has no integer image_token_id (the "
                 "template's image_pad row id)");
-    out.image_token_id = (int32_t)json_int(*pad, "image_token_id");
+    const int64_t pad_id = json_int(*pad, "image_token_id");
+    STRIX_CHECK(pad_id >= 0 && pad_id <= std::numeric_limits<int32_t>::max(), fn, ": config.json image_token_id = ",
+                pad_id, ", expected a token id in 0..", std::numeric_limits<int32_t>::max());
+    out.image_token_id = (int32_t)pad_id;
     return out;
 }
 
@@ -189,19 +195,67 @@ ParsedImage parse_data_url(const std::string &url, const std::string &where) {
     return out;
 }
 
-std::vector<ServedImage> prepare_images(const std::vector<ParsedImage> &parsed, const ServedVision &vision) {
+bool DecodeMemo::find(uint64_t digest, Grid &out) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = grids_.find(digest);
+    if (it == grids_.end()) return false;
+    out = it->second;
+    return true;
+}
+
+void DecodeMemo::remember(uint64_t digest, const Grid &grid) {
+    STRIX_CHECK(grid.grid_t >= 1 && grid.grid_h >= 1 && grid.grid_w >= 1 && grid.merged_tokens >= 1,
+                "DecodeMemo::remember: grid ", grid.grid_t, "x", grid.grid_h, "x", grid.grid_w, " with ",
+                grid.merged_tokens, " merged tokens, expected every field >= 1 (a decoded image's grid)");
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!grids_.emplace(digest, grid).second) return;
+    order_.push_back(digest);
+    while (order_.size() > kMaxEntries) {
+        grids_.erase(order_.front());
+        order_.pop_front();
+    }
+}
+
+size_t DecodeMemo::size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return grids_.size();
+}
+
+std::vector<ServedImage> prepare_images(std::vector<ParsedImage> parsed, const ServedVision &vision,
+                                        DecodeMemo *memo) {
     std::vector<ServedImage> out;
     out.reserve(parsed.size());
     for (size_t i = 0; i < parsed.size(); ++i) {
+        STRIX_CHECK(!parsed[i].bytes.empty(), "prepare_images: image ", i + 1, " of ", parsed.size(),
+                    " has 0 bytes (parse_data_url refuses those - internal)");
         ServedImage img;
-        const Preprocessed pre = preprocess_image(parsed[i].bytes, vision.cfg);  // refuses by name (stb's
+        img.merge = vision.cfg.spatial_merge_size;
+        img.digest = strix_hash64(parsed[i].bytes.data(), parsed[i].bytes.size());
+        DecodeMemo::Grid known;
+        if (memo != nullptr && memo->find(img.digest, known)) {
+            img.prefill.grid_t = known.grid_t, img.prefill.grid_h = known.grid_h, img.prefill.grid_w = known.grid_w;
+            img.merged_tokens = known.merged_tokens;
+            auto bytes = std::make_shared<const std::vector<uint8_t>>(std::move(parsed[i].bytes));
+            img.prefill.decode = [bytes, cfg = vision.cfg, known, digest = img.digest]() {
+                Preprocessed pre = preprocess_image(*bytes, cfg);
+                STRIX_CHECK(pre.grid_t == known.grid_t && pre.grid_h == known.grid_h && pre.grid_w == known.grid_w &&
+                                pre.merged_tokens == known.merged_tokens,
+                            "prepare_images: image ", digest, " decoded at prefill to grid ", pre.grid_t, "x",
+                            pre.grid_h, "x", pre.grid_w, " (", pre.merged_tokens, " merged), its first decode gave ",
+                            known.grid_t, "x", known.grid_h, "x", known.grid_w, " (", known.merged_tokens,
+                            ") - the same bytes must give the same grid");
+                return std::move(pre.pixel_values);
+            };
+            out.push_back(std::move(img));
+            continue;
+        }
+        Preprocessed pre = preprocess_image(parsed[i].bytes, vision.cfg);  // refuses by name (stb's
         // failure reason, the caps, the grid rule - all expected-vs-found, with the request layer naming
         // which image part failed)
         img.prefill.pixel_values = std::move(pre.pixel_values);
         img.prefill.grid_t = pre.grid_t, img.prefill.grid_h = pre.grid_h, img.prefill.grid_w = pre.grid_w;
         img.merged_tokens = pre.merged_tokens;
-        img.merge = vision.cfg.spatial_merge_size;
-        img.digest = strix_hash64(parsed[i].bytes.data(), parsed[i].bytes.size());
+        if (memo != nullptr) memo->remember(img.digest, {pre.grid_t, pre.grid_h, pre.grid_w, pre.merged_tokens});
         out.push_back(std::move(img));
     }
     return out;
@@ -271,6 +325,21 @@ VisionPromptPlan plan_vision_prompt(const std::vector<int32_t> &prompt, std::vec
                 "plan_vision_prompt: the walk built ", plan.pos3.size() / 3, " rows for a prompt of ",
                 prompt.size(), " (internal)");
     return plan;
+}
+
+PreprocessGate::Slot PreprocessGate::acquire(int64_t limit) {
+    STRIX_CHECK(limit >= 1, "PreprocessGate::acquire: limit ", limit, ", expected >= 1 (config vision-preprocess-limit)");
+    // Claim first, then check: two callers can both see room, but the counter they incremented is the truth -
+    // the loser of the race is over the limit and un-claims. (A CAS loop would work too; the fetch_add and
+    // the rare fetch_sub are simpler to read than the loop and this is not a hot path.)
+    const int64_t in_flight_before = in_flight_.fetch_add(1);
+    if (in_flight_before + 1 > limit) {
+        in_flight_.fetch_sub(1);
+        STRIX_FAIL("PreprocessGate: all ", limit, " image preprocess slots are held (config vision-preprocess-limit = ",
+                   limit, ") - the decode / resize runs on the request thread and each one costs a few hundred MB of "
+                   "host RAM; retry the image request shortly");
+    }
+    return Slot(this);
 }
 
 }  // namespace strix::vision

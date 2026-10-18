@@ -277,7 +277,7 @@ private:
     friend class Qwen4ExpSession;
     int64_t pos_ = -1;
     uint64_t epoch_ = 0;
-    std::vector<DeviceBuffer<uint8_t>> conv_, tail_;
+    std::vector<DeviceBuffer<uint8_t>> conv_, tail_, kv8_tail_;  // kv8_tail_: KvFormat::Q8 only
     std::vector<DeviceBuffer<float>> rec_;
     DeviceBuffer<uint8_t> ple_state_, mtp_tail_, mtp_prev_;
     PleHistory ple_hist_;
@@ -299,13 +299,22 @@ struct ImageInput {
     int64_t grid_t = 0, grid_h = 0, grid_w = 0;
 };
 
+// The full-attention layers' K/V cache: in the activation dtype, or 8 bits (kernels/kv8.hpp). Q8 keeps ~56% of the
+// bytes; the rows of the newest incomplete 32-token group stay in a small tail in the activation dtype.
+enum class KvFormat { Act, Q8 };
+const char *kv_format_name(KvFormat f);  // "bf16" / "q8" (Act is named by the config as bf16)
+KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8; anything else throws
+
 class Qwen4ExpSession {
 public:
     // mtp: keep the MTP draft head's state (its KV cache, filled for every position a forward runs) so
     // forward_mtp can draft; needs a model with the head. Off, forward_mtp throws and forwards skip that work.
+    // kv: the full-attention layers' K/V cache format (KvFormat; the MTP head's own K/V stays in the activation
+    // dtype either way).
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false);
+                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act);
     PrefillMath prefill_math() const { return prefill_math_; }
+    KvFormat kv_format() const { return kv_format_; }
     // The kernel-step precision choices for every forward from now on (default: all exact).
     void set_precision(const PrecisionOptions &p);
     const PrecisionOptions &precision() const { return precision_; }
@@ -382,6 +391,17 @@ public:
     // (ms): T = 8 65.9 FP32 vs 76.8 WMMA, 10 78.8 vs 80.2, 12 84.7 vs 82.8, 16 101.0 vs 88.6, 24
     // 131.3 vs 97.4 - so 12.
     static constexpr int64_t kWmmaMinTokens = 12;
+    // WMMA prefill attention over the 8-bit cache stages the dequantized rows (dense and QSA-gathered) for forwards
+    // of at least kKv8StageMinTokens tokens, when the unpacking it saves outweighs the copy: per (query, key row it
+    // reads) over the 12 layers unpacking costs kKv8UnpackNs more than a staged load, and staging costs kKv8StageNs a
+    // row below the call. A gathered query reads qsa_budget rows, so staging pays from T ~ rows / 512: ~256 tokens at
+    // 131k positions, ~1000 at 489k; prefill chunks are far above that, small turn deltas at depth below it.
+    static constexpr int64_t kKv8StageMinTokens = 128;
+    static constexpr double kKv8UnpackNs = 30.0, kKv8StageNs = 120.0;
+    // Whether a T-token forward whose queries each read keys_per_query of the `rows` 8-bit rows stages them.
+    static bool kv8_stage_pays(int64_t T, int64_t keys_per_query, int64_t rows) {
+        return T >= kKv8StageMinTokens && (double)T * (double)keys_per_query * kKv8UnpackNs >= (double)rows * kKv8StageNs;
+    }
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe = nullptr);
     // The image forward (the vision build's forward extension): runs the tower over the image and
     // scatters its merged rows at the image_token_id positions of ids, then forwards exactly like the
@@ -433,6 +453,14 @@ public:
         double gather_seconds = 0, wait_seconds = 0, wait_max_seconds = 0, prefetch_seconds = 0;
     };
     PleStats ple_stats() const;
+    // Vision tower: forwards run (one per image; run_tower_and_scatter), patches and merged tokens fed through
+    // them, seconds spent (upload + tower + scatter, the span the journal line times), the longest single run.
+    // Safe to read from another thread.
+    struct VisionStats {
+        int64_t images = 0, patches = 0, merged_tokens = 0;
+        double tower_seconds = 0, tower_max_seconds = 0;
+    };
+    VisionStats vision_stats() const;
     // Hint for decode with drafts: ids are the tokens the next forward will start with (after the n-gram history
     // at pos()); the PLE n-gram rows of ids[first, size) go into the table's row cache on a background thread now,
     // so that forward's gather finds them there instead of reading them while the GPU waits. The engine calls it as
@@ -481,7 +509,27 @@ private:
     // Per-layer state (empty buffers for the other kind).
     std::vector<DeviceBuffer<uint8_t>> k_cache_, v_cache_, block_keys_, tail_[2], conv_state_;
     std::vector<DeviceBuffer<float>> rec_state_;
-    int tail_cur_ = 0;
+    int tail_cur_ = 0;  // the current indexer tails - and with KvFormat::Q8 the current K/V tails
+    // KvFormat::Q8 (k_cache_ / v_cache_ empty then): per attention layer the 8-bit storage (kernels/kv8.hpp, for
+    // kv8_cap_ rows: the capacity rounded up to whole groups) and the K/V tails [2] (kv8_tail_[tail_cur_] current,
+    // double-buffered like the indexer tails); kv_new_ [max_tokens][2W] the forward's new K | V rows before
+    // kv8_commit; kv8_err_ the fp16-overflow flag.
+    KvFormat kv_format_ = KvFormat::Act;
+    int64_t kv8_cap_ = 0;
+    // An exported state's 8-bit K/V of one layer: the groups [from / 32, n / 32) (codes and params of K, then of V)
+    // and the tail (its rows past n % 32 exported as zeros). kv8_copy moves them between the host cursor and the
+    // layer's storage / `tail` (to_host: export, else import) and records the unused tail bytes for zeroing.
+    size_t kv8_state_bytes(int64_t n, int64_t from) const;
+    void kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t from, const DeviceBuffer<uint8_t> &tail, bool to_host,
+                  std::vector<std::pair<uint8_t *, size_t>> *unused);
+    std::vector<DeviceBuffer<uint8_t>> kv8_store_, kv8_tail_[2];
+    DeviceBuffer<uint8_t> kv_new_;
+    // WMMA prefill attention over the 8-bit cache reads a staged copy (kernels/kv8.hpp Kv8View::staged_k): one
+    // layer's K | V rows [0, kv8_cap_) in BF16, re-filled per layer and call (kv8_dequant; kv8_stage_pays). Empty
+    // unless the session has the 8-bit cache, WMMA prefill and BF16 activations, and forwards of kKv8StageMinTokens
+    // or more.
+    DeviceBuffer<uint8_t> kv8_stage_;
+    DeviceBuffer<uint32_t> kv8_err_;
     // Rewinds for can_restore: epoch e started when the session rewound to rewind_to_[e] (reset() = 0).
     std::vector<int64_t> rewind_to_{0};
     DeviceBuffer<uint8_t> ple_state_;
@@ -511,7 +559,8 @@ private:
     int verify_tail_cur_ = 0, verify_mtp_tail_cur_ = 0;
     PleHistory verify_hist_;
     // keep_verify_prefix's inputs, saved by the verify forward per layer (kMaxLogits rows each): GDN layers their
-    // in_proj rows [T, gstride], attention layers their raw indexer key rows [T, idx_d]; and the verify's ids / size.
+    // in_proj rows [T, gstride], attention layers their raw indexer key rows [T, idx_d] (with KvFormat::Q8 followed by
+    // their new K | V rows [T, 2 hkv hd]); and the verify's ids / size.
     std::vector<DeviceBuffer<uint8_t>> verify_in_;
     std::vector<int32_t> verify_ids_;
     // Chained drafts: step - 1's output streams, the chain's own indexer tails (the committed ones stay untouched),
@@ -600,7 +649,7 @@ private:
     void run_tower_and_scatter(const std::vector<int32_t> &ids, const ImageInput &image);
     // Pinned: the error words at 0 (router, experts, attention - 3 words each), the embedding slot at
     // kReadbackEmbAt, the logits from kReadbackLogitsAt. read_back fills and checks it at the end of a forward.
-    static constexpr size_t kReadbackEmbAt = 64, kReadbackLogitsAt = 128;
+    static constexpr size_t kReadbackEmbAt = 64, kReadbackLogitsAt = 128;  // error words [0, 12): 48 bytes
     PinnedHostBuffer readback_;
     // n_cand_rows > 0: the candidates (cand_dev_: [rows, kLogitCands] then rows NaN words) come back in place of the
     // logits, into cand_host_.
@@ -662,6 +711,8 @@ private:
     // rows at the PLE layer - the part the GPU sits idle for.
     std::atomic<int64_t> ple_gathers_{0}, ple_gather_ns_{0}, ple_waits_{0}, ple_wait_ns_{0}, ple_wait_max_ns_{0};
     std::atomic<int64_t> ple_prefetches_{0}, ple_prefetch_ns_{0}, ple_prefetch_skipped_{0}, ple_prefetch_failed_{0};
+    // Vision tower counters (vision_stats): images (tower forwards), patches, merged tokens, total / max ns.
+    std::atomic<int64_t> vision_images_{0}, vision_patches_{0}, vision_merged_{0}, vision_ns_{0}, vision_max_ns_{0};
     // prefetch_ple's jobs: their own thread, so a prefetch never delays a gather's start (the table's lock orders
     // the two: whichever runs second finds the rows cached). Declared after the counters it writes.
     PleWorker ple_prefetcher_;

@@ -64,11 +64,10 @@ class VisionTower {
 public:
     // path: a vision.strixw from the same checkpoint as text_weights (the side-file rule the n-gram table
     // follows: kind must be "vision" and source_fingerprint must equal the text file's - a tower from
-    // another checkpoint is refused naming both). The text model's placement only chooses the margin
-    // policy here: the tower itself is always one device region (HostExperts is a contract about expert
-    // stacks, which the tower file has none of).
-    VisionTower(const std::string &path, const StrixwFile &text_weights, WeightPlacement text_placement,
-                kernels::Act act);
+    // another checkpoint is refused naming both). The tower loads to the device whatever the text model's
+    // placement is: HostExperts is a contract about expert stacks, which the tower file has none of, and
+    // 856 MiB of BF16 is a device region on every machine.
+    VisionTower(const std::string &path, const StrixwFile &text_weights, kernels::Act act);
 
     const VisionTowerDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }

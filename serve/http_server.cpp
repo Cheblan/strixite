@@ -206,14 +206,28 @@ void HttpServer::routes() {
                 gen.max_tokens = clamp_max_tokens(cr.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(), clamped);
             }
             if (vision) {
-                // The image pipeline: decode + resize + pack (on this thread - the engine worker never
-                // sees bytes), the template's single pad expanded to each image's merged rows, and the
-                // mRoPE walk + the cache-key stream.
+                // The image pipeline: decode + resize + pack on this thread for every image the server hasn't
+                // decoded before (a repeat takes its grid from vision_memo_ and keeps its bytes - the engine
+                // decodes it only if its prefill reaches the block), the template's single pad expanded to each
+                // image's merged rows, and the mRoPE walk + the cache-key stream.
                 // Every failure here is the client's image (a 400 naming what was expected).
                 if (cfg_.vision == nullptr)
                     throw ApiError(400, "image parts need the server's vision tower (config vision)", "messages");
+                // The transient-RAM bound first, before any bytes decode (serve/vision_request.hpp
+                // PreprocessGate): all slots held is a server-load refusal (503, retryable), not the
+                // client's error. The slot releases when the vision block below unwinds.
+                vision::PreprocessGate::Slot preprocess_slot;
                 try {
-                    std::vector<vision::ServedImage> images = vision::prepare_images(cr.images, *cfg_.vision);
+                    preprocess_slot = vision_gate_.acquire(cfg_.vision_preprocess_limit);
+                } catch (const Error &e) {
+                    log_error(id, req, 503, e.what());
+                    return send_error(res, 503, e.what(), "server_error", "messages");
+                }
+                try {
+                    std::vector<vision::ServedImage> images = vision::prepare_images(std::move(cr.images), *cfg_.vision,
+                                                                                      &vision_memo_);
+                    int64_t decoded = 0;
+                    for (const vision::ServedImage &im : images) decoded += !im.prefill.pixel_values.empty();
                     std::vector<int64_t> counts;
                     counts.reserve(images.size());
                     for (const vision::ServedImage &im : images) counts.push_back(im.merged_tokens);
@@ -239,7 +253,9 @@ void HttpServer::routes() {
                                            "messages");
                     if (pre_tokens != gen.prompt.size())
                         vision_note = std::to_string((long long)images.size()) +
-                                      (images.size() == 1 ? " image, " : " images, ") +
+                                      (images.size() == 1 ? " image (" : " images (") +
+                                      std::to_string((long long)decoded) + " decoded, " +
+                                      std::to_string((long long)(images.size() - decoded)) + " known), " +
                                       std::to_string((long long)plan.merged_rows_total) + " expanded rows (prompt " +
                                       std::to_string((long long)pre_tokens) + " -> " +
                                       std::to_string((long long)gen.prompt.size()) + " tokens, rope positions to " +
@@ -288,6 +304,8 @@ void HttpServer::routes() {
         if (cfg_.thinking_cap > 0 && !cr.thinking_budget.has_value() && gen.thinking_budget > cfg_.thinking_cap) {
             gen.thinking_budget = cfg_.thinking_cap;
             gen.thinking_budget_grace = cfg_.thinking_cap_grace;
+            gen.log_header.emplace_back("thinking", cat("capped to ", fmt_n(cfg_.thinking_cap), " tokens (the answer's "
+                                        "room was larger; +", fmt_n(cfg_.thinking_cap_grace), " grace to a sentence end)"));
         }
         auto sink = std::make_shared<QueueSink>();
         const bool thinking_on = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
@@ -578,6 +596,7 @@ void HttpServer::routes() {
             disk.set("ram_evicted", json::Value::integer(d.ram_evicted));
             disk.set("ram_only_dropped", json::Value::integer(d.ram_only_dropped));
             disk.set("room_refused", json::Value::integer(d.room_refused));
+            disk.set("room_waits", json::Value::integer(d.room_waits));
             disk.set("turn_buffers_reused", json::Value::integer(d.turn_buffers_reused));
             disk.set("disk_entries", json::Value::integer(d.disk_entries));
             disk.set("bytes", json::Value::integer(d.bytes));
@@ -658,6 +677,15 @@ void HttpServer::routes() {
         metric("strix_ple_wait_seconds_total", "counter", "Time forwards waited for PLE rows (the GPU idle).",
                bs.ple_wait_seconds);
         metric("strix_ple_wait_max_seconds", "gauge", "Longest single wait for PLE rows.", bs.ple_wait_max_seconds);
+        metric("strix_vision_images_total", "counter", "Images through the vision tower (one forward each).",
+               (double)bs.vision_images);
+        metric("strix_vision_patches_total", "counter", "Patches the tower forwards ran over.",
+               (double)bs.vision_patches);
+        metric("strix_vision_merged_tokens_total", "counter", "Merged image tokens scattered into prompts by the tower.",
+               (double)bs.vision_merged_tokens);
+        metric("strix_vision_tower_seconds_total", "counter",
+               "Time in vision tower runs (upload, tower, scatter; the journal line's span).", bs.vision_tower_seconds);
+        metric("strix_vision_tower_max_seconds", "gauge", "Longest single vision tower run.", bs.vision_tower_max_seconds);
         metric("strix_mtp_acceptance_rate", "gauge", "MTP acceptance rate [0, 1].",
                s.mtp_drafted_tokens > 0 ? (double)s.mtp_accepted_tokens / (double)s.mtp_drafted_tokens : 0.0);
         metric("strix_prefill_seconds_total", "counter", "Time spent prefilling.", s.prefill_seconds);
@@ -689,6 +717,8 @@ void HttpServer::routes() {
                    "One-shot requests' entries that left RAM (never written to disk, by design).", (double)d.ram_only_dropped);
             metric("strix_prompt_cache_room_refused_total", "counter",
                    "Saves skipped or disk loads refused: no room in RAM above the margin.", (double)d.room_refused);
+            metric("strix_prompt_cache_room_waits_total", "counter",
+                   "Polls make_room_for spent waiting for evicted entries' writes to give their RAM back.", (double)d.room_waits);
             metric("strix_prompt_cache_buffers_reused_total", "counter",
                    "Exports / loads given an on-disk entry's RAM buffer instead of a fresh mapping.", (double)d.buffers_reused);
             metric("strix_prompt_cache_prefaulted_total", "counter", "Spare buffers populated ahead of an export.", (double)d.prefaulted);

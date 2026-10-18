@@ -17,6 +17,11 @@
 
 namespace strix {
 
+// Concurrent row reads (the SSD queue depth). 64 reads a cold gather ~1.25x faster than 32 (16,384 random rows 168 ->
+// 134 ms, 65,536 rows 630 -> 494 ms); 128 and 256 gain nothing more.
+constexpr size_t kReadThreads = 64;
+size_t ngram_read_threads() { return kReadThreads; }
+
 namespace {
 
 // Persistent row readers for parallel_rows: starting a std::thread per read cost more than the read itself (a 16-row
@@ -25,7 +30,7 @@ namespace {
 class ReadPool {
 public:
     static ReadPool &get() {
-        static ReadPool pool(32);
+        static ReadPool pool(kReadThreads);
         return pool;
     }
     ~ReadPool() {
@@ -121,10 +126,6 @@ void parallel_rows(size_t n, size_t max_threads, const std::function<void(size_t
     }
     ReadPool::get().run(n, std::min(max_threads, n) - 1, fetch);
 }
-
-namespace {
-constexpr size_t kReadThreads = 32;  // concurrent row reads (SSD queue depth)
-}  // namespace
 
 NgramTableRows::NgramTableRows(const std::string &path, int64_t cache_rows) : file_(path), cap_(cache_rows) {
     STRIX_CHECK(cache_rows >= 0 && cache_rows <= (1ll << 26), "NgramTableRows: cache_rows = ", cache_rows,

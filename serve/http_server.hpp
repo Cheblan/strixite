@@ -37,7 +37,10 @@ struct ServerConfig {
     size_t max_body_bytes = 64u << 20;
     // Vision (Phase D): non-null when the server loaded with vision on - the image parts parse, preprocess
     // (on the HTTP thread) and reach the engine; /health reports engine_.backend().has_vision().
+    // vision_preprocess_limit (config vision-preprocess-limit): how many image preprocesses may run at once -
+    // see vision::PreprocessGate (serve/vision_request.hpp).
     const vision::ServedVision *vision = nullptr;
+    int64_t vision_preprocess_limit = 2;
 };
 
 class HttpServer {
@@ -56,6 +59,8 @@ private:
     int64_t started_;
     std::atomic<int64_t> next_id_{0};  // request ids for the log ("req <id> ...")
     GrammarCache grammars_;            // compiled response formats (structured output), shared across requests
+    vision::PreprocessGate vision_gate_;  // image preprocesses in flight (cfg_.vision_preprocess_limit)
+    vision::DecodeMemo vision_memo_;      // grids of the images already decoded (their repeats skip the decode)
     std::unique_ptr<httplib::Server> svr_;
     void routes();
 };

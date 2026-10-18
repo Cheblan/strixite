@@ -230,6 +230,10 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"vision", K::OnOff, 0, 0, "on",
          "image input: load vision.strixw from the weights' directory, allow image parts "
          "(data: URLs only); off keeps image parts the 400, loads no tower, and serves no image kernels"},
+        {"vision-preprocess-limit", K::Int, 1, 16, "2",
+         "how many images may decode / resize / pack at once (on the request threads; each one's worst case "
+         "is a few hundred MB of transient host RAM): an image request past the limit is refused with a "
+         "retryable 503, never queued into a memory spike"},
         {"tokenizer", K::Path, 0, 0, ckpt + "/tokenizer.json", "tokenizer.json"},
         {"generation-config", K::Path, 0, 0, ckpt + "/generation_config.json",
          "generation_config.json: the sampling defaults (temperature, top_k, top_p)"},
@@ -260,16 +264,19 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"prompt-cache-delta-max-tokens", K::Int, 0, 1 << 24, std::to_string(cache.delta_max_tokens),
          "a turn is saved as a delta on the whole entry it extends while it adds at most this many tokens (and a "
          "quarter of the base); 0 = every entry whole"},
-        {"gdn-precision", K::Text, 0, 0, "exact",
-         "prefill delta rule products: exact (BF16 hi + lo, near FP32) or fast (one BF16 product, ~3.5% faster prefill "
-         "at 120k, state error ~3e-3)"},
+        {"gdn-precision", K::Text, 0, 0, "half-u",
+         "prefill delta rule products: half-u (F16, the state-carrying products as F16 hi + lo pairs, Q / K staged "
+         "exactly; ~3% faster prefill at 120k than exact, state error ~9e-6), exact (BF16 hi + lo, near FP32), half (one "
+         "F16 product, operands power-of-two scaled; state error ~4e-4) or fast (one BF16 product, state error ~3e-3)"},
         {"attention-precision", K::Text, 0, 0, "exact",
          "prefill attention's P * V: exact (P as BF16 hi + lo) or fast (P as one BF16 term, as flash attention does)"},
+        {"kv-cache", K::Text, 0, 0, "q8",
+         "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes) or bf16"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
-        // MTP defaults: chained drafts at margin 2.0 with a 65536-id draft vocabulary, 7 drafts (reasons in
+        // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).
         {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
-        {"mtp-margin", K::Number, 0, 100, "2", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},
@@ -292,7 +299,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"placement", K::Text, 0, 0, "device",
          "where the weights live: device, or host-experts (the expert stacks in pinned host RAM - for GPUs too small "
          "for the model; slow, test machines only)"},
-        {"thinking-cap", K::Int, 0, 1 << 20, "2048",
+        {"thinking-cap", K::Int, 0, 1 << 20, "0",
          "a cap on thinking tokens for requests that set no budget of their own (0 = off); the thinking budget's stop "
          "closes the block and the model answers"},
         {"thinking-cap-grace", K::Int, 0, 1 << 16, "256",

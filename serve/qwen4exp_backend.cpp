@@ -9,8 +9,8 @@
 namespace strix {
 
 Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp,
-                                 int64_t mtp_vocab, const PrecisionOptions &precision)
-    : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp()),
+                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv)
+    : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv),
       snapshots_{session_.make_snapshot(), session_.make_snapshot(), session_.make_snapshot(),
                  session_.make_snapshot()} {
     STRIX_CHECK(mtp_vocab >= 0, "Qwen4ExpBackend: mtp_vocab ", mtp_vocab, ", expected >= 0 (0 = the whole vocabulary)");
@@ -42,6 +42,9 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
         s.ngram_rows_cached = (int64_t)n.hits, s.ngram_rows_read = (int64_t)n.reads;
         s.ngram_rows_prefetched = (int64_t)n.prefetched;
     }
+    const Qwen4ExpSession::VisionStats v = session_.vision_stats();
+    s.vision_images = v.images, s.vision_patches = v.patches, s.vision_merged_tokens = v.merged_tokens;
+    s.vision_tower_seconds = v.tower_seconds, s.vision_tower_max_seconds = v.tower_max_seconds;
     return s;
 }
 
@@ -75,10 +78,13 @@ std::string Qwen4ExpBackend::state_fingerprint() const {
     // Precision: a state built with a non-exact step is not the one the exact math builds (" gdn=fast"; nothing when
     // all exact, so the existing entries stay valid).
     const std::string prec = session_.precision().exact() ? std::string() : " " + session_.precision().describe();
-    const int n = std::snprintf(buf, sizeof buf, "qwen4exp-state-v2 %s layout-%016llx %s L%lld%s%s%s",
+    // 8-bit K/V (" kv8"): another state layout - a BF16 entry is dropped at load, never misread (nothing for the
+    // activation dtype's K/V, so those entries stay valid).
+    const int n = std::snprintf(buf, sizeof buf, "qwen4exp-state-v2 %s layout-%016llx %s L%lld%s%s%s%s",
                                 f.meta("source_fingerprint").c_str(), (unsigned long long)strix_hash64(layout.data(), layout.size()),
                                 kernels::act_name(model_.act()), (long long)model_.dims().layers,
-                                session_.has_mtp() ? " mtp" : "", yarn, prec.c_str());
+                                session_.has_mtp() ? " mtp" : "", yarn, prec.c_str(),
+                                session_.kv_format() == KvFormat::Q8 ? " kv8" : "");
     STRIX_CHECK(n > 0 && n < (int)sizeof buf, "Qwen4ExpBackend::state_fingerprint: ", n, " characters, expected < ", sizeof buf);
     return buf;
 }
@@ -87,7 +93,8 @@ std::string Qwen4ExpBackend::describe() const {
     const StrixwFile &f = model_.weights().file();
     return "qwen4exp, " + std::to_string(model_.dims().layers) + " layers, layout " + f.meta("layout") + ", " +
            kernels::act_name(model_.act()) + ", capacity " + std::to_string(capacity()) + ", chunk " +
-           std::to_string(max_chunk()) + ", precision " + session_.precision().describe() +
+           std::to_string(max_chunk()) + ", precision " + session_.precision().describe() + ", kv " +
+           kv_format_name(session_.kv_format()) +
            (has_mtp() ? ", mtp (draft vocabulary " + std::to_string(session_.mtp_vocab()) + ")" : "") +
            (model_.has_vision() ? ", vision tower on" : "") + [&] {
                const auto *t = dynamic_cast<const NgramTableRows *>(&model_.ngram_rows());
@@ -118,6 +125,8 @@ LogitRows Qwen4ExpBackend::forward_image_prefill(const std::vector<int32_t> &ids
                 "a vision.strixw - image prompts are refused (config vision)");
     if (masks != nullptr)
         masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_image_prefill");
+    STRIX_CHECK(!image.prefill.pixel_values.empty(), "Qwen4ExpBackend::forward_image_prefill: the image block at row ",
+                image.row_start, " has no pixel_values - the engine decodes a known image before its forward");
     session_.set_positions(pos3);  // the walk's triples for exactly this forward's rows (Phase A checks)
     ImageInput in;
     in.pixel_values = image.prefill.pixel_values;  // one copy per image forward (the block runs once)

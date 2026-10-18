@@ -406,7 +406,7 @@ void Engine::run(Job &job) {
         // runs replaced by content-derived pseudo ids, serve/vision_request.cpp), the forwards on the real
         // ids. Text prompts: both are req.prompt - the path is bit-identical and allocation-free.
         const bool has_images = !req.image_pos3.empty();
-        STRIX_CHECK(req.prefill_images.empty() == !has_images,
+        STRIX_CHECK(has_images == !req.prefill_images.empty(),
                     "Engine::run: ", req.prefill_images.size(), " prefill images with ",
                     req.image_pos3.size() / 3, " triple rows - an image prompt carries both");
         if (has_images) {
@@ -526,6 +526,21 @@ void Engine::run(Job &job) {
                 STRIX_CHECK(pos == im->row_start && end == im->row_start + im->rows,
                             "Engine::run: the image forward covers rows [", pos, ", ", end, "), the block is [",
                             im->row_start, ", ", im->row_start + im->rows, ")");
+                PrefillImage decoded;  // an image the HTTP layer knew (no pixels) that the resume didn't cover
+                if (im->prefill.pixel_values.empty()) {
+                    STRIX_CHECK(static_cast<bool>(im->prefill.decode), "Engine::run: the image block at row ",
+                                im->row_start, " (grid ", im->prefill.grid_h, "x", im->prefill.grid_w,
+                                ") carries neither pixel_values nor a decode - the request layer must give one");
+                    const double t_dec = now_s();
+                    decoded.prefill.pixel_values = im->prefill.decode();
+                    decoded.prefill.grid_t = im->prefill.grid_t;
+                    decoded.prefill.grid_h = im->prefill.grid_h, decoded.prefill.grid_w = im->prefill.grid_w;
+                    decoded.row_start = im->row_start, decoded.rows = im->rows;
+                    slog_row(LogLevel::Info, "vision", "image at row %s decoded at prefill (%lldx%lld grid, %.0f ms): "
+                             "the resume stopped before it", fmt_n(im->row_start).c_str(),
+                             (long long)im->prefill.grid_h, (long long)im->prefill.grid_w, (now_s() - t_dec) * 1e3);
+                    im = &decoded;
+                }
                 logits = be_.forward_image_prefill(
                     std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end), *im,
                     std::vector<int64_t>(req.image_pos3.begin() + 3 * pos, req.image_pos3.begin() + 3 * end),

@@ -104,34 +104,52 @@ __device__ inline void load8(const uint16_t *p, int64_t i, float (&v)[8]) {
     for (int j = 0; j < 4; ++j) v[2 * j] = __uint_as_float(w4[j] << 16), v[2 * j + 1] = __uint_as_float(w4[j] & 0xffff0000u);
 }
 
-// Thread = one block key b of query t (grid.y); the query's H heads in LDS.
+// Thread = one block key b, for up to kScQ queries [kScQ y, kScQ y + kScQ) (grid.y); their H heads in LDS (dynamic,
+// kScQ x H x D floats). Each key is read once per kScQ queries: an MTP verify (T = 2..8) used to re-read every block
+// key per query (grid.y = T) - at 491k context T = 8 cost 2.6x T = 1, which runs at the read peak. Per (query, key)
+// the products and their order are as before (bit-identical scores).
+constexpr int kScQ = 8;
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
-    scores_kernel(const T *q, int64_t q_ts, int64_t q_hs, int64_t pos0, int H, int D, const T *bk, int64_t cap,
-                  float *scores, int64_t ld) {
-    __shared__ float qs[kMaxH * kMaxD];
-    const int64_t t = blockIdx.y;
-    for (int i = threadIdx.x; i < H * D; i += blockDim.x) qs[i] = load(q, t * q_ts + (i / D) * q_hs + i % D);
+    scores_kernel(const T *q, int64_t q_ts, int64_t q_hs, int64_t T_rows, int64_t pos0, int H, int D, const T *bk,
+                  int64_t cap, float *scores, int64_t ld) {
+    extern __shared__ float qs[];  // [kScQ][H][D]
+    const int64_t t0 = (int64_t)blockIdx.y * kScQ;
+    const int nq = (int)(T_rows - t0 < kScQ ? T_rows - t0 : kScQ);
+    for (int i = threadIdx.x; i < nq * H * D; i += blockDim.x) {
+        const int tq = i / (H * D), r = i % (H * D);
+        qs[i] = load(q, (t0 + tq) * q_ts + (r / D) * q_hs + r % D);
+    }
     __syncthreads();
-    const int64_t full = (pos0 + t + 1) / kQsaBlock, b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= full) return;
-    float acc[kMaxH];
+    // The last query sees the most blocks; a key past it is past every query of the group.
+    const int64_t b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= (pos0 + t0 + nq) / kQsaBlock) return;
+    float acc[kScQ][kMaxH];
 #pragma unroll
-    for (int h = 0; h < kMaxH; ++h) acc[h] = 0.f;
+    for (int tq = 0; tq < kScQ; ++tq)
+#pragma unroll
+        for (int h = 0; h < kMaxH; ++h) acc[tq][h] = 0.f;
     for (int c = 0; c < D / 8; ++c) {
         float v[8];
         load8(bk, ((int64_t)c * cap + b) * 8, v);
 #pragma unroll
-        for (int h = 0; h < kMaxH; ++h)
-            if (h < H)
+        for (int tq = 0; tq < kScQ; ++tq)
+            if (tq < nq)
 #pragma unroll
-                for (int e = 0; e < 8; ++e) acc[h] = fmaf(qs[h * D + c * 8 + e], v[e], acc[h]);
+                for (int h = 0; h < kMaxH; ++h)
+                    if (h < H)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[tq][h] = fmaf(qs[(tq * H + h) * D + c * 8 + e], v[e], acc[tq][h]);
     }
-    float s = 0.f;
 #pragma unroll
-    for (int h = 0; h < kMaxH; ++h)
-        if (h < H) s += fmaxf(acc[h], 0.f);
-    scores[t * ld + b] = s / sqrtf((float)D);
+    for (int tq = 0; tq < kScQ; ++tq) {
+        if (tq >= nq || b >= (pos0 + t0 + tq + 1) / kQsaBlock) continue;  // query t0 + tq doesn't see block b
+        float s = 0.f;
+#pragma unroll
+        for (int h = 0; h < kMaxH; ++h)
+            if (h < H) s += fmaxf(acc[tq][h], 0.f);
+        scores[(t0 + tq) * ld + b] = s / sqrtf((float)D);
+    }
 }
 
 // Prefill scores on the matrix units (BF16 activations, D % 16 == 0): a workgroup of kSwWaves waves keeps 64 block
@@ -935,14 +953,18 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
         STRIX_HIP_CHECK_LAUNCH(fn, " wmma T=", T, " pos0=", pos0, " blocks=", nb);
         return;
     }
-    dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), (unsigned)T), block(kThreads);
+    dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), (unsigned)((T + kScQ - 1) / kScQ)), block(kThreads);
+    const size_t lds = (size_t)kScQ * (size_t)H * (size_t)D * sizeof(float);
+    STRIX_CHECK(lds <= 64 * 1024, fn, ": ", kScQ, " queries x ", H, " heads x ", D, " dims = ", lds,
+                " bytes of LDS, over 64 KiB");
     if (act == Act::F32)
-        scores_kernel<float><<<grid, block, 0, stream>>>(static_cast<const float *>(q), q_ts, q_hs, pos0, (int)H, (int)D,
-                                                         static_cast<const float *>(block_keys), cap_blocks, scores, ld);
+        scores_kernel<float><<<grid, block, lds, stream>>>(static_cast<const float *>(q), q_ts, q_hs, T, pos0, (int)H,
+                                                           (int)D, static_cast<const float *>(block_keys), cap_blocks,
+                                                           scores, ld);
     else
-        scores_kernel<uint16_t><<<grid, block, 0, stream>>>(static_cast<const uint16_t *>(q), q_ts, q_hs, pos0, (int)H,
-                                                            (int)D, static_cast<const uint16_t *>(block_keys), cap_blocks,
-                                                            scores, ld);
+        scores_kernel<uint16_t><<<grid, block, lds, stream>>>(static_cast<const uint16_t *>(q), q_ts, q_hs, T, pos0,
+                                                              (int)H, (int)D, static_cast<const uint16_t *>(block_keys),
+                                                              cap_blocks, scores, ld);
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " pos0=", pos0, " blocks=", nb);
 }
 

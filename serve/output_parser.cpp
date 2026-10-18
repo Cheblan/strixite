@@ -1,6 +1,7 @@
 #include "serve/output_parser.hpp"
 
 #include "common/check.hpp"
+#include "serve/log.hpp"
 #include "serve/unicode.hpp"
 
 #include <algorithm>
@@ -163,8 +164,16 @@ OutputParser::OutputParser(const Tokenizer &tok, Config cfg)
 void OutputParser::add(Channel &c, const std::string &bytes, std::vector<OutputEvent> &out, bool *stopped) {
     c.bytes += bytes;
     const size_t n = whole_chars(c.bytes);
-    std::string whole = c.bytes.substr(0, n);
+    // Byte tokens sampled out of UTF-8 order (seen at T 1.0: a lead byte, then ASCII) become U+FFFD - as a byte-level
+    // tokenizer's decode does - instead of failing the request at the first decode below.
+    int64_t bad = 0;
+    std::string whole = unicode::replace_invalid_utf8(std::string_view(c.bytes).substr(0, n), &bad);
     c.bytes.erase(0, n);
+    if (bad > 0) {
+        invalid_bytes_ += bad;
+        slog(LogLevel::Warning, "output: %lld byte(s) of the model's output were not UTF-8 - replaced by U+FFFD",
+             (long long)bad);
+    }
     if (!c.started && cfg_.trim_ws) {
         const std::vector<uint32_t> cps = unicode::decode_utf8(whole, "output text");
         size_t k = 0;

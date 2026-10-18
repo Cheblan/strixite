@@ -112,6 +112,7 @@ int run(int argc, char **argv) {
     PrecisionOptions precision;
     precision.gdn = parse_gdn_precision(settings.text("gdn-precision"));  // an unknown value fails startup
     precision.attention = parse_attention_precision(settings.text("attention-precision"));
+    const KvFormat kv_format = parse_kv_format(settings.text("kv-cache"));  // an unknown value fails startup
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
@@ -185,17 +186,26 @@ int run(int argc, char **argv) {
         served_vision = std::make_unique<vision::ServedVision>(vision::load_vision_config(
             tokenizer.substr(0, slash) + "/preprocessor_config.json", tokenizer.substr(0, slash) + "/config.json",
             kernels::kMaxVisionSeq));
+        // The runtime scatters the tower's merged rows at kVisionImageTokenId positions of the id stream; the
+        // request path expands the checkpoint's own image_token_id. Two sources of truth - they must agree,
+        // or every image forward fails later with a row-count message. Fail at startup naming both.
+        STRIX_CHECK(served_vision->image_token_id == kVisionImageTokenId,
+                    "strix_server: config.json image_token_id = ", (int)served_vision->image_token_id,
+                    ", but the runtime scatters merged image rows at id ", (int)kVisionImageTokenId,
+                    " (runtime/qwen4exp.hpp kVisionImageTokenId) - this checkpoint's image token is not served");
         served_vision->vision_weights = vision_weights;
         cfg.vision = served_vision.get();
+        cfg.vision_preprocess_limit = settings.integer("vision-preprocess-limit");
         slog(LogLevel::Info, "startup: vision on - tower %s (image_token_id %d, resize clamp %lld patches, "
-                     "mean %.2f/%.2f/%.2f std %.2f/%.2f/%.2f)",
+                     "mean %.2f/%.2f/%.2f std %.2f/%.2f/%.2f), at most %lld image preprocesses at once",
              vision_weights.c_str(), (int)served_vision->image_token_id, (long long)served_vision->cfg.max_patches,
              served_vision->cfg.mean[0], served_vision->cfg.mean[1], served_vision->cfg.mean[2],
-             served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2]);
+             served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
+             (long long)cfg.vision_preprocess_limit);
     }
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision);
+    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format);
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
-         precision.exact() ? "" : " (faster, less exact math than the default)");
+         precision.exact() ? "" : " (faster, less exact math than all-exact)");
     {
         // Where the GPU memory went (all of it is system RAM here - the prompt cache's RAM tier gets what's left).
         const auto tally = GpuMemoryTally::snapshot();

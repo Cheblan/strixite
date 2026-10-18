@@ -184,6 +184,8 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 opt_.idle_seconds, ", expected > 0");
     STRIX_CHECK(std::isfinite(opt_.ram_watch_seconds) && opt_.ram_watch_seconds > 0 && opt_.ram_watch_seconds <= 60,
                 "PromptCache: ram_watch_seconds ", opt_.ram_watch_seconds, ", expected 0 < s <= 60");
+    STRIX_CHECK(std::isfinite(opt_.room_wait_seconds) && opt_.room_wait_seconds >= 0 && opt_.room_wait_seconds <= 600,
+                "PromptCache: room_wait_seconds ", opt_.room_wait_seconds, ", expected 0 <= s <= 600");
     STRIX_CHECK(opt_.ram_watch_headroom < (1ull << 40), "PromptCache: ram_watch_headroom ", opt_.ram_watch_headroom,
                 " bytes, expected < 1 TiB");
     STRIX_CHECK(std::isfinite(opt_.write_gib_per_hour) && opt_.write_gib_per_hour >= 0,
@@ -397,12 +399,33 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
     };
     std::vector<Part> parts;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        const int i = find_locked(prompt.data(), n);
-        if (i < 0) return false;  // gone since best()
-        const EntryPtr e = entries_[(size_t)i];
-        if (e->base) parts.push_back({e->base, {}, {}});
-        parts.push_back({e, {}, {}});
+        std::unique_lock<std::mutex> lock(mu_);
+        // A part whose eviction write is giving its RAM back reads as zero pages: wait for the file (the writer
+        // notifies idle_cv_ after every write), then it is a disk part. The entry may be gone after the wait.
+        bool logged = false;
+        const double deadline = now_s() + 120;
+        for (;;) {
+            const int i = find_locked(prompt.data(), n);
+            if (i < 0) return false;  // gone since best()
+            const EntryPtr e = entries_[(size_t)i];
+            const Entry *busy = e->releasing ? e.get() : e->base && e->base->releasing ? e->base.get() : nullptr;
+            if (busy == nullptr) {
+                if (e->base) parts.push_back({e->base, {}, {}});
+                parts.push_back({e, {}, {}});
+                break;
+            }
+            if (!logged) {
+                logged = true;
+                slog(LogLevel::Info, "prompt cache: the %s-token entry is being written as it leaves RAM - waiting for "
+                     "the file before loading it", fmt_n((long long)busy->tokens.size()).c_str());
+            }
+            if (now_s() > deadline) {
+                slog(LogLevel::Warning, "prompt cache: gave up waiting 120 s for the %s-token entry's write",
+                     fmt_n((long long)busy->tokens.size()).c_str());
+                return false;
+            }
+            idle_cv_.wait_for(lock, std::chrono::milliseconds(50));
+        }
         for (Part &p : parts) {
             p.e->last_used = ++clock_, p.e->touched_s = now_s(), p.e->no_room = false;
             STRIX_CHECK(!p.e->ram.empty() || !p.e->path.empty(), "PromptCache::with_state: the entry of ",
@@ -448,6 +471,10 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
                  fmt_rate((p.file_bytes - p.loaded.capacity()) / 1e9, 1).c_str(),
                  fmt_rate(mem_available() / (double)(1ull << 30), 1).c_str(),
                  fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+            if (parts.size() == 2 && &p == &parts[0])
+                slog(LogLevel::Warning, "%sit is the base of the %s-token entry the prompt resumes from", kCont,
+                     fmt_n((long long)parts[1].e->tokens.size()).c_str());
+            slog(LogLevel::Warning, "%s%s", kCont, ram_summary().c_str());
             return false;
         }
         try {
@@ -567,13 +594,13 @@ void PromptCache::unlink_locked(Entry &e) {
     e.path.clear(), e.file_bytes = 0;
 }
 
-void PromptCache::remove_locked(size_t i) {
+void PromptCache::remove_locked(size_t i, bool to_spare) {
     STRIX_CHECK(i < entries_.size(), "PromptCache::remove_locked: index ", i, " of ", entries_.size());
     EntryPtr e = entries_[i];
     entries_.erase(entries_.begin() + (int64_t)i);
     e->dead = true;
     unlink_locked(*e);
-    if (e->readers == 0) drop_ram_locked(*e, true);  // else the last reader does
+    if (e->readers == 0) drop_ram_locked(*e, to_spare);  // else the last reader does
     if (e->base) {  // a delta lets go of its base
         --e->base->dependents;
         e->base.reset();
@@ -583,7 +610,7 @@ void PromptCache::remove_locked(size_t i) {
     for (size_t k = entries_.size(); e->dependents > 0 && k-- > 0;)
         if (entries_[k]->base == e) {
             ++stats_.deltas_dropped;
-            remove_locked(k);
+            remove_locked(k, to_spare);
         }
     STRIX_CHECK(e->dependents == 0, "PromptCache::remove_locked: a removed base still has ", e->dependents, " deltas");
 }
@@ -755,17 +782,54 @@ void PromptCache::enqueue_locked(const EntryPtr &e, Why why) {
 bool PromptCache::make_room_for(uint64_t bytes) {
     STRIX_CHECK(bytes < (1ull << 40), "PromptCache::make_room_for: ", bytes, " bytes, expected < 1 TiB");
     if (bytes == 0) return true;
-    {
-        std::vector<HostBuffer> trash;
-        std::lock_guard<std::mutex> lock(mu_);
-        make_room_locked(bytes);
-        trash.swap(trash_);
-    }  // the evicted buffers are unmapped here, before MemAvailable is read again
-    const uint64_t avail = mem_available();
-    if (avail >= opt_.ram_margin + bytes) return true;
+    // Entries the RAM rule sends to disk give their RAM back only as the writer writes them (seconds), so the first
+    // check after the rule often comes up short although the room is on its way - and a refused load re-prefills its
+    // whole prompt. So while evicted entries are still being written, wait for them, up to room_wait_seconds; refuse
+    // only when nothing more is leaving or the wait runs out.
+    const double deadline = now_s() + opt_.room_wait_seconds;
+    for (;;) {
+        {
+            std::vector<HostBuffer> trash;
+            std::lock_guard<std::mutex> lock(mu_);
+            make_room_locked(bytes);
+            trash.swap(trash_);
+        }  // the evicted buffers are unmapped here, before MemAvailable is read again
+        if (mem_available() >= opt_.ram_margin + bytes) return true;
+        std::unique_lock<std::mutex> lock(mu_);
+        const double left = deadline - now_s();
+        if (leaving_bytes_locked() == 0 || left <= 0) {
+            ++stats_.room_refused;
+            return false;
+        }
+        ++stats_.room_waits;
+        idle_cv_.wait_for(lock, std::chrono::duration<double>(std::min(left, 0.05)));  // a write done, or poll
+    }
+}
+
+std::string PromptCache::ram_summary() const {
     std::lock_guard<std::mutex> lock(mu_);
-    ++stats_.room_refused;
-    return false;
+    int64_t n = 0, in_use = 0, queued = 0, free_n = 0;
+    uint64_t bytes = 0, in_use_b = 0, queued_b = 0, free_b = 0;
+    for (const EntryPtr &e : entries_) {
+        if (e->ram.empty()) continue;
+        const uint64_t b = e->ram.capacity();
+        ++n, bytes += b;
+        if (e->queued) ++queued, queued_b += b;
+        else if (e->readers > 0) ++in_use, in_use_b += b;
+        else ++free_n, free_b += b;
+    }
+    const auto gb = [](uint64_t b) { return fmt_rate(b / 1e9, 1); };
+    return "RAM tier " + fmt_n(n) + " entries, " + gb(bytes) + " GB: " + fmt_n(in_use) + " in use (" + gb(in_use_b) +
+           " GB), " + fmt_n(queued) + " queued for a write (" + gb(queued_b) + " GB), " + fmt_n(free_n) +
+           " free to leave (" + gb(free_b) + " GB); spares " + fmt_n((long long)spares_.size()) + " (" + gb(spare_bytes_) +
+           " GB); leaving " + gb(leaving_bytes_locked()) + " GB";
+}
+
+uint64_t PromptCache::leaving_bytes_locked() const {
+    uint64_t b = 0;
+    for (const EntryPtr &e : entries_)
+        if (e->drop_ram && !e->ram.empty()) b += e->ram.capacity();
+    return b;
 }
 
 void PromptCache::make_room_locked(uint64_t extra) {
@@ -773,6 +837,10 @@ void PromptCache::make_room_locked(uint64_t extra) {
     if (avail >= target && opt_.ram_tier) return;
     // No RAM tier: every entry that can leave does (need never reaches 0 below).
     uint64_t need = opt_.ram_tier ? target - avail : UINT64_MAX;
+    // RAM already on its way out (evicted entries still being written) counts as freed, as it does for the entries
+    // this pass sends: a second pass while those writes run (make_room_for's wait, the margin watch) must not evict
+    // more for the same shortfall.
+    if (opt_.ram_tier) need -= std::min(need, leaving_bytes_locked());
     // Spares go first: nothing is lost.
     while (need > 0 && !spares_.empty()) {
         need -= std::min(need, (uint64_t)spares_.back().capacity());
@@ -802,7 +870,7 @@ void PromptCache::make_room_locked(uint64_t extra) {
         }
         if (lru->ram_only) {  // never written: gone
             ++stats_.ram_only_dropped;
-            remove_locked((size_t)find_locked(lru));
+            remove_locked((size_t)find_locked(lru), false);
             continue;
         }
         // The eviction rule: write it, unless the queue, the budget or the disk says no - then it's gone.
@@ -848,7 +916,7 @@ void PromptCache::make_room_locked(uint64_t extra) {
                  fmt_rate(budget_bytes_ / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.write_gib_per_hour, 0).c_str(),
                  fmt_rate(total / 1e9, 1).c_str(), ago(((double)total - budget_bytes_) / rate).c_str());
         }
-        remove_locked((size_t)find_locked(lru));
+        remove_locked((size_t)find_locked(lru), false);
     }
 }
 
@@ -1049,9 +1117,12 @@ void PromptCache::write_entry(Job &job) {
             trash.swap(trash_);
             return;
         }
+        // An eviction: its RAM goes back as its bytes are written (not all at the end) - unless a reader holds it, and
+        // no reader takes it meanwhile (with_state waits for the file while `releasing`).
+        releasing = e.drop_ram && e.readers == 0;
+        e.releasing = releasing;
         ++e.readers;  // the RAM copy stays put while the file is written
         e.queued = true;
-        releasing = e.drop_ram;  // an eviction: its RAM goes back as its bytes are written (not all at the end)
     }
     const uint64_t token_hash = strix_hash64(e.tokens.data(), n * 4);
     char name[64];
@@ -1104,13 +1175,13 @@ void PromptCache::write_entry(Job &job) {
         ok = true;
     } catch (...) {
         std::lock_guard<std::mutex> lock(mu_);
-        e.queued = false;
+        e.queued = false, e.releasing = false;
         release_locked(e);
         throw;
     }
     std::vector<HostBuffer> trash;
     std::lock_guard<std::mutex> lock(mu_);
-    e.queued = false;
+    e.queued = false, e.releasing = false;
     if (e.dead) {  // replaced while it was written: the file goes too
         std::error_code ec;
         fs::remove(path, ec);

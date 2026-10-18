@@ -48,6 +48,10 @@ struct BackendStats {
     int64_t ngram_rows_prefetched = 0;
     int64_t ple_gathers = 0, ple_waits = 0, ple_prefetches = 0, ple_prefetch_skipped = 0;
     double ple_gather_seconds = 0, ple_wait_seconds = 0, ple_wait_max_seconds = 0, ple_prefetch_seconds = 0;
+    // Vision tower (Qwen4ExpSession::vision_stats): images = tower forwards (one per image), the patch / merged-token
+    // counts they ran, and the time they took (the journal line's span: upload + tower + scatter).
+    int64_t vision_images = 0, vision_patches = 0, vision_merged_tokens = 0;
+    double vision_tower_seconds = 0, vision_tower_max_seconds = 0;
 };
 
 // One tower input for an image prefill (vision): the rows the tower runs over (FP32,
@@ -56,6 +60,11 @@ struct BackendStats {
 struct VisionPrefill {
     std::vector<float> pixel_values;
     int64_t grid_t = 1, grid_h = 0, grid_w = 0;
+    // Set when pixel_values were left empty because this server decoded the same image bytes before
+    // (vision::DecodeMemo - usually the image is behind the resume point and the pixels are never read): builds them
+    // from the kept bytes. The engine calls it only for a block its prefill reaches (a resume that came up short of
+    // the image), on the worker, and hands the result to the backend as is.
+    std::function<std::vector<float>()> decode;
 };
 
 // One image at its row span in the prompt (stream order). row_start is the first image_token_id row, rows the

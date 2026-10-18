@@ -90,6 +90,34 @@ std::vector<uint32_t> decode_utf8(std::string_view s, const char *what) {
     return out;
 }
 
+std::string replace_invalid_utf8(std::string_view s, int64_t *replaced) {
+    std::string out;
+    out.reserve(s.size());
+    int64_t n_bad = 0;
+    static const uint32_t kMin[5] = {0, 0, 0x80, 0x800, 0x10000};
+    for (size_t i = 0; i < s.size();) {
+        const unsigned c = (unsigned char)s[i];
+        int n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+        uint32_t cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+        bool ok = n > 0 && i + (size_t)n <= s.size();
+        for (int k = 1; ok && k < n; ++k) {
+            const unsigned b = (unsigned char)s[i + (size_t)k];
+            ok = (b & 0xC0) == 0x80;
+            cp = (cp << 6) | (b & 0x3F);
+        }
+        ok = ok && cp >= kMin[n] && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+        if (ok) {
+            out.append(s.data() + i, (size_t)n);
+            i += (size_t)n;
+        } else {  // one byte at a time: the next byte may start a valid character
+            out += "\xEF\xBF\xBD";
+            ++n_bad, ++i;
+        }
+    }
+    if (replaced) *replaced = n_bad;
+    return out;
+}
+
 void append_utf8(std::string &out, uint32_t cp) {
     if (cp < 0x80) out += (char)cp;
     else if (cp < 0x800) out += (char)(0xC0 | (cp >> 6)), out += (char)(0x80 | (cp & 0x3F));

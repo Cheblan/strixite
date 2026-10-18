@@ -94,8 +94,11 @@ constexpr int64_t kDeltaRuleChunkMinT = INT64_MAX;  // chunked not faster yet (s
 enum class DeltaRulePath { Auto, PerToken, Chunked, ChunkedWmma };
 // ChunkedWmma's products (config gdn-precision): Exact - BF16 hi + lo on both
 // operands, three products (state rel RMS vs the FP32 per-token kernel ~6e-6 after 4096 tokens); Fast - one BF16
-// product (~40% less kernel time, state rel RMS ~3e-3). The other paths are FP32 and ignore it.
-enum class DrPrecision { Exact, Fast };
+// product (~40% less kernel time, state rel RMS ~3e-3); Half - one F16 product, every unbounded operand power-of-two
+// scaled into F16's range (state ~4e-4); HalfU (served) - half with Q / K staged raw and the U-path and P U products as
+// F16 hi + lo pairs (state ~9e-6 with BF16 activations, ~45% less kernel time than exact). The other paths are FP32 and
+// ignore it.
+enum class DrPrecision { Exact, Fast, Half, HalfU };
 
 struct DeltaRuleShape {
     int64_t T = 0;

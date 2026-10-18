@@ -88,6 +88,7 @@ public:
     int64_t tool_calls() const { return tool_calls_; }
     bool dropped_partial_call() const { return dropped_call_; }
     int64_t malformed_calls() const { return malformed_calls_; }  // streamed calls that went out but weren't well-formed
+    int64_t invalid_bytes() const { return invalid_bytes_; }  // output bytes that weren't UTF-8 (sent as U+FFFD)
 
 private:
     // One text channel: bytes in, whole characters out, leading / trailing white space trimmed, stop strings.
@@ -123,7 +124,7 @@ private:
     bool pending_close_ = false;  // a shadow close: a value ended at a </parameter> before a </function> that may
     size_t pending_v_end_ = 0;    // be the call's own - text after it means the value held the tags: look on
     std::unordered_set<std::string> params_seen_;
-    int64_t malformed_calls_ = 0;
+    int64_t malformed_calls_ = 0, invalid_bytes_ = 0;
     int64_t reasoning_tokens_ = 0, tool_calls_ = 0;
     bool dropped_call_ = false, stopped_ = false;
     bool after_newline_ = true;  // the last token fed ended in '\n' (the prompt ends in one)
