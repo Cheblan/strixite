@@ -21,20 +21,27 @@ __device__ inline float load(const uint16_t *p, int64_t i) { return bf16_bits_to
 __device__ inline void store(float *p, int64_t i, float v) { p[i] = v; }
 __device__ inline void store(uint16_t *p, int64_t i, float v) { p[i] = f32_to_bf16_bits(v); }
 
-// One thread per (token, head, pair). BF16 rounds where transformers' BF16 run does.
+// One thread per (head, pair) of a token. BF16 rounds where transformers' BF16 run does.
 template <typename T, bool kBF16>
-__global__ void __launch_bounds__(kThreads) rope_kernel(T *x, int64_t n, int64_t heads, int64_t half,
+__global__ void __launch_bounds__(kThreads) rope_kernel(T *x, int64_t T_count, int64_t heads, int64_t half,
                                                         int64_t token_stride, int64_t head_stride, int64_t pos0,
                                                         const float *inv_freq, float cos_sin_scale) {
-    for (int64_t w = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; w < n; w += (int64_t)gridDim.x * blockDim.x) {
-        const int64_t i = w % half, h = (w / half) % heads, t = w / (half * heads);
-        float c, s;
-        rope_math::cos_sin<kBF16>(pos0 + t, inv_freq[i], cos_sin_scale, c, s);
-        const int64_t base = t * token_stride + h * head_stride + i;
-        float y0, y1;
-        rope_math::rotate<kBF16>(load(x, base), load(x, base + half), c, s, y0, y1);
-        store(x, base, y0);
-        store(x, base + half, y1);
+    const int64_t head_pairs = heads * half;
+    for (int64_t t = blockIdx.y; t < T_count; t += gridDim.y) {
+        const int64_t pos = pos0 + t;
+        const int64_t t_base = t * token_stride;
+        for (int64_t w = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; w < head_pairs;
+             w += (int64_t)gridDim.x * blockDim.x) {
+            const int64_t h = w / half;
+            const int64_t i = w % half;
+            float c, s;
+            rope_math::cos_sin<kBF16>(pos, inv_freq[i], cos_sin_scale, c, s);
+            const int64_t base = t_base + h * head_stride + i;
+            float y0, y1;
+            rope_math::rotate<kBF16>(load(x, base), load(x, base + half), c, s, y0, y1);
+            store(x, base, y0);
+            store(x, base + half, y1);
+        }
     }
 }
 
@@ -111,14 +118,15 @@ void rope(void *x, int64_t T, int64_t heads, int64_t token_stride, int64_t head_
                 "rope: cos_sin_scale = ", cos_sin_scale, ", expected finite, 1..2 (YaRN's attention factor)");
     const int64_t es = act == Act::F32 ? 4 : 2;
     STRIX_CHECK(reinterpret_cast<uintptr_t>(x) % es == 0, "rope: x ", x, " not aligned to its ", es, "-byte dtype");
-    const int64_t half = rot_dim / 2, n = T * heads * half;
-    const int64_t blocks = (n + kThreads - 1) / kThreads;
-    dim3 grid((unsigned)(blocks < 65535 * 16 ? blocks : 65535 * 16)), block(kThreads);
+    const int64_t half = rot_dim / 2;
+    const int64_t head_pairs = heads * half;
+    const int64_t blocks_x = (head_pairs + kThreads - 1) / kThreads;
+    dim3 grid((unsigned)(blocks_x < 65535 ? blocks_x : 65535), (unsigned)(T < 65535 ? T : 65535)), block(kThreads);
     if (act == Act::F32)
-        rope_kernel<float, false><<<grid, block, 0, stream>>>(static_cast<float *>(x), n, heads, half, token_stride,
+        rope_kernel<float, false><<<grid, block, 0, stream>>>(static_cast<float *>(x), T, heads, half, token_stride,
                                                               head_stride, pos0, inv_freq, cos_sin_scale);
     else
-        rope_kernel<uint16_t, true><<<grid, block, 0, stream>>>(static_cast<uint16_t *>(x), n, heads, half,
+        rope_kernel<uint16_t, true><<<grid, block, 0, stream>>>(static_cast<uint16_t *>(x), T, heads, half,
                                                                 token_stride, head_stride, pos0, inv_freq, cos_sin_scale);
     STRIX_HIP_CHECK_LAUNCH("rope ", act_name(act), " T=", T, " heads=", heads, " rot_dim=", rot_dim, " pos0=", pos0);
 }
