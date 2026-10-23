@@ -17,11 +17,26 @@ like to keep it that way. Ideas from elsewhere are fine; say where they came fro
 
 ## What helps a change get in
 
-- **Measurements from a Strix Halo**, with how you took them: the command, the settings, and both the old and the
-  new path run on the same machine, ideally alternated.
-- **Output identity:** whether greedy output is unchanged, and if not, where and why it differs.
-- **A test** that fails without your change, where that's possible.
+- **Output identity:** run a few prompts at `temperature` 0 on both builds and compare the tokens. Identical output
+  means the change only moves speed. If the output differs, say where and why - and keep in mind that decode speed
+  with the draft head depends on the text being written, so comparing the speed of two different outputs mostly
+  measures the difference in text. (I run the test suite, which checks every kernel against a reference, on my side.)
+- **A before/after measurement from a Strix Halo**, with how you took it:
+  - the command and the settings;
+  - the old and the new build on the same machine, alternated (old, new, old, new, ...), at least four rounds each;
+  - every round's number, or the spread, next to the difference. One run per side can't tell a gain of a few percent
+    from run-to-run noise.
+- **Where the time goes**, for a kernel change: the kernel's own time before and after (a micro-benchmark, or a
+  trace with the `strix-roctx` preset), and roughly what share of a forward it takes. A kernel with a tiny share
+  can't move end-to-end speed much, however much faster it gets.
+- **A way to reproduce it**, for a bug fix: the request, the settings and the output that show the bug.
 - **Small, focused changes.** One idea per pull request is much easier for me to verify.
+
+## Pull requests written with an LLM
+
+Fine with me - I use them too. Before you send one, please check its explanation against the code: the functions it
+names should exist, the mechanism it describes should be what the code does, and every number should come from a run
+you did. A wrong explanation costs us both time, even when the change itself is good.
 
 ## Scope
 
