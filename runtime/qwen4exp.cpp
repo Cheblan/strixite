@@ -308,8 +308,31 @@ KvFormat parse_kv_format(const std::string &v) {
     STRIX_FAIL("parse_kv_format: '", v, "', expected bf16 or q8");
 }
 
+void QsaSharedWorkspace::allocate(int64_t capacity, int64_t max_tokens, int64_t qsa_budget) {
+    std::lock_guard<std::mutex> lk(mu);
+    const int64_t cap_blocks = capacity / kernels::kQsaBlock + 1;
+    const int64_t qsa_k = qsa_budget / kernels::kQsaBlock;
+    if (prefill_scores.size() < (size_t)(max_tokens * cap_blocks)) {
+        prefill_scores = DeviceBuffer<float>((size_t)(max_tokens * cap_blocks), "shared QSA block scores");
+        prefill_sel = DeviceBuffer<int32_t>((size_t)(max_tokens * qsa_k), "shared QSA kept blocks");
+        prefill_nsel = DeviceBuffer<int32_t>((size_t)max_tokens, "shared QSA kept block counts");
+        prefill_topk_ws_bytes = kernels::qsa_topk_workspace_bytes(max_tokens);
+        prefill_topk_ws = DeviceBuffer<uint8_t>(prefill_topk_ws_bytes, "shared QSA top-k workspace");
+        STRIX_HIP_CHECK(hipMemset(prefill_topk_ws.get(), 0, prefill_topk_ws_bytes), "zero shared QSA top-k workspace");
+    }
+    if (decode_scores.size() < (size_t)(kMaxDecodeTokens * cap_blocks)) {
+        decode_scores = DeviceBuffer<float>((size_t)(kMaxDecodeTokens * cap_blocks), "decode QSA block scores");
+        decode_sel = DeviceBuffer<int32_t>((size_t)(kMaxDecodeTokens * qsa_k), "decode QSA kept blocks");
+        decode_nsel = DeviceBuffer<int32_t>((size_t)kMaxDecodeTokens, "decode QSA kept block counts");
+        decode_topk_ws_bytes = kernels::qsa_topk_workspace_bytes(kMaxDecodeTokens);
+        decode_topk_ws = DeviceBuffer<uint8_t>(decode_topk_ws_bytes, "decode QSA top-k workspace");
+        STRIX_HIP_CHECK(hipMemset(decode_topk_ws.get(), 0, decode_topk_ws_bytes), "zero decode QSA top-k workspace");
+    }
+}
+
 Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                                 PrefillMath prefill_math, bool mtp, KvFormat kv)
+                                 PrefillMath prefill_math, bool mtp, KvFormat kv,
+                                 std::shared_ptr<QsaSharedWorkspace> shared_qsa)
     : m_(model), capacity_(capacity), max_tokens_(max_tokens), prefill_math_(prefill_math), kv_format_(kv),
       mtp_(mtp) {
     STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8, "Qwen4ExpSession: unknown KV format ", (int)kv);
@@ -417,12 +440,12 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         }
     }
     if (qsa) {
-        qsa_scores_ = DeviceBuffer<float>((size_t)(M * cap_blocks_), "QSA block scores");
-        qsa_sel_ = DeviceBuffer<int32_t>((size_t)(M * qsa_k), "QSA kept blocks");
-        qsa_nsel_ = DeviceBuffer<int32_t>((size_t)M, "QSA kept block counts");
-        qsa_topk_ws_bytes_ = kernels::qsa_topk_workspace_bytes(M);
-        qsa_topk_ws_ = DeviceBuffer<uint8_t>(qsa_topk_ws_bytes_, "QSA top-k workspace");
-        STRIX_HIP_CHECK(hipMemset(qsa_topk_ws_.get(), 0, qsa_topk_ws_bytes_), "zero the QSA top-k workspace");
+        if (shared_qsa != nullptr) {
+            qsa_ws_ = shared_qsa;
+        } else {
+            qsa_ws_ = std::make_shared<QsaSharedWorkspace>();
+        }
+        qsa_ws_->allocate(capacity, M, D.qsa_budget);
     }
     attn_err_ = DeviceBuffer<uint32_t>(3, "attention error");
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "zero attention error");
@@ -1539,6 +1562,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     const int64_t rope0 = mk_jobs_.pos3 == nullptr ? rope_pos(pos_) : pos_;  // scalar-path rope base (Phase A:
     // interleaved calls pass the kernels their positions, so pos0 is unused there)
     const bool fresh = pos_ == 0;
+    std::unique_lock<std::mutex> qsa_lk;
+    if (qsa_ws_) qsa_lk = std::unique_lock<std::mutex>(qsa_ws_->mu);
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     const ProbeType pt = act == Act::F32 ? ProbeType::F32 : ProbeType::BF16;
     auto show = [&](const std::string &name, const void *dev, int64_t cols, ProbeType type) {
@@ -1779,28 +1804,30 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                 // attention. Queries that still see every key keep all their blocks - the dense set.
                 const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
                 void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
+                STRIX_CHECK(qsa_ws_ != nullptr, "forward: missing QSA workspace");
                 kernels::qsa_scores(iq, D.astride, D.idx_d, T, pos_, D.idx_h, D.idx_d, block_keys_[(size_t)i].get(),
-                                    cap_blocks_, qsa_scores_.get(), cap_blocks_, act, stream_);
-                kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, pos_, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
-                                  qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-                show(L + "qsa_sel", qsa_sel_.get(), qsa_k, ProbeType::I32);
-                show(L + "qsa_nsel", qsa_nsel_.get(), 1, ProbeType::I32);
+                                    cap_blocks_, qsa_ws_->prefill_scores.get(), cap_blocks_, act, stream_);
+                kernels::qsa_topk(qsa_ws_->prefill_scores.get(), cap_blocks_, T, pos_, qsa_k,
+                                  qsa_ws_->prefill_sel.get(), qsa_ws_->prefill_nsel.get(),
+                                  qsa_ws_->prefill_topk_ws.get(), qsa_ws_->prefill_topk_ws_bytes, stream_);
+                show(L + "qsa_sel", qsa_ws_->prefill_sel.get(), qsa_k, ProbeType::I32);
+                show(L + "qsa_nsel", qsa_ws_->prefill_nsel.get(), 1, ProbeType::I32);
                 stage_kv8(std::min<int64_t>(D.qsa_budget, pos_ + T));
                 if (wmma_attn && q8)
-                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(),
-                                                     qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_ws_->prefill_sel.get(),
+                                                     qsa_ws_->prefill_nsel.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
                                                      attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
                 else if (wmma_attn)
-                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                                     qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_ws_->prefill_sel.get(),
+                                                     qsa_ws_->prefill_nsel.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
                                                      attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
                 else if (q8)
-                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(), qsa_nsel_.get(),
-                                                qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_,
-                                                attn_err_.get(), act, stream_);
+                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kv8, as, qsa_ws_->prefill_sel.get(),
+                                                qsa_ws_->prefill_nsel.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                                                attn_ws_bytes_, attn_err_.get(), act, stream_);
                 else
-                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                                qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_ws_->prefill_sel.get(),
+                                                qsa_ws_->prefill_nsel.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
                                                 attn_ws_bytes_, attn_err_.get(), act, stream_);
             }
             show(L + "attn_core", core_.get(), D.hq * D.hd, pt);
@@ -2150,20 +2177,24 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                 } else {
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
                     void *iq = proj_k + (size_t)D.idx_col * e;
+                    STRIX_CHECK(s0.qsa_ws_ != nullptr, "forward_batch_decode: session 0 missing QSA workspace");
+                    STRIX_CHECK(Tk <= QsaSharedWorkspace::kMaxDecodeTokens,
+                                "forward_batch_decode: Tk ", Tk, " exceeds max decode tokens");
                     kernels::qsa_scores(iq, D.astride, D.idx_d, Tk, pos_k, D.idx_h, D.idx_d,
                                         sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
-                                        s0.qsa_scores_.get(), sk.cap_blocks_, act, stream);
-                    kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, Tk, pos_k, qsa_k,
-                                      s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
-                                      s0.qsa_topk_ws_bytes_, stream);
+                                        s0.qsa_ws_->decode_scores.get(), sk.cap_blocks_, act, stream);
+                    kernels::qsa_topk(s0.qsa_ws_->decode_scores.get(), sk.cap_blocks_, Tk, pos_k, qsa_k,
+                                      s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(),
+                                      s0.qsa_ws_->decode_topk_ws.get(),
+                                      s0.qsa_ws_->decode_topk_ws_bytes, stream);
                     if (q8) {
                         kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kv8, as,
-                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(), qsa_k, scale,
                                                     core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
                                                     s0.attn_err_.get(), act, stream);
                     } else {
                         kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
-                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(), qsa_k, scale,
                                                     core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
                                                     s0.attn_err_.get(), act, stream);
                     }
@@ -2381,14 +2412,16 @@ void Qwen4ExpSession::forward_batch_mtp_top2(
         } else {
             const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
             void *iq = proj_k + (size_t)D.idx_col * e;
+            STRIX_CHECK(s0.qsa_ws_ != nullptr, "forward_batch_decode: session 0 missing QSA workspace for MTP");
             kernels::qsa_scores(iq, D.astride, D.idx_d, 1, p_k, D.idx_h, D.idx_d,
                                 sk.block_keys_mtp_.get(), sk.cap_blocks_,
-                                s0.qsa_scores_.get(), sk.cap_blocks_, act, stream);
-            kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, 1, p_k, qsa_k,
-                              s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
-                              s0.qsa_topk_ws_bytes_, stream);
+                                s0.qsa_ws_->decode_scores.get(), sk.cap_blocks_, act, stream);
+            kernels::qsa_topk(s0.qsa_ws_->decode_scores.get(), sk.cap_blocks_, 1, p_k, qsa_k,
+                              s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(),
+                              s0.qsa_ws_->decode_topk_ws.get(),
+                              s0.qsa_ws_->decode_topk_ws_bytes, stream);
             kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
-                                        s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                        s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(), qsa_k, scale,
                                         core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, s0.attn_err_.get(), act, stream);
         }
     }
@@ -2939,11 +2972,15 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     } else {
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
         void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
+        STRIX_CHECK(qsa_ws_ != nullptr, "run_mtp: missing QSA workspace");
+        std::unique_lock<std::mutex> qsa_lk(qsa_ws_->mu);
         kernels::qsa_scores(iq, D.astride, D.idx_d, T, p, D.idx_h, D.idx_d, block_keys_mtp_.get(), cap_blocks_,
-                            qsa_scores_.get(), cap_blocks_, act, stream_);
-        kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, p, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
-                          qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-        kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(), qsa_nsel_.get(),
+                            qsa_ws_->prefill_scores.get(), cap_blocks_, act, stream_);
+        kernels::qsa_topk(qsa_ws_->prefill_scores.get(), cap_blocks_, T, p, qsa_k,
+                          qsa_ws_->prefill_sel.get(), qsa_ws_->prefill_nsel.get(),
+                          qsa_ws_->prefill_topk_ws.get(), qsa_ws_->prefill_topk_ws_bytes, stream_);
+        kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as,
+                                    qsa_ws_->prefill_sel.get(), qsa_ws_->prefill_nsel.get(),
                                     qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_, attn_err_.get(), act,
                                     stream_);
     }

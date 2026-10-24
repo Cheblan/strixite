@@ -205,11 +205,15 @@ int run(int argc, char **argv) {
     }
     const int64_t num_slots = settings.integer("slots");
     slog(LogLevel::Info, "startup: serving slots = %lld", (long long)num_slots);
+    std::shared_ptr<QsaSharedWorkspace> shared_qsa = nullptr;
+    if (num_slots > 1 && capacity > model.dims().dense_key_limit()) {
+        shared_qsa = std::make_shared<QsaSharedWorkspace>();
+    }
     std::vector<std::unique_ptr<Qwen4ExpBackend>> backends;
     backends.reserve(num_slots);
     for (int64_t i = 0; i < num_slots; ++i) {
         backends.push_back(std::make_unique<Qwen4ExpBackend>(
-            model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format));
+            model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, shared_qsa));
     }
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");
