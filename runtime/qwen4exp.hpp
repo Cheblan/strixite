@@ -585,6 +585,7 @@ private:
     std::vector<int32_t> block_table_host_;
     DeviceBuffer<int32_t> block_table_dev_;
     void ensure_paged_capacity(int64_t needed_pos);
+    void paged_copy(uint8_t *&cur, const void *pool, int64_t n, int64_t from, int64_t W, bool to_host, const char *what);
     // Rewinds for can_restore: epoch e started when the session rewound to rewind_to_[e] (reset() = 0).
     std::vector<int64_t> rewind_to_{0};
     DeviceBuffer<uint8_t> ple_state_;

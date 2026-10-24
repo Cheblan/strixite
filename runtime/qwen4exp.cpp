@@ -1165,10 +1165,41 @@ void Qwen4ExpSession::kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t f
     host_copy(cur, tail.get(), tail.size(), to_host, stream_, "K/V tail");
 }
 
+void Qwen4ExpSession::paged_copy(uint8_t *&cur, const void *pool, int64_t n, int64_t from, int64_t W,
+                                 bool to_host, const char *what) {
+    if (from >= n) return;
+    STRIX_CHECK(pool != nullptr, "Qwen4ExpSession::paged_copy: null pool for ", what);
+    const size_t e = es(m_.act());
+    const size_t row_bytes = (size_t)W * e;
+    const uint8_t *dev_base = static_cast<const uint8_t *>(pool);
+
+    int64_t t = from;
+    while (t < n) {
+        const int64_t b = t / kPageBlockSize;
+        const int64_t o = t % kPageBlockSize;
+        STRIX_CHECK(b < static_cast<int64_t>(block_table_host_.size()),
+                    "Qwen4ExpSession::paged_copy: block table size ", block_table_host_.size(),
+                    " too small for block ", b);
+        const int32_t pb = block_table_host_[(size_t)b];
+        const int64_t chunk_tokens = std::min(kPageBlockSize - o, n - t);
+        const size_t chunk_bytes = (size_t)chunk_tokens * row_bytes;
+        const uint8_t *dev_chunk = dev_base + (size_t)(pb * kPageBlockSize + o) * row_bytes;
+
+        if (to_host) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(cur, dev_chunk, chunk_bytes, hipMemcpyDeviceToHost, stream_),
+                            "Qwen4ExpSession export: ", what);
+        } else {
+            STRIX_HIP_CHECK(hipMemcpyAsync(const_cast<uint8_t *>(dev_chunk), cur, chunk_bytes,
+                                           hipMemcpyHostToDevice, stream_),
+                            "Qwen4ExpSession import: ", what);
+        }
+        cur += chunk_bytes;
+        t += chunk_tokens;
+    }
+}
+
 void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
     STRIX_CHECK(out != nullptr, "Qwen4ExpSession::export_state: null output");
-    STRIX_CHECK(kv_format_ != KvFormat::Paged,
-                "Qwen4ExpSession::export_state: prompt cache export is not supported with paged KV cache");
     STRIX_CHECK(can_restore(s), "Qwen4ExpSession::export_state: the snapshot (position ", s.pos(),
                 ") is not valid for this session's KV cache any more");
     const int64_t n = s.pos();
@@ -1204,6 +1235,9 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
             if (kv_format_ == KvFormat::Q8) {
                 kv8_copy(cur, l, n, from, s.kv8_tail_[l], true, &tail_unused);
+            } else if (kv_format_ == KvFormat::Paged) {
+                paged_copy(cur, page_pool_->k_pool(l), n, from, D.hkv * D.hd, true, "K cache");
+                paged_copy(cur, page_pool_->v_pool(l), n, from, D.hkv * D.hd, true, "V cache");
             } else {
                 host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, true, stream_, "K cache");
                 host_copy(cur, v_cache_[l].get() + (size_t)from * row, kv, true, stream_, "V cache");
@@ -1221,8 +1255,13 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, stream_, "PLE conv state");
     if (mtp_) {
         const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-        host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
-        host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
+        if (kv_format_ == KvFormat::Paged) {
+            paged_copy(cur, page_pool_->k_mtp_pool(), n, from, D.hkv * D.hd, true, "MTP K cache");
+            paged_copy(cur, page_pool_->v_mtp_pool(), n, from, D.hkv * D.hd, true, "MTP V cache");
+        } else {
+            host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
+            host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
+        }
         block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
         STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_state: MTP indexer tail of ",
                     s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
@@ -1237,8 +1276,6 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
 
 void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, int64_t from) {
     STRIX_CHECK(in != nullptr, "Qwen4ExpSession::import_state: null input");
-    STRIX_CHECK(kv_format_ != KvFormat::Paged,
-                "Qwen4ExpSession::import_state: prompt cache import is not supported with paged KV cache");
     STRIX_CHECK(n >= 1 && n < capacity_, "Qwen4ExpSession::import_state: n = ", n, ", expected 1..", capacity_ - 1);
     STRIX_CHECK(from >= 0 && from < n, "Qwen4ExpSession::import_state: from = ", from, ", expected 0..", n - 1);
     STRIX_CHECK(bytes >= sizeof(Qwen4ExpStateHeader), "Qwen4ExpSession::import_state: ", bytes,
@@ -1287,6 +1324,25 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     const bool carry_tail = hdr.has_image == 1 && hdr.ntriples > 0 && !triple_uniform(hdr.triples + (hdr.ntriples - 1) * 3);
     const int64_t b0 = from / kernels::kQsaBlock, b1 = n / kernels::kQsaBlock;
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::import_state");
+    if (kv_format_ == KvFormat::Paged) {
+        const int64_t needed_blocks = (n + kPageBlockSize - 1) / kPageBlockSize;
+        if (from == 0 && static_cast<int64_t>(block_table_host_.size()) > needed_blocks) {
+            page_pool_->block_mgr().free_blocks(block_table_host_.data() + needed_blocks,
+                                                block_table_host_.size() - needed_blocks);
+            block_table_host_.resize(needed_blocks);
+        }
+        ensure_paged_capacity(n);
+        if (block_table_dev_.size() < block_table_host_.size()) {
+            const size_t new_cap = std::max((size_t)cap_blocks_, block_table_host_.size());
+            block_table_dev_ = DeviceBuffer<int32_t>(new_cap, "block_table_dev");
+        }
+        if (!block_table_host_.empty()) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(block_table_dev_.get(), block_table_host_.data(),
+                                           block_table_host_.size() * sizeof(int32_t),
+                                           hipMemcpyHostToDevice, stream_),
+                            "upload block_table_dev");
+        }
+    }
     const Qwen4ExpDims &D = m_.dims();
     const size_t e = es(m_.act());
     uint8_t *cur = const_cast<uint8_t *>(in);
@@ -1299,6 +1355,9 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
             if (kv_format_ == KvFormat::Q8) {
                 kv8_copy(cur, l, n, from, kv8_tail_[tail_cur_][l], false, nullptr);
+            } else if (kv_format_ == KvFormat::Paged) {
+                paged_copy(cur, page_pool_->k_pool(l), n, from, D.hkv * D.hd, false, "K cache");
+                paged_copy(cur, page_pool_->v_pool(l), n, from, D.hkv * D.hd, false, "V cache");
             } else {
                 host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, false, stream_, "K cache");
                 host_copy(cur, v_cache_[l].get() + (size_t)from * row, kv, false, stream_, "V cache");
@@ -1313,8 +1372,13 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     host_copy(cur, ple_state_.get(), ple_state_.size(), false, stream_, "PLE conv state");
     if (mtp_) {
         const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-        host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP K cache");
-        host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP V cache");
+        if (kv_format_ == KvFormat::Paged) {
+            paged_copy(cur, page_pool_->k_mtp_pool(), n, from, D.hkv * D.hd, false, "MTP K cache");
+            paged_copy(cur, page_pool_->v_mtp_pool(), n, from, D.hkv * D.hd, false, "MTP V cache");
+        } else {
+            host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP K cache");
+            host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP V cache");
+        }
         block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
         host_copy(cur, tail_mtp_[mtp_tail_cur_].get(), tail_mtp_[mtp_tail_cur_].size(), false, stream_,
                   "MTP indexer tail");
