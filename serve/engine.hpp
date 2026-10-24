@@ -38,6 +38,8 @@
 
 namespace strix {
 
+class Qwen4ExpSession;
+
 // Counters a backend keeps for /metrics and the request log - cumulative, readable from any thread. PLE n-gram rows:
 // requested by forwards, distinct per gather, served from the row cache, read from the table file (SSD / page cache);
 // gathers and their seconds; forwards that waited for their rows at the PLE layer (the GPU idles meanwhile);
@@ -176,6 +178,7 @@ public:
     // The bytes export_snapshot(slot, out, from) will size out to (the prompt cache makes room for them first).
     virtual uint64_t snapshot_bytes(int slot, int64_t from = 0) const = 0;
     virtual void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) = 0;
+    virtual Qwen4ExpSession *session() { return nullptr; }
     // What a saved state fits: model, weights, layout, activation dtype (PromptCache refuses others).
     virtual std::string state_fingerprint() const = 0;
     virtual std::string describe() const = 0;  // for /health and logs
@@ -383,6 +386,25 @@ private:
     void capture(const Slot &slot, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
     void report_resume_loss(const std::vector<int32_t> &prompt, int64_t start, int64_t live_common, int64_t live_n,
                             int64_t id);
+    LogitRows batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids, bool verify,
+                                 const LogitMasks *masks = nullptr);
+
+    struct DecodeBatcher {
+        std::mutex mu;
+        std::condition_variable cv;
+        int active_decoders = 0;
+        int gen = 0;
+        bool executing = false;
+
+        struct Request {
+            int slot_id = -1;
+            Qwen4ExpSession *session = nullptr;
+            std::vector<int32_t> tokens;
+            std::vector<float> logits;
+            bool done = false;
+        };
+        std::vector<Request *> reqs;
+    } batcher_;
 
     std::vector<std::unique_ptr<LmBackend>> owned_backends_;
     std::vector<Slot> slots_;

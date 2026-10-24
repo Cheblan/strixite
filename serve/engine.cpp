@@ -1,4 +1,5 @@
 #include "serve/engine.hpp"
+#include "runtime/qwen4exp.hpp"
 #include "serve/think_nudge.hpp"
 
 #include "serve/capture.hpp"
@@ -345,6 +346,80 @@ int64_t Engine::resume_point(Slot &slot, const std::vector<int32_t> &prompt, int
     slot.seq.clear();
     none();
     return 0;
+}
+
+LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids, bool verify,
+                                     const LogitMasks *masks) {
+    Qwen4ExpSession *s = slot.be ? slot.be->session() : nullptr;
+    if (!s || slots_.size() <= 1) {
+        return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
+                      : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+    }
+
+    DecodeBatcher::Request my_req;
+    my_req.slot_id = slot.id;
+    my_req.session = s;
+    my_req.tokens = ids;
+
+    std::vector<DecodeBatcher::Request *> batch_reqs;
+
+    {
+        std::unique_lock<std::mutex> lk(batcher_.mu);
+        batcher_.cv.wait(lk, [&] { return !batcher_.executing || stop_; });
+        if (stop_) {
+            return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
+                          : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+        }
+
+        batcher_.reqs.push_back(&my_req);
+
+        const int target = std::max(1, batcher_.active_decoders);
+        if ((int)batcher_.reqs.size() >= target) {
+            batcher_.executing = true;
+        } else {
+            auto timeout = std::chrono::microseconds(1500);
+            batcher_.cv.wait_for(lk, timeout, [&] {
+                return (int)batcher_.reqs.size() >= batcher_.active_decoders || batcher_.executing || stop_;
+            });
+            if (stop_) {
+                return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
+                              : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+            }
+            if (!batcher_.executing) {
+                batcher_.executing = true;
+            }
+        }
+
+        if (batcher_.executing && !my_req.done) {
+            batch_reqs = std::move(batcher_.reqs);
+            batcher_.reqs.clear();
+        } else {
+            batcher_.cv.wait(lk, [&] { return my_req.done || stop_; });
+        }
+    }
+
+    if (!batch_reqs.empty()) {
+        std::vector<Qwen4ExpSession::BatchSlotStep> batch(batch_reqs.size());
+        for (size_t i = 0; i < batch_reqs.size(); ++i) {
+            batch[i].session = batch_reqs[i]->session;
+            batch[i].tokens = batch_reqs[i]->tokens;
+        }
+        std::vector<std::vector<float>> batch_logits;
+        Qwen4ExpSession::forward_batch_decode(batch, batch_logits, true);
+
+        std::lock_guard<std::mutex> lk(batcher_.mu);
+        for (size_t i = 0; i < batch_reqs.size(); ++i) {
+            batch_reqs[i]->logits = std::move(batch_logits[i]);
+            batch_reqs[i]->done = true;
+        }
+        batcher_.executing = false;
+        batcher_.gen++;
+        batcher_.cv.notify_all();
+    }
+
+    LogitRows l = LogitRows::from_full(std::move(my_req.logits), slot.be->logits_row());
+    if (masks != nullptr) apply_masks(l, *masks);
+    return l;
 }
 
 void Engine::capture(const Slot &slot, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason) {
@@ -756,7 +831,7 @@ void Engine::run(Slot &slot, Job &job) {
             res.completion_tokens += n, res.fed_tokens += n;
             ++res.think_closed_for_call;
             ++res.decode_forwards;
-            logits = be.forward_rows(fed, 1, cands, n_valid, masks_for({}));
+            logits = batch_forward_rows(slot, fed, false, masks_for({}));
             seq.insert(seq.end(), fed.begin(), fed.end());
             step(kThinkingStopStep, 0, n);  // the fed close, then the sampled <tool_call> as a step of its own
             step(0, 0, 1);
@@ -766,6 +841,19 @@ void Engine::run(Slot &slot, Job &job) {
         // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
         // forward of its own (strixite PR #1).
         int32_t carry = -1;
+        {
+            std::lock_guard<std::mutex> lk(batcher_.mu);
+            batcher_.active_decoders++;
+            batcher_.cv.notify_all();
+        }
+        struct DecoderScope {
+            DecodeBatcher &b;
+            ~DecoderScope() {
+                std::lock_guard<std::mutex> lk(b.mu);
+                b.active_decoders--;
+                b.cv.notify_all();
+            }
+        } dec_scope{batcher_};
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -779,7 +867,7 @@ void Engine::run(Slot &slot, Job &job) {
                 const bool nudge_due = options_.think_nudge && parser.in_reasoning() && watch.due() != 0;
                 if (budget_due || nudge_due) {
                     ++res.decode_forwards;
-                    logits = be.forward_rows({carry}, 1, cands, n_valid, masks_for({}));
+                    logits = batch_forward_rows(slot, {carry}, false, masks_for({}));
                     seq.push_back(carry);
                     step(0, 0, 1);
                     carry = -1;
@@ -801,7 +889,7 @@ void Engine::run(Slot &slot, Job &job) {
                 }
                 if (!events.empty()) sink.on_events(events), events.clear();
                 res.completion_tokens += n;
-                logits = be.forward_rows(thinking_stop_, 1, cands, n_valid, masks_for({}));
+                logits = batch_forward_rows(slot, thinking_stop_, false, masks_for({}));
                 seq.insert(seq.end(), thinking_stop_.begin(), thinking_stop_.end());
                 step(kThinkingStopStep, 0, n);
                 continue;
@@ -825,7 +913,7 @@ void Engine::run(Slot &slot, Job &job) {
                         res.completion_tokens += n;
                         ++res.think_nudges;
                         res.fed_tokens += n;
-                        logits = be.forward_rows(nt, 1, cands, n_valid, masks_for({}));
+                        logits = batch_forward_rows(slot, nt, false, masks_for({}));
                         seq.insert(seq.end(), nt.begin(), nt.end());
                         step(kThinkingStopStep, 0, n);
                         watch.fired();
@@ -897,8 +985,8 @@ void Engine::run(Slot &slot, Job &job) {
                 if (k > 0) {
                     res.mtp_drafted_tokens += k;
                     ++res.decode_forwards;
-                    LogitRows ml = be.forward_verify_rows(
-                        ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
+                    LogitRows ml = batch_forward_rows(
+                        slot, ids, true, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
                     STRIX_CHECK(ml.rows == k + 1, "Engine: verify of ", k + 1, " tokens returned ", ml.rows,
                                 " logits rows");
                     // Accept drafts while the sampled token is the draft.
@@ -992,7 +1080,7 @@ void Engine::run(Slot &slot, Job &job) {
                 }
             }
             ++res.decode_forwards;
-            logits = be.forward_rows({id}, 1, cands, n_valid, masks_for({}));
+            logits = batch_forward_rows(slot, {id}, false, masks_for({}));
             seq.push_back(id);
             step(0, 0, 1);
         }
