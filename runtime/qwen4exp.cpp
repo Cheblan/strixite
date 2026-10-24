@@ -1875,7 +1875,6 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                        attn_ws_.get(), attn_ws_bytes_, act, stream_);
             } else {
                 const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
                 void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
                 STRIX_CHECK(qsa_ws_ != nullptr, "forward: missing QSA workspace");
                 kernels::qsa_scores(iq, D.astride, D.idx_d, T, pos_, D.idx_h, D.idx_d, block_keys_[(size_t)i].get(),
@@ -1898,7 +1897,6 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                 } else if (wmma_attn && q8)
                     kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_ws_->prefill_sel.get(),
                                                      qsa_ws_->prefill_nsel.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
-                                                     attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
                                                      attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
                 else if (wmma_attn)
                     kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_ws_->prefill_sel.get(),
@@ -2323,7 +2321,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                                                     s0.attn_err_.get(), act, stream);
                     } else if (paged) {
                         kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, paged_view, as,
-                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    s0.qsa_ws_->decode_sel.get(), s0.qsa_ws_->decode_nsel.get(), qsa_k, scale,
                                                     core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
                                                     s0.attn_err_.get(), act, stream);
                     } else {
