@@ -28,7 +28,8 @@ public:
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits) override {
         return session_.forward(ids, n_logits);
     }
-    Qwen4ExpSession *session() override { return &session_; }
+    Qwen4ExpSession &session() { return session_; }
+    const Qwen4ExpSession &session() const { return session_; }
     bool has_mtp() const override { return session_.has_mtp(); }
     std::vector<float> forward_mtp(int32_t token_id, int64_t step) override {
         return session_.forward_mtp(token_id, step);
