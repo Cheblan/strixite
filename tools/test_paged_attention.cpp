@@ -457,6 +457,98 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // 4d. Test paged_copy (Prompt Cache Gather / Scatter)
+    printf("=== Testing paged_copy (Prompt Cache Gather / Scatter) ===\n");
+    auto paged_copy_test = [&](uint8_t *&cur, const void *pool, int64_t n, int64_t from, int64_t width,
+                               bool to_host, const std::vector<int32_t> &bt, hipStream_t s) {
+        if (from >= n) return;
+        const size_t row_bytes = (size_t)width * 2; // BF16
+        const uint8_t *dev_base = static_cast<const uint8_t *>(pool);
+        int64_t t = from;
+        while (t < n) {
+            const int64_t b = t / bs32;
+            const int64_t o = t % bs32;
+            const int32_t pb = bt[(size_t)b];
+            const int64_t chunk_tokens = std::min(bs32 - o, n - t);
+            const size_t chunk_bytes = (size_t)chunk_tokens * row_bytes;
+            const uint8_t *dev_chunk = dev_base + (size_t)(pb * bs32 + o) * row_bytes;
+            if (to_host) {
+                STRIX_HIP_CHECK(hipMemcpyAsync(cur, dev_chunk, chunk_bytes, hipMemcpyDeviceToHost, s), "paged export");
+            } else {
+                STRIX_HIP_CHECK(hipMemcpyAsync(const_cast<uint8_t *>(dev_chunk), cur, chunk_bytes, hipMemcpyHostToDevice, s), "paged import");
+            }
+            cur += chunk_bytes;
+            t += chunk_tokens;
+        }
+    };
+
+    // Test whole export (from = 0 to N = 256)
+    std::vector<uint8_t> exported_k(N * W * 2);
+    uint8_t *cur_exp = exported_k.data();
+    paged_copy_test(cur_exp, d_pool_k32.get(), N, 0, W, true, bt32, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "export sync");
+    int exp_mismatches = 0;
+    const uint16_t *exp_k_words = reinterpret_cast<const uint16_t *>(exported_k.data());
+    for (int64_t i = 0; i < N * W; ++i) {
+        if (exp_k_words[i] != h_k_flat[i]) exp_mismatches++;
+    }
+    printf("paged_copy export (from=0..%lld) mismatches: %d / %lld\n", (long long)N, exp_mismatches, (long long)(N * W));
+    if (exp_mismatches != 0) {
+        printf(">> [FAILURE] paged_copy export failed! <<\n\n");
+        return 1;
+    }
+
+    // Test delta import into fresh pool with different block table permutation
+    std::vector<int32_t> bt_new(num_logical_blocks32);
+    std::iota(bt_new.begin(), bt_new.end(), 0);
+    std::reverse(bt_new.begin(), bt_new.end()); // reversed physical block mapping!
+    DeviceBuffer<uint16_t> d_pool_k_new(num_physical_blocks32 * bs32 * W, "pool_k_new");
+    STRIX_HIP_CHECK(hipMemset(d_pool_k_new.get(), 0, d_pool_k_new.size() * 2), "zero pool_k_new");
+
+    // Import whole state from exported_k
+    const uint8_t *cur_imp = exported_k.data();
+    uint8_t *cur_imp_mut = const_cast<uint8_t *>(cur_imp);
+    paged_copy_test(cur_imp_mut, d_pool_k_new.get(), N, 0, W, false, bt_new, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "import sync");
+
+    // Re-export from d_pool_k_new and check it matches original flat buffer
+    std::vector<uint8_t> reexported_k(N * W * 2);
+    uint8_t *cur_reexp = reexported_k.data();
+    paged_copy_test(cur_reexp, d_pool_k_new.get(), N, 0, W, true, bt_new, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "reexport sync");
+
+    int reexp_mismatches = 0;
+    const uint16_t *reexp_k_words = reinterpret_cast<const uint16_t *>(reexported_k.data());
+    for (int64_t i = 0; i < N * W; ++i) {
+        if (reexp_k_words[i] != h_k_flat[i]) reexp_mismatches++;
+    }
+    printf("paged_copy round-trip import->reexport mismatches: %d / %lld\n", reexp_mismatches, (long long)(N * W));
+    if (reexp_mismatches != 0) {
+        printf(">> [FAILURE] paged_copy round-trip failed! <<\n\n");
+        return 1;
+    }
+
+    // Test delta export/import (from = 47 to N = 239, unaligned!)
+    const int64_t delta_from = 47;
+    const int64_t delta_to = 239;
+    std::vector<uint8_t> delta_buf((delta_to - delta_from) * W * 2);
+    uint8_t *cur_delta_exp = delta_buf.data();
+    paged_copy_test(cur_delta_exp, d_pool_k32.get(), delta_to, delta_from, W, true, bt32, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "delta export sync");
+
+    int delta_exp_mismatches = 0;
+    const uint16_t *delta_k_words = reinterpret_cast<const uint16_t *>(delta_buf.data());
+    for (int64_t i = 0; i < (delta_to - delta_from) * W; ++i) {
+        if (delta_k_words[i] != h_k_flat[(delta_from * W) + i]) delta_exp_mismatches++;
+    }
+    printf("paged_copy delta export (from=%lld..%lld) mismatches: %d / %lld\n",
+           (long long)delta_from, (long long)delta_to, delta_exp_mismatches, (long long)((delta_to - delta_from) * W));
+    if (delta_exp_mismatches != 0) {
+        printf(">> [FAILURE] paged_copy delta export failed! <<\n\n");
+        return 1;
+    }
+    printf(">> [SUCCESS] paged_copy (Prompt Cache Gather/Scatter) is 100%% BIT-IDENTICAL! <<\n\n");
+
     // 5. Benchmark Latency
     printf("Running 200 benchmark iterations...\n");
     hipEvent_t start, stop;

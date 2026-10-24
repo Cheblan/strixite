@@ -121,10 +121,6 @@ int run(int argc, char **argv) {
     precision.gdn = parse_gdn_precision(settings.text("gdn-precision"));  // an unknown value fails startup
     precision.attention = parse_attention_precision(settings.text("attention-precision"));
     const KvFormat kv_format = parse_kv_format(settings.text("kv-cache"));  // an unknown value fails startup
-    if (kv_format == KvFormat::Paged && cache_gib > 0) {
-        slog(LogLevel::Warning, "startup: prompt cache is not supported with paged KV cache (requires linear export); disabling prompt cache");
-        cache_gib = 0;
-    }
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
