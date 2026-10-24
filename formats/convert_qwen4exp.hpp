@@ -39,6 +39,10 @@ struct ConvertOptions {
     std::vector<int64_t> layers;  // decoder layers to convert; empty = all
     bool globals = true;          // embedding, LM head, final HC mixer
     bool mtp = true;              // the MTP head
+    // Separate MTP: write out_dir/mtp.strixw as its own strixw file and omit mtp.* tensors from weights.strixw.
+    bool mtp_separate = false;
+    // MTP only: write exactly out_dir/mtp.strixw and nothing else (never touches existing weights.strixw).
+    bool mtp_only = false;
     // A safetensors file whose tensors replace the checkpoint's same-named mtp.* tensors (a fine-tuned draft head):
     // every tensor in it must be an mtp.* tensor the checkpoint has, same dtype and shape. The trunk still comes from
     // src_dir, so source_fingerprint stays the checkpoint's (it pairs with the n-gram table); the metadata records
@@ -79,6 +83,7 @@ struct ConvertPlan {
 struct ConvertResult {
     std::string weights_path;
     std::string vision_path;  // "" unless ConvertOptions::vision
+    std::string mtp_path;     // "" unless ConvertOptions::mtp_separate or mtp_only
     uint64_t source_bytes = 0, output_bytes = 0;
     size_t tensors = 0;
     double seconds = 0;

@@ -52,7 +52,7 @@ Qwen4ExpModel::Hc load_hc(const StrixwDevice &w, const std::string &p, const Qwe
 
 Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngram, Act act,
                              bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor,
-                             WeightPlacement placement, const std::string &vision)
+                             WeightPlacement placement, const std::string &vision, const std::string &mtp)
     : act_(act) {
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, "Qwen4ExpModel: unsupported activation dtype ", (int)act);
     STRIX_CHECK(std::isfinite(yarn_factor) && yarn_factor >= 1.0f && yarn_factor <= 8.0f, "Qwen4ExpModel: yarn_factor = ",
@@ -159,30 +159,39 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         }
         layers_.push_back(l);
     }
-    has_mtp_ = f.find("mtp.fc_embedding.weight") != nullptr;
+    if (!mtp.empty()) {
+        const StrixwFile mf(mtp);
+        STRIX_CHECK(mf.meta("arch") == "qwen4exp", "Qwen4ExpModel: MTP weights '", mtp,
+                    "' has arch '", mf.meta("arch"), "', expected qwen4exp");
+        mtp_w_ = std::make_unique<StrixwDevice>(mtp, 8, placement);
+        has_mtp_ = true;
+    } else {
+        has_mtp_ = f.find("mtp.fc_embedding.weight") != nullptr;
+    }
     if (has_mtp_) {
-        mtp_.fc_embedding = w_->qw("mtp.fc_embedding.weight", {D.d, D.d});
-        mtp_.fc_hidden = w_->qw("mtp.fc_hidden.weight", {D.d, D.d});
-        mtp_.pre_fc_norm_embedding = w_->f32("mtp.pre_fc_norm_embedding.weight", {D.d});
-        mtp_.pre_fc_norm_hidden = w_->f32("mtp.pre_fc_norm_hidden.weight", {n4});
-        mtp_.hc_mixer = load_hc(*w_, "mtp.hyper_connection_mixer.", D, false);
+        const StrixwDevice &mw = mtp_w_ ? *mtp_w_ : *w_;
+        mtp_.fc_embedding = mw.qw("mtp.fc_embedding.weight", {D.d, D.d});
+        mtp_.fc_hidden = mw.qw("mtp.fc_hidden.weight", {D.d, D.d});
+        mtp_.pre_fc_norm_embedding = mw.f32("mtp.pre_fc_norm_embedding.weight", {D.d});
+        mtp_.pre_fc_norm_hidden = mw.f32("mtp.pre_fc_norm_hidden.weight", {n4});
+        mtp_.hc_mixer = load_hc(mw, "mtp.hyper_connection_mixer.", D, false);
         const std::string M = "mtp.layers.0.";
         Layer &l = mtp_.layer;
-        l.hc_attn = load_hc(*w_, M + "attn_hyper_connection.", D, true);
-        l.hc_mlp = load_hc(*w_, M + "mlp_hyper_connection.", D, true);
+        l.hc_attn = load_hc(mw, M + "attn_hyper_connection.", D, true);
+        l.hc_mlp = load_hc(mw, M + "mlp_hyper_connection.", D, true);
         const std::string A = M + "self_attn.";
-        l.qkv = w_->qw(A + "qkv", {D.astride, D.d});
-        l.o_proj = w_->qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
-        l.q_norm = w_->f32(A + "q_norm.weight", {D.hd});
-        l.k_norm = w_->f32(A + "k_norm.weight", {D.hd});
-        l.idx_q_norm = w_->f32(A + "indexer.q_layernorm.weight", {D.idx_d});
-        l.idx_k_norm = w_->f32(A + "indexer.k_layernorm.weight", {D.idx_d});
-        l.gate_up = w_->qw(M + "mlp.experts_gate_up", {Estack * 2 * D.inter, D.d});
-        l.down = w_->qw(M + "mlp.experts_down", {Estack * D.d, D.inter});
-        l.router = w_->bf16(M + "mlp.router", {D.experts + 1, D.d});
+        l.qkv = mw.qw(A + "qkv", {D.astride, D.d});
+        l.o_proj = mw.qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
+        l.q_norm = mw.f32(A + "q_norm.weight", {D.hd});
+        l.k_norm = mw.f32(A + "k_norm.weight", {D.hd});
+        l.idx_q_norm = mw.f32(A + "indexer.q_layernorm.weight", {D.idx_d});
+        l.idx_k_norm = mw.f32(A + "indexer.k_layernorm.weight", {D.idx_d});
+        l.gate_up = mw.qw(M + "mlp.experts_gate_up", {Estack * 2 * D.inter, D.d});
+        l.down = mw.qw(M + "mlp.experts_down", {Estack * D.d, D.inter});
+        l.router = mw.bf16(M + "mlp.router", {D.experts + 1, D.d});
         if (shared_separate_) {
-            l.shared_gate_up = w_->qw(M + "mlp.shared_expert.gate_up", {2 * D.inter, D.d});
-            l.shared_down = w_->qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
+            l.shared_gate_up = mw.qw(M + "mlp.shared_expert.gate_up", {2 * D.inter, D.d});
+            l.shared_down = mw.qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
         }
     }
     // The image tower (vision): a second file, loaded last (it's the optional part), with the side-file

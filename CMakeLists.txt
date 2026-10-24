@@ -254,6 +254,9 @@ target_link_libraries(check_stream_calls PRIVATE strix_serve)
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
+add_executable(test_separate_mtp tools/test_separate_mtp.cpp)
+target_link_libraries(test_separate_mtp PRIVATE strix_serve_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
