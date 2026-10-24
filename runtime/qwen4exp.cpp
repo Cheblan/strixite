@@ -1078,6 +1078,14 @@ void Qwen4ExpSession::restore(const Qwen4ExpSnapshot &s) {
                 ") doesn't end at the restored position ", pos_, " (internal)");
     broken_ = false, mtp_chain_step_ = -1;
     rewind_to_.push_back(s.pos_);
+    if (kv_format_ == KvFormat::Paged && page_pool_) {
+        const int64_t needed_blocks = (s.pos_ + kPageBlockSize - 1) / kPageBlockSize;
+        if (static_cast<int64_t>(block_table_host_.size()) > needed_blocks) {
+            page_pool_->block_mgr().free_blocks(block_table_host_.data() + needed_blocks,
+                                                block_table_host_.size() - needed_blocks);
+            block_table_host_.resize(needed_blocks);
+        }
+    }
 }
 
 size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
@@ -2130,7 +2138,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
         const int64_t Tk = offsets[k + 1] - offsets[k];
         sk.prepare_positions(sk.pos_, Tk);
         if (sk.kv_format_ == KvFormat::Paged) {
-            sk.ensure_paged_capacity(Tk);
+            sk.ensure_paged_capacity(sk.pos_ + Tk);
         }
         if (Tk > 1) {
             sk.ensure_verify_buffers();

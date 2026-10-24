@@ -401,9 +401,12 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
             batcher_.cv.wait(lk, [&] { return my_req.done || stop_; });
             if (!my_req.done && stop_) {
                 auto it = std::find(batcher_.reqs.begin(), batcher_.reqs.end(), &my_req);
-                if (it != batcher_.reqs.end()) batcher_.reqs.erase(it);
-                return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
-                              : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+                if (it != batcher_.reqs.end()) {
+                    batcher_.reqs.erase(it);
+                    return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
+                                  : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+                }
+                batcher_.cv.wait(lk, [&] { return my_req.done || !batcher_.executing; });
             }
         }
     }
