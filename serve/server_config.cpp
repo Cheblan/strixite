@@ -239,11 +239,22 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "generation_config.json: the sampling defaults (temperature, top_k, top_p)"},
         {"host", K::Text, 0, 0, server.host, "address to listen on"},
         {"port", K::Int, 1, 65535, std::to_string(server.port), "port to listen on"},
+        {"request-read-timeout-s", K::Int, 1, 3600, "30",
+         "seconds a connection may go silent while its request body is still arriving before the read is abandoned "
+         "and a retryable 408 goes out; per-read inactivity, not total upload time (httplib's default was 5 s, too "
+         "short for multi-MB histories over weak Wi-Fi - strixite #15)"},
         {"capacity", K::Int, 4096, 1 << 20, "524288", "positions per session (at most 262144 x rope-yarn-factor)"},
+        {"total-slots", K::Int, 1, 8, "2",
+         "conversations served at once, each its own state at the full capacity (one slot's state is ~8 GiB at 512k "
+         "with 8-bit K/V); requests past them wait in arrival order. Startup refuses a count the memory doesn't hold, "
+         "naming the one that fits"},
         {"rope-yarn-factor", K::Number, 1, 8, "2",
          "YaRN context extension: positions as trained (262144) x this; 1 = off (RoPE as trained). A change makes "
          "the prompt cache's entries from the other setting unusable (dropped at startup)"},
         {"chunk", K::Int, 1, 16384, "16384", "prefill chunk in tokens; progress and cancellation are checked per chunk"},
+        {"chunk-shared", K::Int, 0, 16384, "2048",
+         "prefill chunk in tokens while another slot is decoding (several slots): a slot's chunk holds the GPU, so the "
+         "other slots' decode steps run only between chunks; 0 = always the full chunk"},
         {"model-id", K::Text, 0, 0, server.model_id, "the model name the API reports"},
         {"prompt-cache-dir", K::Path, 0, 0, models_dir + "/prompt-cache", "the disk prompt cache's directory"},
         {"prompt-cache-gib", K::Int, 0, 1 << 16, "128", "the disk prompt cache's cap in GiB; 0 = no prompt cache"},
@@ -280,6 +291,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},
+        {"log-level", K::Text, 0, 0, "info",
+         "the least severe log lines printed: error, warn, info (each request's block, startup) or debug (+ the "
+         "per-request MTP / PLE / cache detail rows and the prompt cache writer's lines)"},
         {"capture-dir", K::PathOrOff, 0, 0, "off",
          "write each request's token ids and MTP steps here (serve/capture.hpp); off = no capture"},
         {"think-nudge", K::OnOff, 0, 0, "on",

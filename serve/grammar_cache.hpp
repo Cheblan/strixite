@@ -6,8 +6,9 @@
 // compile nor the masks again. Keyed by the schema's compact JSON; the least recently used entry is dropped past
 // kMaxEntries (a request still running keeps its automaton alive through its shared_ptr).
 //
-// get() is called from HTTP threads (mutex inside); the automaton it returns is then used by the engine thread
-// alone (GrammarAutomaton isn't thread-safe; the engine runs one request at a time).
+// get() is called from HTTP threads (mutex inside); the automaton it returns is shared by every request with
+// that schema and driven by several slot workers at once - GrammarAutomaton is internally synchronized
+// (serve/grammar.hpp).
 
 #include "serve/grammar.hpp"
 #include "serve/json.hpp"

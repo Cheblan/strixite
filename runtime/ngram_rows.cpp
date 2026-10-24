@@ -23,6 +23,17 @@ constexpr size_t kReadThreads = 32;  // concurrent row reads per gather (SSD que
 }  // namespace
 
 NgramRowsFromShards::NgramRowsFromShards(const std::string &dir, const std::string &P) {
+    // A throw from the body runs no destructor: close the shards opened so far, then rethrow.
+    try {
+        open_shards(dir, P);
+    } catch (...) {
+        for (Shard &s : shards_)
+            if (s.fd >= 0) ::close(s.fd), s.fd = -1;
+        throw;
+    }
+}
+
+void NgramRowsFromShards::open_shards(const std::string &dir, const std::string &P) {
     namespace fs = std::filesystem;
     STRIX_CHECK(fs::is_directory(dir), "NgramRowsFromShards: '", dir, "' is not a directory (the PLE rows still come ",
                 "from the HF checkpoint - the table file is OPEN)");

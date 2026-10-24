@@ -4,29 +4,35 @@
 #include "formats/strixw.hpp"
 #include "runtime/ngram_table.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace strix {
 
 Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp,
-                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv)
-    : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv),
-      snapshots_{session_.make_snapshot(), session_.make_snapshot(), session_.make_snapshot(),
-                 session_.make_snapshot()} {
+                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv, int64_t n_seqs)
+    : model_(model),
+      session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv, n_seqs) {
+    for (int k = 0; k < (int)n_seqs; ++k) {  // each conversation's own snapshot slots (a snapshot belongs to one state)
+        snapshots_.emplace_back();
+        for (int i = 0; i < 4; ++i) snapshots_.back().push_back(session_.make_snapshot(k));
+    }
     STRIX_CHECK(mtp_vocab >= 0, "Qwen4ExpBackend: mtp_vocab ", mtp_vocab, ", expected >= 0 (0 = the whole vocabulary)");
     session_.set_precision(precision);
     if (mtp_vocab > 0) session_.set_mtp_vocab(mtp_vocab);
 }
 
-Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int slot) {
+Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) {
+    check_seq(seq, "snapshot");
     STRIX_CHECK(slot == kTurnSlot || slot == kSystemSlot || slot == kDraftSlot || slot == kUserSlot,
-                "Qwen4ExpBackend: snapshot slot ", slot);
-    return snapshots_[slot];
+                "Qwen4ExpBackend: snapshot slot ", slot, " of seq ", seq);
+    return snapshots_[(size_t)seq][(size_t)slot];
 }
-const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int slot) const {
+const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) const {
+    check_seq(seq, "snapshot");
     STRIX_CHECK(slot == kTurnSlot || slot == kSystemSlot || slot == kDraftSlot || slot == kUserSlot,
-                "Qwen4ExpBackend: snapshot slot ", slot);
-    return snapshots_[slot];
+                "Qwen4ExpBackend: snapshot slot ", slot, " of seq ", seq);
+    return snapshots_[(size_t)seq][(size_t)slot];
 }
 
 BackendStats Qwen4ExpBackend::backend_stats() const {
@@ -48,21 +54,21 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
     return s;
 }
 
-void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
-    const Qwen4ExpSnapshot &s = snap(slot);
-    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::export_snapshot: slot ", slot, " was never saved");
+void Qwen4ExpBackend::export_snapshot(int seq, int slot, HostBuffer &out, int64_t from) {
+    const Qwen4ExpSnapshot &s = snap(seq, slot);
+    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::export_snapshot: slot ", slot, " of seq ", seq, " was never saved");
     out.resize(session_.state_bytes(s.pos(), from));
-    session_.export_state(s, out.data(), out.size(), from);
+    session_.export_state(seq, s, out.data(), out.size(), from);
 }
 
-uint64_t Qwen4ExpBackend::snapshot_bytes(int slot, int64_t from) const {
-    const Qwen4ExpSnapshot &s = snap(slot);
-    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::snapshot_bytes: slot ", slot, " was never saved");
+uint64_t Qwen4ExpBackend::snapshot_bytes(int seq, int slot, int64_t from) const {
+    const Qwen4ExpSnapshot &s = snap(seq, slot);
+    STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::snapshot_bytes: slot ", slot, " of seq ", seq, " was never saved");
     return (uint64_t)session_.state_bytes(s.pos(), from);
 }
 
-void Qwen4ExpBackend::import_state(const HostBuffer &state, int64_t n, int64_t from) {
-    session_.import_state(state.data(), state.size(), n, from);
+void Qwen4ExpBackend::import_state(int seq, const HostBuffer &state, int64_t n, int64_t from) {
+    session_.import_state(seq, state.data(), state.size(), n, from);
 }
 
 std::string Qwen4ExpBackend::state_fingerprint() const {
@@ -155,6 +161,88 @@ LogitRows Qwen4ExpBackend::candidate_rows(int64_t rows) const {
     for (size_t i = 0; i < c.cand.size(); ++i) l.cand_v[i] = c.cand[i].v, l.cand_id[i] = c.cand[i].id;
     for (size_t r = 0; r < (size_t)rows; ++r) l.nan[r] = c.nan[r] != 0;
     return l;
+}
+
+LogitRows Qwen4ExpBackend::forward_rows(int seq, const std::vector<int32_t> &ids, int64_t n_logits, bool cands,
+                                        int64_t n_valid, const LogitMasks *masks) {
+    if (seq == 0) return forward_rows(ids, n_logits, cands, n_valid, masks);  // the one-seq path, unchanged
+    check_seq(seq, "forward_rows");
+    if (masks != nullptr) masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_rows");
+    std::vector<Qwen4ExpSession::BatchRun> run{{seq, ids, n_logits}};
+    if (!cands || n_logits == 0) {
+        LogitRows l = LogitRows::from_full(session_.forward_batch(run), logits_row());
+        if (masks != nullptr) apply_masks(l, *masks);
+        return l;
+    }
+    if (masks != nullptr) session_.want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
+    else session_.want_candidates(n_valid);
+    session_.forward_batch(run);
+    return candidate_rows(n_logits);
+}
+
+LogitMasks Qwen4ExpBackend::batch_masks(const std::vector<VerifyRun> &runs) const {
+    LogitMasks m;
+    for (const VerifyRun &r : runs)
+        if (r.masks != nullptr) {
+            r.masks->check((int64_t)r.ids.size(), logits_row(), "Qwen4ExpBackend::verify_batch");
+            m.words = std::max(m.words, r.masks->words);
+        }
+    if (m.words == 0) return m;
+    for (const VerifyRun &r : runs) m.rows += (int64_t)r.ids.size();
+    m.bits.assign((size_t)(m.rows * m.words), ~0u);  // runs without masks: every id allowed
+    int64_t at = 0;
+    for (const VerifyRun &r : runs) {
+        if (r.masks != nullptr)
+            for (int64_t i = 0; i < (int64_t)r.ids.size(); ++i)
+                std::copy(r.masks->row(i), r.masks->row(i) + r.masks->words, m.bits.begin() + (size_t)((at + i) * m.words));
+        at += (int64_t)r.ids.size();
+    }
+    return m;
+}
+
+std::vector<LogitRows> Qwen4ExpBackend::verify_batch(const std::vector<VerifyRun> &runs, bool cands, int64_t n_valid) {
+    STRIX_CHECK(!runs.empty() && (int64_t)runs.size() <= n_seqs(), "Qwen4ExpBackend::verify_batch: ", runs.size(),
+                " runs, expected 1..", n_seqs());
+    std::vector<Qwen4ExpSession::BatchRun> batch;
+    int64_t rows = 0;
+    for (const VerifyRun &r : runs) {
+        check_seq(r.seq, "verify_batch");
+        batch.push_back({r.seq, r.ids, (int64_t)r.ids.size()});
+        rows += (int64_t)r.ids.size();
+    }
+    const LogitMasks masks = batch_masks(runs);
+    std::vector<LogitRows> out;
+    if (!cands) {
+        const LogitRows all = LogitRows::from_full(session_.forward_batch_verify(batch), logits_row());
+        STRIX_CHECK(all.rows == rows, "Qwen4ExpBackend::verify_batch: ", all.rows, " logits rows, expected ", rows);
+        int64_t at = 0;
+        for (const VerifyRun &r : runs) {
+            const int64_t n = (int64_t)r.ids.size();
+            LogitRows l;
+            l.rows = n, l.row = all.row;
+            l.full.assign(all.full.begin() + at * all.row, all.full.begin() + (at + n) * all.row);
+            if (r.masks != nullptr) apply_masks(l, *r.masks);
+            out.push_back(std::move(l));
+            at += n;
+        }
+        return out;
+    }
+    if (!masks.empty()) session_.want_candidates(n_valid, masks.bits.data(), masks.rows, masks.words);
+    else session_.want_candidates(n_valid);
+    session_.forward_batch_verify(batch);
+    const LogitRows all = candidate_rows(rows);
+    int64_t at = 0;
+    for (const VerifyRun &r : runs) {
+        const int64_t n = (int64_t)r.ids.size(), K = all.cands;
+        LogitRows l;
+        l.rows = n, l.row = all.row, l.cands = K;
+        l.cand_v.assign(all.cand_v.begin() + at * K, all.cand_v.begin() + (at + n) * K);
+        l.cand_id.assign(all.cand_id.begin() + at * K, all.cand_id.begin() + (at + n) * K);
+        l.nan.assign(all.nan.begin() + at, all.nan.begin() + at + n);
+        out.push_back(std::move(l));
+        at += n;
+    }
+    return out;
 }
 
 }  // namespace strix

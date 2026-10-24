@@ -247,7 +247,7 @@ private:
         uint64_t file_bytes = 0;
         int readers = 0;           // with_state / the writer using ram (it must stay put)
         bool queued = false;       // a write is queued or running
-        bool drop_ram = false;     // leave RAM once written (an eviction)
+        bool drop_ram = false;     // leave RAM once written and unread (an eviction; the last release_locked drops it)
         bool releasing = false;    // its RAM is given back as the writer writes it: unreadable (with_state waits)
         bool dead = false;         // removed from the index while in use; the last user cleans up
         bool no_room = false;      // the disk had no room for it (or evicted it): no idle write until it's used again
@@ -277,7 +277,9 @@ private:
     void release_locked(Entry &e);                     // a reader / the writer is done with e
     void unlink_locked(Entry &e);                      // its file
     void keep_spare_locked(HostBuffer b);
-    void make_room_locked(uint64_t extra = 0);         // the RAM rule: MemAvailable >= ram_margin + extra
+    // The RAM rule: MemAvailable >= ram_margin + extra. avail: the caller's reading of MemAvailable (UINT64_MAX: read it
+    // here) - make_room_for passes the one its check used, so both decide on the same number.
+    void make_room_locked(uint64_t extra = 0, uint64_t avail = UINT64_MAX);
     uint64_t leaving_bytes_locked() const;             // RAM of evicted entries not yet written (on its way out)
     // The writer's margin watch (Options::ram_watch_seconds): the RAM rule, its buffers unmapped outside the lock.
     void watch_margin(std::unique_lock<std::mutex> &lock);

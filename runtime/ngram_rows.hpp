@@ -31,6 +31,7 @@ public:
     void gather(const int64_t *rows, int64_t n, uint16_t *out) const override;
 
 private:
+    void open_shards(const std::string &dir, const std::string &layer_prefix);  // the constructor's body
     struct Shard {
         int fd = -1;
         uint64_t offset = 0;  // the tensor's first byte in its file

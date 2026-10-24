@@ -65,9 +65,11 @@ std::vector<uint32_t> TokenMasker::compute(grammar::GrammarAutomaton &automaton,
     return mask;
 }
 
-const std::vector<uint32_t> &TokenMasker::mask(grammar::GrammarAutomaton &automaton, int32_t state) const {
-    if (const std::vector<uint32_t> *cached = automaton.cached_mask(state, this)) return *cached;
-    return automaton.store_mask(state, this, compute(automaton, state));
+std::shared_ptr<const std::vector<uint32_t>> TokenMasker::mask(grammar::GrammarAutomaton &automaton,
+                                                               int32_t state) const {
+    if (std::shared_ptr<const std::vector<uint32_t>> cached = automaton.cached_mask(state, this)) return cached;
+    std::vector<uint32_t> fresh = compute(automaton, state);  // computed outside any automaton lock (its next()
+    return automaton.store_mask(state, this, std::move(fresh));  // takes them itself; concurrent misses converge)
 }
 
 }  // namespace strix

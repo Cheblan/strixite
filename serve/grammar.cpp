@@ -305,14 +305,18 @@ uint64_t hash_parses(const std::vector<GrammarMatcher::Stack> &parses) {
 GrammarAutomaton::GrammarAutomaton(std::shared_ptr<const Grammar> grammar, bool colliding_hash_for_tests)
     : grammar_(std::move(grammar)), colliding_hash_(colliding_hash_for_tests) {
     STRIX_CHECK(grammar_ != nullptr, "GrammarAutomaton needs a grammar (got a null pointer)");
-    intern(GrammarMatcher(grammar_));  // state 0: the start
+    {
+        std::lock_guard<std::mutex> lock(mu_);  // intern wants it held (nothing else can see the automaton yet)
+        intern(GrammarMatcher(grammar_));  // state 0: the start
+    }
 }
 
-void GrammarAutomaton::check_state(int32_t state, const char *what) const {
+void GrammarAutomaton::check_state_locked(int32_t state, const char *what) const {
     STRIX_CHECK(state >= 0 && static_cast<size_t>(state) < states_.size(), what, ": state ", state, " outside [0, ",
                 states_.size(), ") (kDead is not a state; check next()'s result first)");
 }
 
+// mu_ held: the state id for `matcher`'s parse set (an existing equivalent, or a new state).
 int32_t GrammarAutomaton::intern(GrammarMatcher matcher) {
     const uint64_t hash = colliding_hash_ ? 0 : hash_parses(matcher.parses());
     std::vector<int32_t> &bucket = by_hash_[hash];
@@ -328,14 +332,31 @@ int32_t GrammarAutomaton::intern(GrammarMatcher matcher) {
     return id;
 }
 
+// Thread-safe (review item 2): the cache probes and the intern run under mu_, the parse work between them outside
+// (a mask's first walk computes its states without blocking another slot's generation). Two threads that compute
+// the same transition end at the same interned state id, so whichever emplace wins, the cache holds the same value.
 int32_t GrammarAutomaton::next(int32_t state, uint8_t byte) {
     const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(state)) << 8) | byte;
-    const auto found = transitions_.find(key);
-    if (found != transitions_.end()) return found->second;
-    check_state(state, "GrammarAutomaton::next");
-    GrammarMatcher matcher = states_[state];
-    const int32_t result = matcher.advance(byte) ? intern(std::move(matcher)) : kDead;
-    transitions_.emplace(key, result);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto found = transitions_.find(key);
+        if (found != transitions_.end()) return found->second;
+    }
+    GrammarMatcher matcher = [&] {  // copy the source state under the lock ...
+        std::lock_guard<std::mutex> lock(mu_);
+        check_state_locked(state, "GrammarAutomaton::next");
+        return states_[state];
+    }();
+    const int32_t result = matcher.advance(byte)  // ... advance the copy outside it ...
+                               ? [&] {
+                                     std::lock_guard<std::mutex> lock(mu_);
+                                     return intern(std::move(matcher));
+                                 }()
+                               : kDead;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        transitions_.emplace(key, result);  // a concurrent identical computation stores the same id
+    }
     return result;
 }
 
@@ -348,30 +369,53 @@ int32_t GrammarAutomaton::next(int32_t state, std::string_view bytes) {
 }
 
 bool GrammarAutomaton::accepting(int32_t state) const {
-    check_state(state, "GrammarAutomaton::accepting");
+    std::lock_guard<std::mutex> lock(mu_);
+    check_state_locked(state, "GrammarAutomaton::accepting");
     return accepting_[state] != 0;
 }
 
 bool GrammarAutomaton::can_continue(int32_t state) const {
-    check_state(state, "GrammarAutomaton::can_continue");
+    std::lock_guard<std::mutex> lock(mu_);
+    check_state_locked(state, "GrammarAutomaton::can_continue");
     return can_continue_[state] != 0;
 }
 
-const std::vector<uint32_t> *GrammarAutomaton::cached_mask(int32_t state, const void *owner) const {
+size_t GrammarAutomaton::state_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return states_.size();
+}
+
+size_t GrammarAutomaton::transition_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return transitions_.size();
+}
+
+std::shared_ptr<const std::vector<uint32_t>> GrammarAutomaton::cached_mask(int32_t state, const void *owner) const {
+    std::lock_guard<std::mutex> lock(mu_);
     STRIX_CHECK(mask_owner_ == nullptr || mask_owner_ == owner, "grammar automaton: masks were cached for another "
                 "vocabulary (one automaton serves one tokenizer)");
     const auto found = masks_.find(state);
-    return found == masks_.end() ? nullptr : &found->second;
+    return found == masks_.end() ? nullptr : found->second;
 }
 
-const std::vector<uint32_t> &GrammarAutomaton::store_mask(int32_t state, const void *owner, std::vector<uint32_t> mask) {
-    check_state(state, "GrammarAutomaton::store_mask");
+std::shared_ptr<const std::vector<uint32_t>> GrammarAutomaton::store_mask(int32_t state, const void *owner,
+                                                                         std::vector<uint32_t> mask) {
+    std::lock_guard<std::mutex> lock(mu_);
+    check_state_locked(state, "GrammarAutomaton::store_mask");
     STRIX_CHECK(owner != nullptr, "grammar automaton: a cached mask needs its vocabulary's identity (got null)");
     STRIX_CHECK(mask_owner_ == nullptr || mask_owner_ == owner, "grammar automaton: masks were cached for another "
                 "vocabulary (one automaton serves one tokenizer)");
     mask_owner_ = owner;
-    if (masks_.size() >= kMaxCachedMasks) masks_.clear();
-    return masks_[state] = std::move(mask);
+    if (masks_.size() >= kMaxCachedMasks) masks_.clear();  // shared_ptrs already handed out stay alive
+    const std::shared_ptr<const std::vector<uint32_t>> stored =
+        std::make_shared<const std::vector<uint32_t>>(std::move(mask));
+    masks_[state] = stored;
+    return stored;
+}
+
+size_t GrammarAutomaton::cached_mask_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return masks_.size();
 }
 
 }  // namespace strix::grammar

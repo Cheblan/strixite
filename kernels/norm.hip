@@ -1,6 +1,7 @@
 #include "kernels/norm.hpp"
 
 #include "common/hip_check.hpp"
+#include "kernels/device_info.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -103,6 +104,66 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// The GDN gate norm's shape (BF16, d = 128): a wave per row, kGatedRows rows a block, lane l holding elements
+// 4l .. 4l + 3 (one 8-byte load of x and of z, one 8-byte store). The block-per-row kernel above leaves half its 256
+// threads idle on a 128-wide row.
+// Bit-identical to it: the square sum follows that kernel's LDS tree order for d = 128 exactly (its threads 128..255
+// add zeros; then s = 64, 32, .., 1), here as P[i] = sq[i] + sq[i + 64] (lane l + 16), P[i] + P[i + 32] (lane l + 8),
+// then + 16, + 8, + 4 (lanes l + 4, + 2, + 1) and + 2, + 1 inside the lane. The squares use __fmul_rn so the compiler
+// can't fuse a square into the next add (the tree adds already-rounded squares; a BF16 value's square is exact in
+// FP32, so this only matters if the input type ever widens). Wave32 (gfx11) is checked on the host.
+constexpr int kGatedD = 128, kGatedRows = 8;
+
+__device__ inline float4 shfl_down4(float4 v, int s) {
+    return make_float4(__shfl_down(v.x, s, 32), __shfl_down(v.y, s, 32), __shfl_down(v.z, s, 32),
+                       __shfl_down(v.w, s, 32));
+}
+__device__ inline float4 add4(float4 a, float4 b) { return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
+
+__global__ void __launch_bounds__(kGatedRows * 32)
+    rmsnorm_gated_d128_kernel(const uint16_t *x, const uint16_t *z, const float *w, uint16_t *out, int64_t rows,
+                              float eps, bool sigmoid_gate, int64_t z_heads, int64_t z_ts) {
+    const int lane = (int)threadIdx.x % 32;
+    const int64_t row = (int64_t)blockIdx.x * kGatedRows + threadIdx.x / 32;
+    if (row >= rows) return;  // wave-uniform
+    const int64_t base = row * kGatedD + 4 * lane;
+    const int64_t zbase = (z_heads > 0 ? row / z_heads * z_ts + row % z_heads * kGatedD : row * kGatedD) + 4 * lane;
+    const uint2 xb = *reinterpret_cast<const uint2 *>(x + base), zb = *reinterpret_cast<const uint2 *>(z + zbase);
+    const float xv[4] = {__uint_as_float(xb.x << 16), __uint_as_float(xb.x & 0xffff0000u),
+                         __uint_as_float(xb.y << 16), __uint_as_float(xb.y & 0xffff0000u)};
+    float4 p = make_float4(__fmul_rn(xv[0], xv[0]), __fmul_rn(xv[1], xv[1]), __fmul_rn(xv[2], xv[2]),
+                           __fmul_rn(xv[3], xv[3]));
+    p = add4(p, shfl_down4(p, 16));  // i + 64: valid in lanes 0..15
+    p = add4(p, shfl_down4(p, 8));   // i + 32: lanes 0..7
+    p = add4(p, shfl_down4(p, 4));   // i + 16: lanes 0..3
+    p = add4(p, shfl_down4(p, 2));   // i + 8: lanes 0..1
+    p = add4(p, shfl_down4(p, 1));   // i + 4: lane 0
+    const float s2x = p.x + p.z, s2y = p.y + p.w;  // i + 2
+    const float total = __shfl(s2x + s2y, 0, 32);  // i + 1, broadcast
+    const float inv = 1.0f / sqrtf(total / (float)kGatedD + eps);
+    const float4 wv = *reinterpret_cast<const float4 *>(w + 4 * lane);
+    const float ww[4] = {wv.x, wv.y, wv.z, wv.w};
+    const float zv[4] = {__uint_as_float(zb.x << 16), __uint_as_float(zb.x & 0xffff0000u),
+                         __uint_as_float(zb.y << 16), __uint_as_float(zb.y & 0xffff0000u)};
+    uint16_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // the same per-element expression as rmsnorm_gated_kernel
+        const float n = round_act<uint16_t>(xv[i] * inv);
+        const float den = 1.0f + expf(-zv[i]);
+        o[i] = f32_to_bf16_bits((ww[i] * n) * (sigmoid_gate ? 1.0f / den : zv[i] / den));
+    }
+    *reinterpret_cast<uint2 *>(out + base) =
+        make_uint2((uint32_t)o[0] | ((uint32_t)o[1] << 16), (uint32_t)o[2] | ((uint32_t)o[3] << 16));
+}
+
+// The d128 kernel's preconditions; anything else runs rmsnorm_gated_kernel.
+bool gated_d128_fits(const void *x, const void *z, const float *w, const void *out, int64_t d, Act act, int64_t z_heads,
+                     int64_t z_ts) {
+    auto a = [](const void *p, uintptr_t n) { return reinterpret_cast<uintptr_t>(p) % n == 0; };
+    return act == Act::BF16 && d == kGatedD && a(x, 8) && a(z, 8) && a(out, 8) && a(w, 16) &&
+           (z_heads == 0 || z_ts % 4 == 0);
+}
+
 void check_common(const char *op, const void *x, const float *w, const void *out, int64_t rows, int64_t d, float eps) {
     STRIX_CHECK(x != nullptr && w != nullptr && out != nullptr, op, ": null pointer (x=", x, ", w=", w, ", out=", out,
                 ")");
@@ -158,6 +219,17 @@ void rmsnorm_gated(const void *x, const void *z, const float *w, void *out, int6
     STRIX_CHECK(gate == GateAct::SiLU || gate == GateAct::Sigmoid, "rmsnorm_gated: unknown gate activation ",
                 (int)gate);
     const bool sig = gate == GateAct::Sigmoid;
+    if (gated_d128_fits(x, z, w, out, d, act, z_heads, z_token_stride)) {
+        STRIX_CHECK(device_warp_size(kGatedRows * 32) == 32, "rmsnorm_gated: the d128 kernel needs wave32, the device "
+                    "runs wave", device_warp_size(kGatedRows * 32));
+        dim3 grid((unsigned)((rows + kGatedRows - 1) / kGatedRows)), block(kGatedRows * 32);
+        rmsnorm_gated_d128_kernel<<<grid, block, 0, stream>>>(static_cast<const uint16_t *>(x),
+                                                              static_cast<const uint16_t *>(z), w,
+                                                              static_cast<uint16_t *>(out), rows, eps, sig, z_heads,
+                                                              z_token_stride);
+        STRIX_HIP_CHECK_LAUNCH("rmsnorm_gated d128 ", gate_act_name(gate), " rows=", rows);
+        return;
+    }
     dim3 grid((unsigned)rows), block(kThreads);
     switch (act) {
         case Act::F32:

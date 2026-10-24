@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 namespace strix::kernels {
@@ -308,6 +309,9 @@ static_assert(kDW % 32 == 0 && 8 % kWWaves == 0, "wave split: whole 32-dim steps
 // rows a WMMA fragment load reads fall in distinct banks (a stride of 16 elements put rows l and l + 4 in one bank).
 constexpr int kTLd = 20;
 constexpr int kKeyChunk = 256;  // keys per position-table fill (a multiple of the 16-key tile)
+// The 8-bit K's deferred path (kDeferK) up to this many tokens a call: unstaged, gathered at 96k it is -4 .. -8% at
+// M = 16-48, flat at 64, +1% from 96 (where staging usually takes over anyway: kv8_stage_pays).
+constexpr int64_t kDeferKMaxTokens = 64;
 // A workgroup barrier that orders LDS only. __syncthreads' workgroup fence also waits for every global load the
 // wave has in flight (s_waitcnt vmcnt(0): in WGP mode a workgroup spans two CUs' L0 caches), so in the tile loop it
 // drained the next tile's K / V prefetch at every tile. The loop's waves share only LDS, so LDS ordering suffices.
@@ -316,9 +320,18 @@ __device__ __forceinline__ void lds_barrier() {
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
-// One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied.
-template <bool GATHER, bool One, typename R>
-__global__ void __launch_bounds__(kWWaves * 32)
+// x from lane ^ M of the same 16-lane row (M < 16): a DPP row_xmask move, one VALU op. __shfl_xor compiles to
+// ds_bpermute, an LDS-crossbar trip - 16 of them a tile in the softmax's row reductions. The same values in the
+// same order, so the reductions are bit-identical.
+template <int M>
+__device__ __forceinline__ float row_xor(float x) {
+    static_assert(M > 0 && M < 16, "row_xor: a lane mask within one 16-lane row");
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x160 + M, 0xf, 0xf, false));
+}
+// One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied. Defer: kDeferK below
+// (wmma_attention_launch picks it by the call's size).
+template <bool GATHER, bool One, bool Defer, typename R>
+__global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_eu(7)))
     attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, R kv, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
                                   float *ws, int64_t splits, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
                                   uint32_t *err) {
@@ -327,6 +340,15 @@ __global__ void __launch_bounds__(kWWaves * 32)
     __shared__ __attribute__((aligned(16))) uint16_t ps[2][16 * kTLd];  // P hi, lo [row][key] (shared)
     __shared__ float s_alpha[16];                                        // this tile's rescale factor per row
     __shared__ int32_t kpos[kKeyChunk];  // positions of the current chunk's keys (GATHER), resolved once
+    // 8-bit K through Kv8Reader (kDeferK): a tile's K loads only raw codes (or a BF16 exact row) a tile ahead, and its
+    // per-channel params once per 4-key quad into this wave's slot here; the F16 values are made at use. Loading 8
+    // param words per 8 values per lane, unpacked at once, made the 8-bit attention ~25% slower than BF16 at verify
+    // sizes; either load stream alone ran at BF16's speed.
+    constexpr bool kDeferK = Defer && R::kKF16 && !R::kStaged;
+    // The params' slot is the wave's own S-partials row, sp[w] (1 KB = 4 quads x kDW words): at a tile's start every
+    // wave has read sp in the last softmax (before the barrier that completes P), and this wave writes its partials
+    // only after its K is made. A separate 4 KB array put the block at 20.8 KB of LDS: 6 blocks a WGP, not 7.
+    static_assert(sizeof(sp[0]) == 4 * kDW * sizeof(uint32_t), "kDeferK: the params' slot is one wave's sp row");
     const int G = (int)(Hq / Hk), lane = (int)threadIdx.x % 32, w = (int)threadIdx.x / 32, col = lane % 16,
               half = lane / 16, d_w = w * kDW;
     const int64_t sp_i = blockIdx.x, kh = blockIdx.y, t = blockIdx.z, pos = pos0 + t;
@@ -352,8 +374,10 @@ __global__ void __launch_bounds__(kWWaves * 32)
         }
         return b * kQsaTokens + j % kQsaTokens;
     };
-    // This wave's Q fragments (its kDW dims; row col = query head kh G + col, zero past G), kept in registers.
-    wmma_bf16x16 qf[kDW / 16];
+    // This wave's Q fragments (its kDW dims; row col = query head kh G + col, zero past G), kept in registers. Over
+    // the 8-bit cache (R::kKF16) the scores run in F16 - q converted here once, K read as F16 (kv8_math::f16x2).
+    using QFrag = std::conditional_t<R::kKF16, wmma_f16x16, wmma_bf16x16>;
+    QFrag qf[kDW / 16];
 #pragma unroll
     for (int i = 0; i < kDW / 16; ++i) {
         uint4 a0 = make_uint4(0, 0, 0, 0), a1 = a0;
@@ -361,8 +385,9 @@ __global__ void __launch_bounds__(kWWaves * 32)
             const uint16_t *qr = q + t * q_ts + (kh * G + col) * q_hs + d_w + 16 * i;
             a0 = *reinterpret_cast<const uint4 *>(qr), a1 = *reinterpret_cast<const uint4 *>(qr + 8);
         }
+        if constexpr (R::kKF16) a0 = kv8_math::bf16_to_f16x8(a0), a1 = kv8_math::bf16_to_f16x8(a1);
         const wmma_u32x8 u = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-        qf[i] = __builtin_bit_cast(wmma_bf16x16, u);
+        qf[i] = __builtin_bit_cast(QFrag, u);
     }
     const int64_t kb = sp_i * kps, ke = min(n_keys, kb + kps);
     // The softmax is split by rows: wave w owns elements v = kEPW w + e (rows 2v, 2v + 1) - their m, l and P.
@@ -373,23 +398,75 @@ __global__ void __launch_bounds__(kWWaves * 32)
 #pragma unroll
     for (int j = 0; j < kDW / 16; ++j) o[j] = wmma_f32x8{};
     uint16_t *vtw = vt[w], *ph = ps[0], *pl = ps[1];
-    // A key's position: through the chunk table (GATHER) or the key index itself.
-    auto kpos_of = [&](int64_t j) -> int64_t { return GATHER ? (int64_t)kpos[(j - kb) % kKeyChunk] : j; };
+    // The tile loop's key indices and positions in 32 bits (positions < kMaxPos = 2^24, check_shape): 64-bit
+    // compares and adds were ~20 of a tile's ~217 non-WMMA VALU instructions.
+    const int32_t kb32 = (int32_t)kb, ke32 = (int32_t)ke, pos32 = (int32_t)pos, g032 = (int32_t)g0q;
+    // A key's position: through the chunk table (GATHER) or the key index itself. j >= kb, so the unsigned slot is
+    // the same one - a mask, where the signed 64-bit modulo took ~8 instructions.
+    auto kpos_of = [&](int32_t j) -> int32_t { return GATHER ? kpos[(uint32_t)(j - kb32) % kKeyChunk] : j; };
     auto fill_table = [&](int64_t j0) {  // positions of keys [j0, j0 + kKeyChunk) - all threads, caller syncs
         for (int64_t j = j0 + threadIdx.x; j < min(ke, j0 + kKeyChunk); j += kWWaves * 32)
-            kpos[(j - kb) % kKeyChunk] = (int32_t)key_pos(j);
+            kpos[(uint32_t)(j - kb) % kKeyChunk] = (int32_t)key_pos(j);
     };
     // Software-pipelined: tile k0 + 16's K rows (this lane's key column, the wave's dims) and V chunks (keys 2 kp2,
     // 2 kp2 + 1 of the lane's dim group) are loaded into registers while tile k0 computes.
     const int kp2 = lane % 8, grp = lane / 8;
     constexpr int kKLoads = kDW / 8, kVLoads = kDW / 32;  // 16-byte loads per lane per tile
     uint4 kr[kKLoads], va_r[kVLoads], vb_r[kVLoads];
-    auto load_tile = [&](int64_t t0) {
-        const int64_t krow = t0 + col < ke ? kpos_of(t0 + col) : pos, c0 = kh * kD + d_w;
+    uint4 kpf0 = make_uint4(0, 0, 0, 0), kpf1 = kpf0;  // kDeferK: this lane's 8 param words of the next tile
+    bool kx = false;                                  // kDeferK: this lane's next K row is exact (kr holds BF16)
+    auto load_tile = [&](int32_t t0) {
+        const int32_t krow = t0 + col < ke32 ? kpos_of(t0 + col) : pos32;
+        const int32_t ka = t0 + 2 * kp2, kb2 = ka + 1;
+        const int64_t c0 = kh * kD + d_w;
+        // A staged reader's split of the keys: a tile whose 16 keys all exist and lie below g0q (the dequantized
+        // range - every tile but the last one or two with ascending selections) loads them straight from the staged
+        // copy, one test per tile instead of one per load. The ballot covers the V keys too: the K lanes' columns
+        // are the tile's 16 keys, which ka, kb2 also range over. Bit-identical to the per-load reader.
+        if constexpr (R::kStaged) {
+            if (__builtin_amdgcn_ballot_w32(t0 + col >= ke32 || krow >= g032) == 0u) {
+                // 32-bit byte offsets (StagedReader::ks_at): rows < staged_rows, the copy under 4 GiB (check_kv).
+                const uint32_t rb = kv.row_bytes(), cb = (uint32_t)c0 * 2u;
+                const uint32_t ko = (uint32_t)krow * rb + cb;
 #pragma unroll
-        for (int i = 0; i < kKLoads; ++i) kr[i] = kv.k(krow, c0 + 8 * i, g0q);
-        const int64_t ka = t0 + 2 * kp2, kb2 = ka + 1;
-        const int64_t ra = ka < ke ? kpos_of(ka) : -1, rb2 = kb2 < ke ? kpos_of(kb2) : -1;
+                for (int i = 0; i < kKLoads; ++i) kr[i] = kv.ks_at(ko + 16u * (uint32_t)i);
+                const uint32_t vao = (uint32_t)kpos_of(ka) * rb + cb + (uint32_t)grp * 16u,
+                               vbo = (uint32_t)kpos_of(kb2) * rb + cb + (uint32_t)grp * 16u;
+#pragma unroll
+                for (int i = 0; i < kVLoads; ++i) va_r[i] = kv.vs_at(vao + 64u * (uint32_t)i), vb_r[i] = kv.vs_at(vbo + 64u * (uint32_t)i);
+                return;
+            }
+        }
+        if constexpr (kDeferK) {
+            // Codes raw, or the exact BF16 row (a key past ke reads the call's own row, exact; its S is masked).
+            kx = t0 + col >= ke32 || krow >= g032;
+#pragma unroll
+            for (int i = 0; i < kKLoads; ++i) {
+                if (kx) {
+                    kr[i] = kv.kexact(krow, c0 + 8 * i);
+                } else {
+                    const uint2 u = kv.kcodes(krow, c0 + 8 * i);
+                    kr[i] = make_uint4(u.x, u.y, 0u, 0u);
+                }
+            }
+            // The tile's params: quad lane / 8 (keys t0 + 4 q .. + 3), dims c0 + 8 (lane % 8) .. + 7. A quad's keys are
+            // 4 consecutive positions from a multiple of 4 (tiles, QSA blocks and the gathered tail all start on one),
+            // so they share a K group (kKv8Group = 32); a quad past ke or exact loads none.
+            const int32_t jq = t0 + 4 * (lane / 8), prow = jq < ke32 ? kpos_of(jq) : g032;
+            if (prow < g032) {
+                const uint4 *pp = reinterpret_cast<const uint4 *>(kv.kparams(prow, c0 + 8 * (lane % 8)));
+                kpf0 = pp[0], kpf1 = pp[1];
+            } else {
+                kpf0 = kpf1 = make_uint4(0, 0, 0, 0);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < kKLoads; ++i) {
+                if constexpr (R::kKF16) kr[i] = kv.k16(krow, c0 + 8 * i, g0q);
+                else kr[i] = kv.k(krow, c0 + 8 * i, g0q);
+            }
+        }
+        const int32_t ra = ka < ke32 ? kpos_of(ka) : -1, rb2 = kb2 < ke32 ? kpos_of(kb2) : -1;
 #pragma unroll
         for (int i = 0; i < kVLoads; ++i) {
             const int c = grp * 8 + 32 * i;
@@ -399,9 +476,26 @@ __global__ void __launch_bounds__(kWWaves * 32)
     };
     if (GATHER && kb < ke) fill_table(kb);
     __syncthreads();  // the first key table staged
-    if (kb < ke) load_tile(kb);
-    for (int64_t k0 = kb; k0 < ke; k0 += 16) {
-        const bool valid = k0 + col < ke;
+    if (kb < ke) load_tile(kb32);
+    for (int32_t k0 = kb32; k0 < ke32; k0 += 16) {
+        const bool valid = k0 + col < ke32;
+        if constexpr (kDeferK) {
+            // This tile's K as F16 (Kv8Reader::k16_from - k16 bit for bit): params into the wave's LDS slot, then each
+            // lane its quad's words; the fence orders the reads before this wave's partials overwrite the slot.
+            uint32_t *kpl = reinterpret_cast<uint32_t *>(&sp[w][0][0]);
+            uint4 *dst = reinterpret_cast<uint4 *>(kpl + (lane / 8) * kDW + 8 * (lane % 8));
+            dst[0] = kpf0, dst[1] = kpf1;
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+            const uint32_t *pq = kpl + (col / 4) * kDW;
+#pragma unroll
+            for (int i = 0; i < kKLoads; ++i)
+                kr[i] = kx ? kv8_math::bf16_to_f16x8(kr[i]) : R::k16_from(make_uint2(kr[i].x, kr[i].y), pq + 8 * i);
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+        }
         // This wave's part of S from the loaded K rows: its kDW dims, as two independent accumulation chains.
         wmma_f32x8 s0 = {}, s1 = {};
 #pragma unroll
@@ -410,12 +504,19 @@ __global__ void __launch_bounds__(kWWaves * 32)
             const wmma_u32x8 bu0 = {kr[i0].x, kr[i0].y, kr[i0].z, kr[i0].w, kr[i0 + 1].x, kr[i0 + 1].y, kr[i0 + 1].z, kr[i0 + 1].w};
             const wmma_u32x8 bu1 = {kr[i0 + 2].x, kr[i0 + 2].y, kr[i0 + 2].z, kr[i0 + 2].w,
                                     kr[i0 + 3].x, kr[i0 + 3].y, kr[i0 + 3].z, kr[i0 + 3].w};
-            s0 = wmma_bf16(qf[d0 / 16], __builtin_bit_cast(wmma_bf16x16, bu0), s0);
-            s1 = wmma_bf16(qf[d0 / 16 + 1], __builtin_bit_cast(wmma_bf16x16, bu1), s1);
+            if constexpr (R::kKF16) {
+                s0 = wmma_f16(qf[d0 / 16], __builtin_bit_cast(wmma_f16x16, bu0), s0);
+                s1 = wmma_f16(qf[d0 / 16 + 1], __builtin_bit_cast(wmma_f16x16, bu1), s1);
+            } else {
+                s0 = wmma_bf16(qf[d0 / 16], __builtin_bit_cast(wmma_bf16x16, bu0), s0);
+                s1 = wmma_bf16(qf[d0 / 16 + 1], __builtin_bit_cast(wmma_bf16x16, bu1), s1);
+            }
         }
 #pragma unroll
         for (int v = 0; v < 8; ++v) sp[w][v][lane] = s0[v] + s1[v];
-        // V transposed, the wave's dims: each dim's pair of keys (2 kp2, 2 kp2 + 1) as one 32-bit word.
+        // V transposed, the wave's dims: each dim's pair of keys (2 kp2, 2 kp2 + 1) as one 32-bit word - one byte
+        // permute each (v_perm_b32: bytes 0-3 of the second operand, 4-7 of the first), where the shift + and-or pair
+        // took two VALU ops: (a & 0xffff) | (b << 16) and (a >> 16) | (b & 0xffff0000).
         {
             uint32_t *vt32 = reinterpret_cast<uint32_t *>(vtw);
 #pragma unroll
@@ -425,16 +526,16 @@ __global__ void __launch_bounds__(kWWaves * 32)
                 const uint32_t bw[4] = {vb_r[ci].x, vb_r[ci].y, vb_r[ci].z, vb_r[ci].w};
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    vt32[((c + 2 * i) * kTLd + 2 * kp2) / 2] = (aw[i] & 0xffffu) | (bw[i] << 16);
-                    vt32[((c + 2 * i + 1) * kTLd + 2 * kp2) / 2] = (aw[i] >> 16) | (bw[i] & 0xffff0000u);
+                    vt32[((c + 2 * i) * kTLd + 2 * kp2) / 2] = __builtin_amdgcn_perm(bw[i], aw[i], 0x05040100u);
+                    vt32[((c + 2 * i + 1) * kTLd + 2 * kp2) / 2] = __builtin_amdgcn_perm(bw[i], aw[i], 0x07060302u);
                 }
             }
         }
         // The next tile's rows into the same registers: in flight during this tile's softmax and P * V. (No barrier
         // before a table refill: the previous tile's table reads happened before its second barrier.)
-        const int64_t k1 = k0 + 16;
-        if (k1 < ke) {
-            if (GATHER && (k1 - kb) % kKeyChunk == 0) {
+        const int32_t k1 = k0 + 16;
+        if (k1 < ke32) {
+            if (GATHER && (uint32_t)(k1 - kb32) % kKeyChunk == 0) {
                 fill_table(k1);
                 lds_barrier();
             }
@@ -451,14 +552,16 @@ __global__ void __launch_bounds__(kWWaves * 32)
             for (int u = 1; u < kWWaves; ++u) sfull += sp[u][v][lane];
             const float sv = valid ? sfull * scale : -INFINITY;
             float mx = sv;
-#pragma unroll
-            for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+            mx = fmaxf(mx, row_xor<1>(mx)), mx = fmaxf(mx, row_xor<2>(mx)), mx = fmaxf(mx, row_xor<4>(mx)),
+            mx = fmaxf(mx, row_xor<8>(mx));
             const float m_new = fmaxf(m[e], mx);
-            const float alpha = expf(m[e] - m_new);  // m = -inf on the first tile: 0
+            // m = -inf on the first tile: 0. An unmoved max gives expf(0) = 1 exactly, so the (12-instruction) exp
+            // runs only on lanes whose max moved - none, on most tiles once the max settles.
+            float alpha = 1.f;
+            if (m_new != m[e]) alpha = expf(m[e] - m_new);
             const float p = valid ? expf(sv - m_new) : 0.f;
             float sum = p;
-#pragma unroll
-            for (int off = 1; off < 16; off <<= 1) sum += __shfl_xor(sum, off, 32);
+            sum += row_xor<1>(sum), sum += row_xor<2>(sum), sum += row_xor<4>(sum), sum += row_xor<8>(sum);
             l[e] = l[e] * alpha + sum;
             m[e] = m_new;
             const uint32_t hb = __float_as_uint(p);
@@ -470,11 +573,17 @@ __global__ void __launch_bounds__(kWWaves * 32)
             if (col == 0) s_alpha[r] = alpha;
         }
         lds_barrier();  // P and the rescale factors complete
+        // The rescale only when some row's max moved: a factor of exactly 1 leaves O bit for bit (x * 1.0f == x, NaN
+        // and -0 included), and after the first tiles most tiles move no row's max.
+        float alpha[8];
+        bool moved = false;
 #pragma unroll
-        for (int v = 0; v < 8; ++v) {
-            const float alpha = s_alpha[2 * v + half];
+        for (int v = 0; v < 8; ++v) alpha[v] = s_alpha[2 * v + half], moved |= alpha[v] != 1.f;
+        if (__builtin_amdgcn_ballot_w32(moved) != 0u) {
 #pragma unroll
-            for (int j = 0; j < kDW / 16; ++j) o[j][v] *= alpha;
+            for (int v = 0; v < 8; ++v)
+#pragma unroll
+                for (int j = 0; j < kDW / 16; ++j) o[j][v] *= alpha[v];
         }
         const wmma_bf16x16 a_hi = wmma_load_rows(ph, kTLd);
         wmma_bf16x16 a_lo{};
@@ -696,6 +805,8 @@ void check_kv(const char *fn, const KvArg &kv, int64_t capacity, const Attention
     STRIX_CHECK(x.capacity % kKv8Group == 0 && x.capacity >= s.pos0 + s.T, fn, ": 8-bit K/V capacity ", x.capacity,
                 ", expected a multiple of ", kKv8Group, " >= pos0 + T = ", s.pos0 + s.T);
     STRIX_CHECK(x.pos0 == s.pos0, fn, ": 8-bit K/V view is for a call at ", x.pos0, ", the shape's pos0 is ", s.pos0);
+    STRIX_CHECK(x.capacity * x.W <= (int64_t)UINT32_MAX, fn, ": 8-bit K/V capacity ", x.capacity, " rows of ", x.W,
+                " values - over 2^32 codes, past the readers' 32-bit offsets (kv8_math::Kv8Reader)");
     STRIX_CHECK(x.new_ts >= x.W && x.new_ts % 8 == 0, fn, ": 8-bit K/V new-row stride ", x.new_ts,
                 ", expected >= W = ", x.W, " and a multiple of 8 (16-byte rows)");
     if (x.staged_k || x.staged_v || x.staged_rows) {
@@ -706,15 +817,28 @@ void check_kv(const char *fn, const KvArg &kv, int64_t capacity, const Attention
                     ") must be 16-byte aligned");
         STRIX_CHECK(x.staged_rows >= need && x.staged_rows <= x.capacity, fn, ": 8-bit K/V view stages ",
                     x.staged_rows, " rows, the call's last query needs ", need, " (capacity ", x.capacity, ")");
+        // The WMMA kernel's staged loads take 32-bit byte offsets (StagedReader::ks_at); FP32 is the widest dtype.
+        STRIX_CHECK(x.staged_rows * x.W * 4 <= (int64_t)UINT32_MAX, fn, ": 8-bit K/V view stages ", x.staged_rows,
+                    " rows of ", x.W, " values - over 4 GiB a copy, past the kernels' 32-bit offsets");
     }
 }
 
-// Calls f(reader) with the reader type for kv and the element type T.
-template <typename T, typename F>
+// Calls f(reader) with the reader type for kv and the element type T. Staged: the WMMA kernel's staged view (F16 K,
+// kv8_math::StagedReader); the vector kernels refuse one (refuse_staged), so they never instantiate it.
+template <typename T, bool Staged, typename F>
 void with_reader(const KvArg &kv, int64_t W, F &&f) {
-    if (kv.q8 && kv.q8->staged_k) f(kv8_math::StagedReader<T>(*kv.q8));
-    else if (kv.q8) f(kv8_math::Kv8Reader<T>(*kv.q8));
+    if constexpr (Staged) {
+        if (kv.q8 && kv.q8->staged_k) return f(kv8_math::StagedReader<T>(*kv.q8));
+    }
+    if (kv.q8) f(kv8_math::Kv8Reader<T>(*kv.q8));
     else f(kv8_math::PlainReader<T>{static_cast<const T *>(kv.k), static_cast<const T *>(kv.v), W});
+}
+
+// The staged copy holds K in F16 for the WMMA kernel's F16 scores (kv8_dequant k_f16); the vector kernels read BF16.
+void refuse_staged(const char *fn, const KvArg &kv) {
+    STRIX_CHECK(!(kv.q8 && (kv.q8->staged_k || kv.q8->staged_v || kv.q8->staged_rows)), fn,
+                ": an 8-bit K/V view with a staged copy (staged_rows ", kv.q8 ? kv.q8->staged_rows : 0,
+                ") - staging is the WMMA attention's (F16 K); the vector kernel reads the 8-bit rows itself");
 }
 
 int wave_size(const char *fn) {
@@ -735,6 +859,7 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
                 ", gate=", gate, ", out=", out, ", ws=", (const void *)workspace, ")");
     check_shape(s);
     check_kv(fn, kv, capacity, s);
+    refuse_staged(fn, kv);
     STRIX_CHECK(std::isfinite(scale) && scale > 0, fn, ": scale = ", scale);
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
     const size_t need = attention_workspace_bytes(s);
@@ -745,7 +870,7 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
     if (act == Act::F32) {
-        with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
+        with_reader<float, false>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<float, false><<<grid, block, q_lds, stream>>>(
                 static_cast<const float *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits,
                 nullptr, nullptr, 0, nullptr);
@@ -753,7 +878,7 @@ void attention_impl(const void *q, const void *gate, const KvArg &kv, int64_t ca
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
                                                                       s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
     } else {
-        with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+        with_reader<uint16_t, false>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<uint16_t, false><<<grid, block, q_lds, stream>>>(
                 static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace,
                 splits, nullptr, nullptr, 0, nullptr);
@@ -808,6 +933,7 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
                 (const void *)sel, ", nsel=", (const void *)nsel, ", err=", (const void *)err, ")");
     check_shape(s);
     check_kv(fn, kv, capacity, s);
+    refuse_staged(fn, kv);
     STRIX_CHECK(std::isfinite(scale) && scale > 0, fn, ": scale = ", scale);
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
     const size_t need = attention_gathered_workspace_bytes(s, sel_ld);
@@ -818,7 +944,7 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const size_t q_lds = (size_t)(s.Hq / s.Hk) * kD * 4;
     if (act == Act::F32) {
-        with_reader<float>(kv, s.Hk * kD, [&](auto rd) {
+        with_reader<float, false>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<float, true><<<grid, block, q_lds, stream>>>(
                 static_cast<const float *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits,
                 sel, nsel, sel_ld, err);
@@ -826,7 +952,7 @@ void attention_gathered_impl(const void *q, const void *gate, const KvArg &kv, i
         attention_combine_kernel<float><<<cgrid, cblock, 0, stream>>>(workspace, splits, static_cast<const float *>(gate),
                                                                       s.q_ts, s.q_hs, s.Hq, static_cast<float *>(out));
     } else {
-        with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+        with_reader<uint16_t, false>(kv, s.Hk * kD, [&](auto rd) {
             attention_partial_kernel<uint16_t, true><<<grid, block, q_lds, stream>>>(
                 static_cast<const uint16_t *>(q), s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace,
                 splits, sel, nsel, sel_ld, err);
@@ -878,20 +1004,27 @@ void wmma_attention_launch(bool gather, const void *q, const void *gate, const K
     const auto *qb = static_cast<const uint16_t *>(q);
     STRIX_CHECK(precision == AttnPrecision::Exact || precision == AttnPrecision::Fast,
                 "attention (WMMA): unknown precision ", (int)precision);
-    with_reader<uint16_t>(kv, s.Hk * kD, [&](auto rd) {
+    const bool defer = s.T <= kDeferKMaxTokens;
+    with_reader<uint16_t, true>(kv, s.Hk * kD, [&](auto rd) {
         using R = decltype(rd);
-        auto partial = [&](auto one) {
-            constexpr bool One = decltype(one)::value;
+        auto partial = [&](auto one, auto def) {
+            constexpr bool One = decltype(one)::value, Defer = decltype(def)::value;
             if (gather)
-                attention_partial_wmma_kernel<true, One, R><<<grid, block, 0, stream>>>(
+                attention_partial_wmma_kernel<true, One, Defer, R><<<grid, block, 0, stream>>>(
                     qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld, err);
             else
-                attention_partial_wmma_kernel<false, One, R><<<grid, block, 0, stream>>>(
+                attention_partial_wmma_kernel<false, One, Defer, R><<<grid, block, 0, stream>>>(
                     qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
                     nullptr);
         };
-        if (precision == AttnPrecision::Fast) partial(std::true_type{});
-        else partial(std::false_type{});
+        auto with_defer = [&](auto one) {
+            if constexpr (R::kKF16 && !R::kStaged) {
+                if (defer) return partial(one, std::true_type{});
+            }
+            partial(one, std::false_type{});
+        };
+        if (precision == AttnPrecision::Fast) with_defer(std::true_type{});
+        else with_defer(std::false_type{});
     });
     attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
                                                                      static_cast<const uint16_t *>(gate), s.q_ts,

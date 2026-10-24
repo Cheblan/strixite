@@ -32,8 +32,10 @@
 
 #include "common/hip_runtime.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace strix::kernels {
 
@@ -44,6 +46,10 @@ constexpr int64_t kv8_exact_from(int64_t p) { return (p + 1) / kKv8Group * kKv8G
 
 // Bytes of one layer's 8-bit storage (no tail) for capacity rows of W values.
 size_t kv8_bytes(int64_t capacity, int64_t W);
+// The byte ranges {offset, bytes} of one layer's storage (kv8_bytes layout) that rows [0, rows) occupy - K codes, K
+// params, V codes, V params - for paged storage that maps only what is used. rows: a multiple of kKv8Group, at most
+// capacity.
+std::array<std::pair<size_t, size_t>, 4> kv8_used_ranges(int64_t capacity, int64_t W, int64_t rows);
 // Bytes of one tail buffer: [2][kKv8Group][W] in the activation dtype.
 size_t kv8_tail_bytes(int64_t W, Act act);
 
@@ -79,8 +85,9 @@ void kv8_commit(const void *k_new, const void *v_new, int64_t new_ts, int64_t T,
 void report_kv8_error(const uint32_t e[3], const char *what);
 
 // Dequantize rows [r0, r1) (all below a view's g0) into dst [r1 - r0][W] K and V halves: dst_k / dst_v in the
-// activation dtype, rows W apart. For tests and the prefill staging path.
+// activation dtype, rows W apart. k_f16 (BF16 activations only): K in F16 instead - the WMMA attention's staged copy
+// (Kv8View::staged_k, kv8_math::StagedReader), rounded as its unstaged reader rounds. For tests and that staging.
 void kv8_dequant(const uint8_t *store, int64_t capacity, int64_t W, int64_t r0, int64_t r1, void *dst_k, void *dst_v,
-                 Act act, hipStream_t stream);
+                 Act act, bool k_f16, hipStream_t stream);
 
 }  // namespace strix::kernels

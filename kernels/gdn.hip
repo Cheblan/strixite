@@ -606,8 +606,11 @@ __global__ void __launch_bounds__(kWgWaves * 32)
 #pragma unroll
                 for (int e = 0; e < 16; ++e) {
                     const int d = part * 16 + e;
-                    wg_split<One, F16>(qv[e] * iq, Qh[r * kWgLd + d], Ql[r * kWgLd + d]);
-                    wg_split<kQKlo ? false : true, F16>(kv[e] * ik, Kh[r * kWgLd + d], Kl[r * kWgLd + d]);
+                    // Without the lo halves (!kQKlo, so One) Ql / Kl are 8-element stubs, never written: bind [0]
+                    // rather than a reference past their end.
+                    const int dl = kQKlo ? r * kWgLd + d : 0;
+                    wg_split<One, F16>(qv[e] * iq, Qh[r * kWgLd + d], Ql[dl]);
+                    wg_split<kQKlo ? false : true, F16>(kv[e] * ik, Kh[r * kWgLd + d], Kl[dl]);
                 }
             }
         }

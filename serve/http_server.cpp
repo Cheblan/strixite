@@ -82,7 +82,7 @@ void send_error(httplib::Response &res, int status, const std::string &msg, cons
 // A request answered with an error before reaching the engine (no block - one line): 4xx the client's (warning),
 // 5xx the server's (error).
 void log_error(int64_t id, const httplib::Request &req, int status, const std::string &msg) {
-    slog(status >= 500 ? LogLevel::Error : LogLevel::Warning, "Request %lld rejected: %s %s from %s: %d - %s", (long long)id,
+    slog(status >= 500 ? LogLevel::Error : LogLevel::Warning, "Request %lld failed: %s %s from %s: %d - %s", (long long)id,
          req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), status, msg.c_str());
     slog(LogLevel::Info, "\xc2\xa0");  // a blank line after each request
 }
@@ -105,13 +105,39 @@ std::string max_tokens_text(const std::optional<int64_t> &asked, int64_t granted
     return fmt_n(granted);
 }
 
+// The sampling row: the values the request decodes with, and which of them it set itself (the rest are the server's
+// defaults: generation_config.json or the conf) - so a report of odd output says what the client sent.
+std::string sampling_text(const SamplingParams &s, bool seeded, const std::vector<std::string> &asked) {
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "temperature %g, top_p %g, top_k %lld", s.temperature, s.top_p, (long long)s.top_k);
+    std::string out = buf;
+    if (seeded) out += ", seed " + std::to_string(s.seed);
+    if (asked.empty()) return out + " (none asked: server defaults)";
+    std::string names;
+    for (const std::string &a : asked) names += (names.empty() ? "" : ", ") + a;
+    return out + " (asked: " + names + ")";
+}
+
 }  // namespace
 
 HttpServer::HttpServer(Engine &engine, const Tokenizer &tok, ServerConfig cfg)
     : engine_(engine), tok_(tok), cfg_(std::move(cfg)), started_(unix_now()), svr_(std::make_unique<httplib::Server>()) {
     STRIX_CHECK(cfg_.port >= 0 && cfg_.port <= 65535, "HttpServer: port ", cfg_.port);
     STRIX_CHECK(cfg_.keepalive_s > 0, "HttpServer: keepalive_s ", cfg_.keepalive_s);
+    STRIX_CHECK(cfg_.request_read_timeout_s >= 1 && cfg_.request_read_timeout_s <= 3600,
+                "HttpServer: request_read_timeout_s ", cfg_.request_read_timeout_s, ", expected 1..3600");
+    // The sampling defaults (generation_config.json) seed every request that doesn't set them: a bad one fails
+    // startup here, naming it, instead of every such request in the Sampler.
+    try {
+        Sampler probe(cfg_.defaults, 1);
+    } catch (const std::exception &e) {
+        STRIX_CHECK(false, "HttpServer: the sampling defaults (temperature ", cfg_.defaults.temperature, ", top_k ",
+                    cfg_.defaults.top_k, ", top_p ", cfg_.defaults.top_p, ") are invalid: ", e.what());
+    }
     svr_->set_payload_max_length(cfg_.max_body_bytes);
+    // The default 5 s is httplib's, sized for local APIs: a multi-MB history over a weak Wi-Fi uplink can pause
+    // longer than that mid-body (strixite #15).
+    svr_->set_read_timeout(cfg_.request_read_timeout_s, 0);
     routes();
 }
 
@@ -288,6 +314,7 @@ void HttpServer::routes() {
                                                        : thinking_defaulted_off ? "off (server default)"
                                                                               : "off"));
             gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
+            gen.log_header.emplace_back("sampling", sampling_text(cr.sampling, cr.seeded, cr.sampling_asked));
             if (!format_row.empty()) gen.log_header.emplace_back("format", format_row);
             if (!vision_note.empty()) gen.log_header.emplace_back("vision", vision_note);
         }
@@ -453,6 +480,7 @@ void HttpServer::routes() {
         gen.log_header = header_rows(req, cr.stream, cr.model);
         gen.log_header.emplace_back("prompt", fmt_n((long long)gen.prompt.size()) + " tokens, raw completion (no chat template)");
         gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
+        gen.log_header.emplace_back("sampling", sampling_text(cr.sampling, cr.seeded, cr.sampling_asked));
         gen.id = id, gen.stream = cr.stream;
         gen.one_shot = true;  // a raw prompt: its cache entries stay in RAM (benchmarks send many unique ones)
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();
@@ -571,6 +599,18 @@ void HttpServer::routes() {
         b.set("queued", json::Value::integer(s.queued));
         b.set("idle_seconds", json::Value::number(s.idle_seconds));
         b.set("live_tokens", json::Value::integer(s.live_tokens));
+        // Slots (total-slots): each one's running request (0: idle) and the tokens its state holds.
+        b.set("slots", json::Value::integer(s.slots));
+        b.set("busy_slots", json::Value::integer(s.busy));
+        json::Value per = json::Value::array();
+        for (size_t k = 0; k < s.slot_request.size(); ++k) {
+            json::Value o = json::Value::object();
+            o.set("request", json::Value::integer(s.slot_request[k]));
+            o.set("live_tokens", json::Value::integer(k < s.slot_live_tokens.size() ? s.slot_live_tokens[k] : 0));
+            o.set("snapshot_pos", json::Value::integer(k < s.slot_snapshot_pos.size() ? s.slot_snapshot_pos[k] : -1));
+            per.push(std::move(o));
+        }
+        b.set("slot_states", std::move(per));
         res.set_content(b.dump(), "application/json");
     });
 
@@ -581,7 +621,9 @@ void HttpServer::routes() {
         b.set("misses", json::Value::integer(s.cache_misses));
         b.set("prompt_tokens_saved", json::Value::integer(s.cached_tokens));
         b.set("live_tokens", json::Value::integer(s.live_tokens));
-        b.set("snapshot_pos", json::Value::integer(s.snapshot_pos));
+        json::Value snaps = json::Value::array();  // per slot (-1: none)
+        for (int64_t v : s.slot_snapshot_pos) snaps.push(json::Value::integer(v));
+        b.set("snapshot_pos", std::move(snaps));
         b.set("disk_hits", json::Value::integer(s.disk_hits));
         b.set("disk_tokens_saved", json::Value::integer(s.disk_tokens));
         if (const PromptCache *pc = engine_.prompt_cache()) {
@@ -695,11 +737,15 @@ void HttpServer::routes() {
         metric("strix_last_prefill_tokens_per_second", "gauge", "Prefill rate of the last request.", s.last_prefill_tps);
         metric("strix_last_decode_tokens_per_second", "gauge", "Decode rate of the last request.", s.last_decode_tps);
         metric("strix_queue_depth", "gauge", "Requests waiting.", (double)s.queued);
-        metric("strix_busy", "gauge", "1 while a request runs.", (double)s.busy);
+        metric("strix_busy", "gauge", "Requests running (0..strix_slots).", (double)s.busy);
+        metric("strix_slots", "gauge", "Conversations served at once (total-slots).", (double)s.slots);
+        metric("strix_verify_batches_total", "counter", "Batched MTP verifies across slots.", (double)s.verify_batches);
+        metric("strix_verify_batch_runs_total", "counter",
+               "Slots' runs in those batched verifies (/ batches = runs per batched forward).", (double)s.verify_batch_runs);
         metric("strix_idle_seconds", "gauge",
                "Seconds since the last request finished; 0 while one runs or waits. Batch clients: wait for a gap here.",
                s.idle_seconds);
-        metric("strix_live_tokens", "gauge", "Tokens in the session.", (double)s.live_tokens);
+        metric("strix_live_tokens", "gauge", "Tokens held across all slots.", (double)s.live_tokens);
         metric("strix_context_length", "gauge", "Positions the session holds.", (double)engine_.capacity());
         metric("strix_prompt_cache_disk_hits_total", "counter", "Requests resumed from the prompt cache (RAM or disk).", (double)s.disk_hits);
         metric("strix_prompt_cache_disk_tokens_total", "counter", "Prompt tokens restored from the prompt cache.", (double)s.disk_tokens);
@@ -741,8 +787,30 @@ void HttpServer::routes() {
         res.set_content(m, "text/plain; version=0.0.4");
     });
 
-    svr_->set_error_handler([](const httplib::Request &req, httplib::Response &res) {
-        if (res.status == 404) send_error(res, 404, "no route " + req.method + " " + req.path, "not_found_error");
+    // One handler for every error status. 404 gets its JSON body; a 400 whose body never fully arrived gets turned
+    // into the retryable 408 the client can act on (strixite #15: httplib answers the abandoned read itself,
+    // before any route ran - an empty, unlogged 400, which OpenCode took for its own fault and stopped the
+    // session; the OpenAI SDKs retry 408 and x-should-retry, not 400). Errors raised inside a route carry their own JSON and pass
+    // through untouched, as do parse failures (which never get a POST's framing).
+    svr_->set_error_handler([this](const httplib::Request &req, httplib::Response &res) {
+        if (res.status == 404) {
+            send_error(res, 404, "no route " + req.method + " " + req.path, "not_found_error");
+            return;
+        }
+        if (res.status != 400 || !res.body.empty() || req.method != "POST" || req.target.empty()) return;
+        const std::string content_length = req.get_header_value("Content-Length");
+        if (!content_length.empty() && content_length.find_first_not_of("0123456789") != std::string::npos)
+            return;  // a malformed Content-Length also reads as this empty 400 - that's the client's framing to fix, not a slow upload
+        const std::string arrived = content_length.empty()
+            ? std::to_string(req.body.size()) + " bytes arrived"
+            : fmt_n((int64_t)req.body.size()) + " of " + content_length + " bytes arrived";
+        slog(LogLevel::Warning, "Request failed: POST %s from %s: the body stopped arriving (read timeout %d s, %s) - "
+             "answered 408 (retryable)", req.path.c_str(), req.remote_addr.c_str(), cfg_.request_read_timeout_s,
+             arrived.c_str());
+        send_error(res, 408, "the request body stopped arriving (read timeout " + std::to_string(cfg_.request_read_timeout_s) +
+                             " s of silence on the connection" + (content_length.empty() ? "" : ", " + arrived) +
+                             ") - the upload may be slow or the connection was lost; safe to retry", "api_error");
+        res.set_header("x-should-retry", "true");
     });
 }
 

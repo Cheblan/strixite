@@ -78,7 +78,7 @@ __global__ void kv8_tail_kernel(const T *k_new, const T *v_new, int64_t new_ts, 
                             : (half ? v_new : k_new)[(r - pos0) * new_ts + ch];
 }
 
-template <typename T>
+template <typename T, bool KF16>
 __global__ void kv8_dequant_kernel(const uint8_t *store, int64_t capacity, int64_t W, int64_t r0, int64_t n, T *dk,
                                    T *dv) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -90,7 +90,8 @@ __global__ void kv8_dequant_kernel(const uint8_t *store, int64_t capacity, int64
     const uint32_t *vp = reinterpret_cast<const uint32_t *>(vc + capacity * W);
     const float k = kv8_math::value(kc[r * W + ch], kp[(r / kKv8Group) * W + ch]);
     const float v = kv8_math::value(vc[r * W + ch], vp[r * (W / kKv8Block) + ch / kKv8Block]);
-    if constexpr (sizeof(T) == 2) dk[i] = f32_to_bf16_bits(k), dv[i] = f32_to_bf16_bits(v);
+    if constexpr (KF16) dk[i] = kv8_math::f2h(k), dv[i] = f32_to_bf16_bits(v);  // as Kv8Reader::k16 rounds
+    else if constexpr (sizeof(T) == 2) dk[i] = f32_to_bf16_bits(k), dv[i] = f32_to_bf16_bits(v);
     else dk[i] = k, dv[i] = v;
 }
 
@@ -117,6 +118,17 @@ size_t kv8_bytes(int64_t capacity, int64_t W) {
     check_layout("kv8_bytes", capacity, W);
     return (size_t)(capacity * W) * 2 + (size_t)((capacity / kKv8Group) * W) * 4 +
            (size_t)(capacity * (W / kKv8Block)) * 4;
+}
+
+std::array<std::pair<size_t, size_t>, 4> kv8_used_ranges(int64_t capacity, int64_t W, int64_t rows) {
+    check_layout("kv8_used_ranges", capacity, W);
+    STRIX_CHECK(rows >= 0 && rows <= capacity && rows % kKv8Group == 0, "kv8_used_ranges: rows = ", rows,
+                ", expected a multiple of ", kKv8Group, " in [0, capacity = ", capacity, "]");
+    const size_t kc = (size_t)(capacity * W), kp = (size_t)((capacity / kKv8Group) * W) * 4, vc = kc;
+    return {{{0, (size_t)(rows * W)},
+             {kc, (size_t)((rows / kKv8Group) * W) * 4},
+             {kc + kp, (size_t)(rows * W)},
+             {kc + kp + vc, (size_t)(rows * (W / kKv8Block)) * 4}}};
 }
 
 size_t kv8_tail_bytes(int64_t W, Act act) {
@@ -177,9 +189,11 @@ void report_kv8_error(const uint32_t e[3], const char *what) {
 }
 
 void kv8_dequant(const uint8_t *store, int64_t capacity, int64_t W, int64_t r0, int64_t r1, void *dst_k, void *dst_v,
-                 Act act, hipStream_t stream) {
+                 Act act, bool k_f16, hipStream_t stream) {
     const char *fn = "kv8_dequant";
     es_of(fn, act);
+    STRIX_CHECK(!k_f16 || act == Act::BF16, fn, ": F16 K (the WMMA attention's staging) needs BF16 activations, got "
+                "dtype ", (int)act);
     check_layout(fn, capacity, W);
     STRIX_CHECK(store && dst_k && dst_v, fn, ": null pointer (store=", (const void *)store, ", dst_k=", dst_k,
                 ", dst_v=", dst_v, ")");
@@ -187,12 +201,15 @@ void kv8_dequant(const uint8_t *store, int64_t capacity, int64_t W, int64_t r0, 
     const int64_t n = r1 - r0;
     if (n == 0) return;
     const dim3 grid((unsigned)((n * W + 255) / 256));
-    if (act == Act::BF16)
-        hipLaunchKernelGGL(kv8_dequant_kernel<uint16_t>, grid, dim3(256), 0, stream, store, capacity, W, r0, n,
-                           static_cast<uint16_t *>(dst_k), static_cast<uint16_t *>(dst_v));
+    if (k_f16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(kv8_dequant_kernel<uint16_t, true>), grid, dim3(256), 0, stream, store,
+                           capacity, W, r0, n, static_cast<uint16_t *>(dst_k), static_cast<uint16_t *>(dst_v));
+    else if (act == Act::BF16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(kv8_dequant_kernel<uint16_t, false>), grid, dim3(256), 0, stream, store,
+                           capacity, W, r0, n, static_cast<uint16_t *>(dst_k), static_cast<uint16_t *>(dst_v));
     else
-        hipLaunchKernelGGL(kv8_dequant_kernel<float>, grid, dim3(256), 0, stream, store, capacity, W, r0, n,
-                           static_cast<float *>(dst_k), static_cast<float *>(dst_v));
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(kv8_dequant_kernel<float, false>), grid, dim3(256), 0, stream, store,
+                           capacity, W, r0, n, static_cast<float *>(dst_k), static_cast<float *>(dst_v));
     STRIX_HIP_CHECK(hipGetLastError(), fn, ": launch (rows [", r0, ", ", r1, "), W = ", W, ")");
 }
 

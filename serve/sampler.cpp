@@ -143,6 +143,11 @@ int32_t Sampler::sample(const float *logits, size_t size, float *out_margin) {
     constexpr int64_t kBlock = 64;
     int64_t i = 0;
     for (; i < std::min<int64_t>(n, (int64_t)m); ++i) consider(i);  // fill the list first
+    // The list can only be empty if every one of the leading m logits was NaN - the case the check after the
+    // loops exists for. Read it here instead: cand_.back() below (and cand_[0] / [1]) would otherwise run on an
+    // empty vector.
+    STRIX_CHECK(!cand_.empty(), "Sampler::sample: NaN logit(s) in the row of ", n, " (all ", m,
+                " of the leading logits the candidate list starts from)");
     for (; i + kBlock <= n; i += kBlock) {
         const float thr = cand_.back().first;
         const float *b = logits + i;

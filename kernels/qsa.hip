@@ -10,6 +10,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace strix::kernels {
 
@@ -108,14 +109,17 @@ __device__ inline void load8(const uint16_t *p, int64_t i, float (&v)[8]) {
 // kScQ x H x D floats). Each key is read once per kScQ queries: an MTP verify (T = 2..8) used to re-read every block
 // key per query (grid.y = T) - at 491k context T = 8 cost 2.6x T = 1, which runs at the read peak. Per (query, key)
 // the products and their order are as before (bit-identical scores).
+// QN: queries per block - kScQ, or 1 for a one-row call (decode): the rows loop's bookkeeping made T = 1 ~3% slower
+// than the one-query kernel it replaced; the QN = 1 instance has that kernel's shape again. Same products in the same
+// order either way.
 constexpr int kScQ = 8;
-template <typename T>
+template <typename T, int QN>
 __global__ void __launch_bounds__(kThreads)
     scores_kernel(const T *q, int64_t q_ts, int64_t q_hs, int64_t T_rows, int64_t pos0, int H, int D, const T *bk,
                   int64_t cap, float *scores, int64_t ld) {
-    extern __shared__ float qs[];  // [kScQ][H][D]
-    const int64_t t0 = (int64_t)blockIdx.y * kScQ;
-    const int nq = (int)(T_rows - t0 < kScQ ? T_rows - t0 : kScQ);
+    extern __shared__ float qs[];  // [QN][H][D]
+    const int64_t t0 = (int64_t)blockIdx.y * QN;
+    const int nq = (int)(T_rows - t0 < QN ? T_rows - t0 : QN);
     for (int i = threadIdx.x; i < nq * H * D; i += blockDim.x) {
         const int tq = i / (H * D), r = i % (H * D);
         qs[i] = load(q, (t0 + tq) * q_ts + (r / D) * q_hs + r % D);
@@ -124,16 +128,16 @@ __global__ void __launch_bounds__(kThreads)
     // The last query sees the most blocks; a key past it is past every query of the group.
     const int64_t b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= (pos0 + t0 + nq) / kQsaBlock) return;
-    float acc[kScQ][kMaxH];
+    float acc[QN][kMaxH];
 #pragma unroll
-    for (int tq = 0; tq < kScQ; ++tq)
+    for (int tq = 0; tq < QN; ++tq)
 #pragma unroll
         for (int h = 0; h < kMaxH; ++h) acc[tq][h] = 0.f;
     for (int c = 0; c < D / 8; ++c) {
         float v[8];
         load8(bk, ((int64_t)c * cap + b) * 8, v);
 #pragma unroll
-        for (int tq = 0; tq < kScQ; ++tq)
+        for (int tq = 0; tq < QN; ++tq)
             if (tq < nq)
 #pragma unroll
                 for (int h = 0; h < kMaxH; ++h)
@@ -142,7 +146,7 @@ __global__ void __launch_bounds__(kThreads)
                         for (int e = 0; e < 8; ++e) acc[tq][h] = fmaf(qs[(tq * H + h) * D + c * 8 + e], v[e], acc[tq][h]);
     }
 #pragma unroll
-    for (int tq = 0; tq < kScQ; ++tq) {
+    for (int tq = 0; tq < QN; ++tq) {
         if (tq >= nq || b >= (pos0 + t0 + tq + 1) / kQsaBlock) continue;  // query t0 + tq doesn't see block b
         float s = 0.f;
 #pragma unroll
@@ -882,6 +886,16 @@ bool overlaps(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 
 }  // namespace
 
+std::vector<std::pair<size_t, size_t>> qsa_block_keys_used_ranges(int64_t cap_blocks, int64_t D, size_t es, int64_t nb) {
+    STRIX_CHECK(cap_blocks >= 1 && D >= 8 && D % 8 == 0 && (es == 2 || es == 4) && nb >= 0 && nb <= cap_blocks,
+                "qsa_block_keys_used_ranges: cap_blocks = ", cap_blocks, ", D = ", D, ", es = ", es, ", nb = ", nb,
+                " (expected cap_blocks >= 1, D % 8 == 0, es 2 or 4, nb in [0, cap_blocks])");
+    std::vector<std::pair<size_t, size_t>> r;
+    if (nb == 0) return r;
+    for (int64_t c = 0; c < D / 8; ++c) r.push_back({(size_t)(c * cap_blocks * 8) * es, (size_t)(nb * 8) * es});
+    return r;
+}
+
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
                     void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale,
@@ -953,18 +967,28 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
         STRIX_HIP_CHECK_LAUNCH(fn, " wmma T=", T, " pos0=", pos0, " blocks=", nb);
         return;
     }
-    dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), (unsigned)((T + kScQ - 1) / kScQ)), block(kThreads);
-    const size_t lds = (size_t)kScQ * (size_t)H * (size_t)D * sizeof(float);
-    STRIX_CHECK(lds <= 64 * 1024, fn, ": ", kScQ, " queries x ", H, " heads x ", D, " dims = ", lds,
+    const int qn = T == 1 ? 1 : kScQ;
+    dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), (unsigned)((T + qn - 1) / qn)), block(kThreads);
+    const size_t lds = (size_t)qn * (size_t)H * (size_t)D * sizeof(float);
+    STRIX_CHECK(lds <= 64 * 1024, fn, ": ", qn, " queries x ", H, " heads x ", D, " dims = ", lds,
                 " bytes of LDS, over 64 KiB");
-    if (act == Act::F32)
-        scores_kernel<float><<<grid, block, lds, stream>>>(static_cast<const float *>(q), q_ts, q_hs, T, pos0, (int)H,
-                                                           (int)D, static_cast<const float *>(block_keys), cap_blocks,
-                                                           scores, ld);
+    auto launch = [&](auto qn_c) {
+        constexpr int QN = decltype(qn_c)::value;
+        if (act == Act::F32)
+            scores_kernel<float, QN><<<grid, block, lds, stream>>>(static_cast<const float *>(q), q_ts, q_hs, T, pos0,
+                                                                   (int)H, (int)D,
+                                                                   static_cast<const float *>(block_keys), cap_blocks,
+                                                                   scores, ld);
+        else
+            scores_kernel<uint16_t, QN><<<grid, block, lds, stream>>>(static_cast<const uint16_t *>(q), q_ts, q_hs, T,
+                                                                      pos0, (int)H, (int)D,
+                                                                      static_cast<const uint16_t *>(block_keys),
+                                                                      cap_blocks, scores, ld);
+    };
+    if (qn == 1)
+        launch(std::integral_constant<int, 1>{});
     else
-        scores_kernel<uint16_t><<<grid, block, lds, stream>>>(static_cast<const uint16_t *>(q), q_ts, q_hs, T, pos0,
-                                                              (int)H, (int)D, static_cast<const uint16_t *>(block_keys),
-                                                              cap_blocks, scores, ld);
+        launch(std::integral_constant<int, kScQ>{});
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " pos0=", pos0, " blocks=", nb);
 }
 

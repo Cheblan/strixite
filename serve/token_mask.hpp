@@ -29,8 +29,9 @@ public:
     int32_t mask_words() const { return (mask_rows_ + 31) / 32; }
 
     // The allowed tokens in `state`: bit (id % 32) of word (id / 32) set = allowed. Cached in the automaton; the
-    // reference stays valid until the automaton's next store_mask (the next uncached mask).
-    const std::vector<uint32_t> &mask(grammar::GrammarAutomaton &automaton, int32_t state) const;
+    // returned shared_ptr keeps its mask alive as long as the caller holds it, whatever concurrent store_mask /
+    // eviction does to the cache (thread-safe, serve/grammar.hpp).
+    std::shared_ptr<const std::vector<uint32_t>> mask(grammar::GrammarAutomaton &automaton, int32_t state) const;
 
     // The same, computed without the cache (for tests and benches).
     std::vector<uint32_t> compute(grammar::GrammarAutomaton &automaton, int32_t state) const;

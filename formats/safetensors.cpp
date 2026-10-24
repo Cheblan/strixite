@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -413,7 +414,11 @@ SafetensorsFile::SafetensorsFile(const std::string &path) : path_(path) {
                     data_len, " bytes (truncated file?)");
         t.byte_offset = data_start_ + (size_t)rel_start;
         t.byte_length = (size_t)(rel_end - rel_start);
-        size_t expected = (size_t)t.numel() * dtype_size(t.dtype);
+        // numel * itemsize must not wrap: a hostile shape could otherwise land `expected` on a matching small span.
+        const int64_t numel = t.numel();
+        STRIX_CHECK((uint64_t)numel <= SIZE_MAX / dtype_size(t.dtype), where, ": shape ", list_str(t.shape), " x ",
+                    dtype_name(t.dtype), " (", dtype_size(t.dtype), " B/elem) overflows size_t bytes");
+        size_t expected = (size_t)numel * dtype_size(t.dtype);
         STRIX_CHECK(expected == t.byte_length, where, ": shape ", list_str(t.shape), " x ", dtype_name(t.dtype), " (",
                     dtype_size(t.dtype), " B/elem) needs ", expected, " bytes but data_offsets span ", t.byte_length);
         tensors_.push_back(std::move(t));

@@ -159,6 +159,103 @@ public:
         drop_verify();
         forward(std::vector<int32_t>(ids.begin(), ids.begin() + rows), (int64_t)0);
     }
+    // ------------------------------------------------ several conversations (feat/multi-sequence)
+    // A backend holds n_seqs() conversations ("seqs"; not the snapshot slots below), each its own state at its own
+    // position; the calls above are seq 0's. The batched MTP step: every decoding seq drafts its own chain
+    // (forward_mtp_top2(seq, ..), chains stay sequential per seq), then one verify_batch() verifies all their runs
+    // in one forward (the weights read once for every run), then each run is resolved on its own - keep_verify(seq,
+    // rows, carry) or drop_verify(seq) - before anything else runs. The defaults are one seq (0) on the calls above,
+    // so a single-conversation backend serves the same step.
+    virtual int n_seqs() const { return 1; }
+    virtual int64_t pos(int seq) const {
+        check_seq(seq, "pos");
+        return pos();
+    }
+    // A plain forward of seq's next ids (a prefill chunk; one seq a forward).
+    virtual LogitRows forward_rows(int seq, const std::vector<int32_t> &ids, int64_t n_logits, bool cands,
+                                   int64_t n_valid, const LogitMasks *masks = nullptr) {
+        check_seq(seq, "forward_rows");
+        return forward_rows(ids, n_logits, cands, n_valid, masks);
+    }
+    virtual Top2 forward_mtp_top2(int seq, int32_t token_id, int64_t step) {
+        check_seq(seq, "forward_mtp_top2");
+        return forward_mtp_top2(token_id, step);
+    }
+    virtual void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) {
+        check_seq(seq, "prefetch_ple");
+        prefetch_ple(ids, first);
+    }
+    // One run of a batched verify: seq's ids (the token before the drafts, then the drafts), every row's logits
+    // back; masks: null, or one mask per row (masks->rows == ids.size()).
+    struct VerifyRun {
+        int seq = 0;
+        std::vector<int32_t> ids;
+        const LogitMasks *masks = nullptr;
+    };
+    // The runs' logits rows, one LogitRows per run in the runs' order. Distinct seqs; the backend's row budget
+    // (max_verify_rows()) holds all of them - the caller packs.
+    virtual std::vector<LogitRows> verify_batch(const std::vector<VerifyRun> &runs, bool cands, int64_t n_valid) {
+        STRIX_CHECK(runs.size() == 1, "LmBackend::verify_batch: ", runs.size(), " runs on a one-conversation backend (",
+                    describe(), "), expected 1");
+        check_seq(runs[0].seq, "verify_batch");
+        verify_ids_ = runs[0].ids;
+        return {forward_verify_rows(runs[0].ids, (int64_t)runs[0].ids.size(), cands, n_valid, runs[0].masks)};
+    }
+    virtual int64_t max_verify_rows() const { return 16; }  // rows (and logits rows) of one verify_batch forward
+    // Resolve seq's run of the pending verify_batch: keep its first `rows` rows (all of them: the whole verify).
+    // carry: the token seq's next forward starts with (an MTP rejection's corrected sample; -1: none) - a backend
+    // may check it there.
+    virtual void keep_verify(int seq, int64_t rows, int32_t carry) {
+        check_seq(seq, "keep_verify");
+        (void)carry;
+        STRIX_CHECK(rows >= 1 && rows <= (int64_t)verify_ids_.size(), "LmBackend::keep_verify: keep ", rows,
+                    " rows of a ", verify_ids_.size(), "-row verify, expected 1..", verify_ids_.size());
+        if (rows == (int64_t)verify_ids_.size()) keep_verify();
+        else keep_verify_prefix(verify_ids_, rows);
+        verify_ids_.clear();
+    }
+    virtual void drop_verify(int seq) {
+        check_seq(seq, "drop_verify");
+        drop_verify();
+        verify_ids_.clear();
+    }
+    // A conversation's own state: reset it alone (the others untouched), its own snapshot slots, its prompt-cache
+    // export / import. failed(): an earlier call failed midway - every seq's state may be half-written, so only a
+    // reset() of the whole backend continues.
+    virtual void reset(int seq) {
+        check_seq(seq, "reset");
+        reset();
+    }
+    virtual bool failed() const { return false; }
+    virtual void save_snapshot(int seq, int slot) {
+        check_seq(seq, "save_snapshot");
+        save_snapshot(slot);
+    }
+    virtual int64_t snapshot_pos(int seq, int slot) const {
+        check_seq(seq, "snapshot_pos");
+        return snapshot_pos(slot);
+    }
+    virtual bool can_restore_snapshot(int seq, int slot) const {
+        check_seq(seq, "can_restore_snapshot");
+        return can_restore_snapshot(slot);
+    }
+    virtual void restore_snapshot(int seq, int slot) {
+        check_seq(seq, "restore_snapshot");
+        restore_snapshot(slot);
+    }
+    virtual void export_snapshot(int seq, int slot, HostBuffer &out, int64_t from = 0) {
+        check_seq(seq, "export_snapshot");
+        export_snapshot(slot, out, from);
+    }
+    virtual uint64_t snapshot_bytes(int seq, int slot, int64_t from = 0) const {
+        check_seq(seq, "snapshot_bytes");
+        return snapshot_bytes(slot, from);
+    }
+    virtual void import_state(int seq, const HostBuffer &state, int64_t n, int64_t from = 0) {
+        check_seq(seq, "import_state");
+        import_state(state, n, from);
+    }
+
     // Snapshot slots (Qwen4ExpSnapshot): save at pos(), restore if still valid. kTurnSlot: the prompt's generation
     // prompt; kSystemSlot: the end of the system prompt (for the disk cache); kDraftSlot: MTP rollback; kUserSlot:
     // the start of the prompt's last user message - the user-turn checkpoint (for the disk cache): a client that
@@ -179,6 +276,15 @@ public:
     // What a saved state fits: model, weights, layout, activation dtype (PromptCache refuses others).
     virtual std::string state_fingerprint() const = 0;
     virtual std::string describe() const = 0;  // for /health and logs
+
+protected:
+    void check_seq(int seq, const char *what) const {
+        STRIX_CHECK(seq >= 0 && seq < n_seqs(), "LmBackend::", what, ": seq ", seq, ", expected 0..", n_seqs() - 1,
+                    " (", describe(), ")");
+    }
+
+private:
+    std::vector<int32_t> verify_ids_;  // the one-seq default's pending verify_batch run (keep_verify's prefix)
 };
 
 struct GenerationRequest {
@@ -209,7 +315,8 @@ struct GenerationRequest {
     // entries stay in RAM and never reach the disk (PromptCache "RAM-only entries").
     bool one_shot = false;
     // Structured output (response_format / tool_choice): the compiled grammar
-    // the answer must follow, or null. Shared by requests with the same schema; the engine thread alone uses it.
+    // the answer must follow, or null. Shared by requests with the same schema; several slots' workers drive one
+    // concurrently (GrammarAutomaton is internally synchronized - serve/grammar.hpp, review item 2).
     std::shared_ptr<grammar::GrammarAutomaton> grammar;
     int64_t id = 0;       // the HTTP layer's request id, for log lines ("Request <id>"); 0 = none given
     bool stream = false;  // for the log only (the HTTP layer streams or not)
@@ -266,7 +373,9 @@ struct PrefillProgress {
     double ms = 0;
 };
 
-// The request's side of the loop, called on the engine thread.
+// The request's side of the loop, called on the engine thread. Implementations must not throw: the engine calls
+// on_done exactly once per request (the worker's last-line guard does not re-deliver after a delivery was
+// attempted), so a throwing sink loses that request's response and takes nothing else down with it.
 class GenerationSink {
 public:
     virtual ~GenerationSink() = default;
@@ -290,17 +399,25 @@ struct EngineStats {
     int64_t cache_hits = 0, cache_misses = 0;
     double prefill_seconds = 0, decode_seconds = 0;
     double last_prefill_tps = 0, last_decode_tps = 0;
-    int64_t queued = 0, busy = 0;
+    int64_t queued = 0, busy = 0;  // busy: requests running (0..slots)
+    int64_t slots = 1;             // conversations served at once (the backend's n_seqs)
+    // Per slot: the request it runs (0: idle), the tokens its state holds and its snapshot's position (-1: none).
+    std::vector<int64_t> slot_request, slot_live_tokens, slot_snapshot_pos;
+    int64_t verify_batches = 0, verify_batch_runs = 0;  // batched MTP verifies (GpuArbiter) and their runs
+    int64_t decoding_slots = 0;  // slots in their decode loop (GpuArbiter::decoding_count; 0 with one slot)
     // Seconds since the last request finished (or the engine started); 0 while one runs or waits. `busy` alone reads
     // 1 through a steady agent session, so a batch client sampling it saw a "stuck" flag; this lets it
     // wait for a real gap (e.g. idle_seconds >= 2).
     double idle_seconds = 0;
-    int64_t live_tokens = 0, snapshot_pos = -1;
+    int64_t live_tokens = 0;  // the sum of slot_live_tokens: every slot's state, not the last one to finish
     // Prompts resumed from the prompt cache (either tier; ram_hits: of those, from its RAM tier) / states put in its
     // RAM tier (the disk gets them later, if at all).
     int64_t disk_hits = 0, disk_tokens = 0, ram_saves = 0, ram_hits = 0;
     double export_seconds = 0;
 };
+
+class GpuArbiter;  // serve/seq_backend.hpp (it builds on LmBackend above)
+class SeqBackend;
 
 class Engine {
 public:
@@ -336,6 +453,10 @@ public:
         // kThinkCloseBeforeCall ahead of that <tool_call> and the call is parsed as one. Off only for like-for-like
         // comparisons. (Last, so the positional Options{...} in the tests keep their meaning.)
         bool think_close_on_call = true;
+        // Prefill chunk while another slot is decoding (config chunk-shared; several slots only; 0 = the backend's
+        // max chunk always). A chunk holds the GPU: at 16,384 tokens the other slots' decode stopped ~10 s a chunk.
+        // Read per chunk, so a prefill alone runs full chunks again as soon as the others finish.
+        int64_t shared_chunk = 2048;
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -343,6 +464,11 @@ public:
     ~Engine();  // finishes the running request, fails the queued ones, joins the worker
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
+    // The backend's n_seqs() slots each serve one conversation at a time: a worker per slot, requests in arrival
+    // order (FIFO) to an idle slot - the one the prompt continues, else an empty one, else the least recently used
+    // (dispatch_locked); an image prompt waits for slot 0
+    // (image positions are slot 0's); a prompt that continues a busy slot's running request waits for that slot. Several slots share the GPU through a GpuArbiter (serve/seq_backend.hpp),
+    // which batches their MTP verifies.
 
     void submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink);
     EngineStats stats() const;
@@ -360,18 +486,44 @@ private:
         GenerationRequest req;
         std::shared_ptr<GenerationSink> sink;
         double enqueued;
+        std::string slot_why;  // why dispatch picked its slot (the block's "slot" row; several slots only)
+        // Set right before on_done is called (run()'s finish, or the worker's last-line guard): the guard
+        // delivers the error result only when no delivery has happened, so a request gets it exactly once.
+        bool result_sent = false;
     };
-    void worker();
-    void run(Job &job);
+    // One conversation slot: its backend view (the backend itself with one slot, else a SeqBackend), the tokens its
+    // state holds, its worker and the request it was given.
+    struct Slot {
+        int index = 0;
+        LmBackend *be = nullptr;
+        std::unique_ptr<SeqBackend> proxy;  // several slots only
+        std::vector<int32_t> seq;           // the tokens in the slot's state (seq.size() == be->pos())
+        std::thread thread;
+        std::unique_ptr<Job> job;     // assigned, not started; under mu_
+        bool busy = false;            // a request assigned or running; under mu_
+        int64_t running_id = 0;       // under mu_
+        std::vector<int32_t> running_key;  // the running request's prompt (its cache key); empty when idle; under mu_
+        double last_used = 0;         // when it was last given a request (steady clock, s); under mu_
+        int64_t turn_pos = -1;        // its turn snapshot's position after its last request (-1: none); under mu_
+        std::string fatal_pending;    // set by run()'s handler (the slot's thread only)
+        bool needs_reset = false;     // the worker's guard saw an error escape the request path: reset before the
+                                      // next job (the slot's thread only) - an unclean state must not carry over
+    };
+    void worker(Slot &sl);
+    void run(Job &job, Slot &sl);
+    // Marks the job's result sent and delivers it, logging (never propagating) a throwing sink (GenerationSink's
+    // no-throw contract). The one path to on_done outside run()'s finish.
+    static void deliver(Job &job, const GenerationResult &r);
+    void dispatch_locked();  // queued requests to idle slots (FIFO; continued conversation, else empty, else LRU)
     // Sets the backend up to prefill from the returned position: the longest reusable prefix among the live state,
     // the two snapshot slots and the prompt cache (restoring / importing / resetting as needed). from_disk: from the
     // prompt cache (either tier); from_ram: from its RAM tier.
-    int64_t resume_point(const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram);
+    int64_t resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram);
     // Logs where the prompt left the state it shared the most with (the live session before resume_point, or a
     // prompt cache entry) when that cost >= kResumeLossReportTokens of prefill (serve/resume_loss.hpp).
     // Writes the finished request's tokens and MTP steps to options_.capture_dir (serve/capture.hpp); logs, never
     // throws.
-    void capture(const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
+    void capture(Slot &sl, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
     void report_resume_loss(const std::vector<int32_t> &prompt, int64_t start, int64_t live_common, int64_t live_n,
                             int64_t id);
 
@@ -387,17 +539,16 @@ private:
     const std::vector<int32_t> nudge_[2];       // kThinkNudge1 / 2, tokenized
     const std::vector<int32_t> think_close_;    // kThinkCloseBeforeCall, tokenized
     const int32_t call_begin_;                  // <tool_call>
-    std::vector<int32_t> seq_;  // the tokens in the backend (seq_.size() == be_.pos())
+    std::unique_ptr<GpuArbiter> arbiter_;  // several slots only
+    std::vector<std::unique_ptr<Slot>> slots_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Job> queue_;
     bool stop_ = false;
     std::string fatal_;  // the GpuFatalError's text once one was thrown; under mu_
-    std::string fatal_pending_;  // set by run()'s handler, moved to fatal_ by the worker (worker thread only)
     EngineStats stats_;
     double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
-    int64_t running_id_ = 0;  // the id of the request the worker runs (while stats_.busy); under mu_
-    std::thread thread_;
+    int64_t held_logged_ = 0;  // the request whose wait for its conversation's busy slot was logged; under mu_
 };
 
 }  // namespace strix

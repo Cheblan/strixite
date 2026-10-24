@@ -23,8 +23,9 @@ namespace strix {
 
 class StructuredOutput {
 public:
-    // automaton: the request's compiled grammar (shared across requests with the same schema; used on the engine
-    // thread only). masker: the engine's (its mask_rows() = the logits row). think_end: the </think> token;
+    // automaton: the request's compiled grammar (shared across requests with the same schema; driven by
+    // several slot workers at once - GrammarAutomaton is internally synchronized, serve/grammar.hpp).
+    // masker: the engine's (its mask_rows() = the logits row). think_end: the </think> token;
     // end_ids: the end-of-turn tokens (allowed where the grammar is complete). in_content: the prompt has thinking
     // off - the grammar applies from the first token.
     StructuredOutput(std::shared_ptr<grammar::GrammarAutomaton> automaton, const TokenMasker &masker,

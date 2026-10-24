@@ -35,6 +35,10 @@ struct ServerConfig {
     int64_t thinking_cap = 0, thinking_cap_grace = 0;
     double keepalive_s = 10;  // SSE comment interval while nothing else is sent
     size_t max_body_bytes = 64u << 20;
+    // Seconds a connection may go silent while its request body is still arriving before the read is abandoned and
+    // the (retryable, x-should-retry) 408 goes out; inactivity per socket read, not total upload time (strixite #15:
+    // httplib's 5 s default killed whole-history agent uploads over weak Wi-Fi with an empty, unlogged 400).
+    int request_read_timeout_s = 30;
     // Vision (Phase D): non-null when the server loaded with vision on - the image parts parse, preprocess
     // (on the HTTP thread) and reach the engine; /health reports engine_.backend().has_vision().
     // vision_preprocess_limit (config vision-preprocess-limit): how many image preprocesses may run at once -

@@ -6,6 +6,7 @@
 
 #include "common/bf16.hpp"
 #include "common/hip_check.hpp"
+#include "common/log.hpp"
 #include "common/trace.hpp"
 #include "kernels/attention.hpp"
 #include "kernels/gdn.hpp"
@@ -46,6 +47,25 @@ Qwen4ExpModel::Hc load_hc(const StrixwDevice &w, const std::string &p, const Qwe
     const int64_t n4 = D.H * D.d;
     return {w.qw(p + "mix_down", {D.r + (inject ? D.H : 0), n4}), w.qw_chunk_major(p + "mix_up", {n4, D.r}),
             w.f32(p + "hc_norm.weight", {n4})};
+}
+
+// The WMMA attention over the 8-bit cache scores in F16 (kernels/kv8_math.hpp f16x2): every q and K value must fit
+// F16's range. After the zero-centred RMSNorm a head's values have sum((y_i / (1 + w_i))^2) <= D, so a RoPE pair has
+// |y'| <= sqrt(D) max|1 + w| cos_sin_scale - a bound from the weights alone, checked once here (kF16AttnBound
+// leaves 2x for BF16 rounding and the 8-bit K's quantization step).
+constexpr double kF16AttnBound = 32768.0;
+void check_f16_attn_bound(const float *w_dev, int64_t D, float cos_sin_scale, const std::string &name) {
+    std::vector<float> w((size_t)D);
+    STRIX_HIP_CHECK(hipMemcpy(w.data(), w_dev, (size_t)D * 4, hipMemcpyDeviceToHost), "Qwen4ExpModel: read ", name);
+    double m = 0;
+    for (float x : w) {
+        STRIX_CHECK(std::isfinite(x), "Qwen4ExpModel: ", name, " has a non-finite weight ", x);
+        m = std::max(m, std::fabs(1.0 + (double)x));
+    }
+    const double bound = std::sqrt((double)D) * m * std::max(1.0, (double)cos_sin_scale);
+    STRIX_CHECK(bound <= kF16AttnBound, "Qwen4ExpModel: ", name, " bounds the normed values by ", bound,
+                " (sqrt(", D, ") x max|1 + w| ", m, " x RoPE scale ", cos_sin_scale, "), over ", kF16AttnBound,
+                " - the 8-bit K/V attention scores in F16 (kernels/kv8_math.hpp) and needs them inside F16's range");
 }
 
 }  // namespace
@@ -110,6 +130,8 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
             l.o_proj = w_->qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
             l.q_norm = w_->f32(A + "q_norm.weight", {D.hd});
             l.k_norm = w_->f32(A + "k_norm.weight", {D.hd});
+            check_f16_attn_bound(l.q_norm, D.hd, D.rope_scale, A + "q_norm.weight");
+            check_f16_attn_bound(l.k_norm, D.hd, D.rope_scale, A + "k_norm.weight");
             l.idx_q_norm = w_->f32(A + "indexer.q_layernorm.weight", {D.idx_d});
             l.idx_k_norm = w_->f32(A + "indexer.k_layernorm.weight", {D.idx_d});
         } else {
@@ -190,7 +212,7 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
     // here - the merger's output width must be the trunk's embedding width, or the scatter has no place.
     if (!vision.empty()) {
         vision_ = std::make_unique<VisionTower>(vision, f, act);
-        STRIX_CHECK(vision_->dims().out_hidden == D.d, "Qwen4ExpModel: vision tower '", vision_, "' outputs ",
+        STRIX_CHECK(vision_->dims().out_hidden == D.d, "Qwen4ExpModel: vision tower '", vision, "' outputs ",
                     vision_->dims().out_hidden, " columns, the trunk's embed width is ", D.d,
                     " - the merged rows wouldn't fit the embedding rows they replace");
     }
@@ -308,8 +330,150 @@ KvFormat parse_kv_format(const std::string &v) {
     STRIX_FAIL("parse_kv_format: '", v, "', expected bf16 or q8");
 }
 
+// --------------------------------------------------------------------------- one conversation's state: the buffers
+// (feat/multi-sequence, the design in the repo docs). The per-layer caches and states at `capacity` positions, the
+// MTP head's own K/V + chain buffers with mtp, the PLE conv state; positions start at 0. The per-forward
+// workspaces live in Qwen4ExpSession (shared by the slots); the verify's spare state set is allocated by the
+// first forward_verify (it needs the session's kMaxLogits row sizing).
+Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp,
+                                   KvFormat kv) : mtp(mtp) {
+    const Qwen4ExpDims &D = model.dims();
+    const size_t e = es(model.act());
+    const int64_t cap_blocks = capacity / kernels::kQsaBlock + 1;
+    const int64_t kv8_cap = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
+    const int64_t W = D.hkv * D.hd;
+    const bool q8 = kv == KvFormat::Q8;
+    for (int64_t i = 0; i < D.layers; ++i) {
+        const std::string tag = "layer " + std::to_string(i);
+        const bool attn = D.is_attention[(size_t)i];
+        k_cache.emplace_back(attn && !q8 ? PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "K cache " + tag)
+                                         : PagedDeviceBuffer());
+        v_cache.emplace_back(attn && !q8 ? PagedDeviceBuffer((size_t)(capacity * W) * e, kPageBytes, "V cache " + tag)
+                                         : PagedDeviceBuffer());
+        kv8_store.emplace_back(attn && q8 ? PagedDeviceBuffer(kernels::kv8_bytes(kv8_cap, W), kPageBytes, "8-bit K/V " + tag)
+                                           : PagedDeviceBuffer());
+        for (int k = 0; k < 2; ++k)
+            kv8_tail[k].emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_tail_bytes(W, model.act()),
+                                                                      "K/V tail " + std::to_string(k) + " " + tag)
+                                                 : DeviceBuffer<uint8_t>());
+        block_keys.emplace_back(attn ? PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "block keys " + tag)
+                                     : PagedDeviceBuffer());
+        for (int k = 0; k < 2; ++k)
+            tail[k].emplace_back(attn ? DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "indexer tail " + tag)
+                                       : DeviceBuffer<uint8_t>());
+        conv_state.emplace_back(!attn ? DeviceBuffer<uint8_t>((size_t)((kernels::kGdnConvWidth - 1) * D.conv_c) * e,
+                                                              "conv state " + tag)
+                                      : DeviceBuffer<uint8_t>());
+        rec_state.emplace_back(!attn ? DeviceBuffer<float>((size_t)(D.gv * kHD * kHD), "recurrent state " + tag)
+                                     : DeviceBuffer<float>());
+    }
+    if (D.ple_layer >= 0) {
+        const int64_t S = (D.ple_taps - 1) * D.ple_dil, n4 = D.H * D.d;
+        ple_state = DeviceBuffer<uint8_t>((size_t)(S * n4) * e, "PLE conv state");
+    }
+    if (mtp) {  // the head's K/V / keys / tails, the trunk's streams, and the chain's own buffers
+        const int64_t n4 = D.H * D.d;
+        this->mtp_prev = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP previous streams");
+        k_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP K cache");
+        v_cache_mtp = PagedDeviceBuffer((size_t)(capacity * D.hkv * D.hd) * e, kPageBytes, "MTP V cache");
+        block_keys_mtp = PagedDeviceBuffer((size_t)(cap_blocks * D.idx_d) * e, kPageBytes, "MTP block keys");
+        for (int k = 0; k < 2; ++k)
+            tail_mtp[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
+        // mtp_x_'s twin (the session's workspace): a chain step swaps the two, so the step before's output is
+        // kept without a copy - same size, same activation bytes (chain_rows is the workspace's max forward rows).
+        mtp_chain_prev = DeviceBuffer<uint8_t>((size_t)(chain_rows * n4) * e, "MTP chain previous streams");
+        for (int k = 0; k < 2; ++k)
+            mtp_chain_tail[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e,
+                                                       "MTP chain indexer tail " + std::to_string(k));
+    }
+}
+
+// /proc/meminfo's MemAvailable in bytes (the slot allocation guard); 0 if it can't be read (the guard then refuses
+// any slot past the first rather than guess).
+uint64_t Qwen4ExpSession::mem_available_bytes() {
+    FILE *f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    bool found = false;
+    while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+            found = true;
+            break;
+        }
+    std::fclose(f);
+    return found ? (uint64_t)kib * 1024 : 0;
+}
+
+void Qwen4ExpSession::for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::function<void(PagedDeviceBuffer &,
+                                const std::vector<PagedDeviceBuffer::Range> &)> &f) const {
+    STRIX_CHECK(end >= 0 && end <= capacity_, "Qwen4ExpSession::for_paged: end = ", end, ", expected 0..", capacity_);
+    const Qwen4ExpDims &D = m_.dims();
+    const size_t e = es(m_.act());
+    const int64_t W = D.hkv * D.hd;
+    // Block keys: blocks [0, end / kQsaBlock] (the block holding row end - 1, and the one a forward of rows up to end
+    // starts); the 8-bit K/V: whole groups up to end (a group's rows land in the store when it completes).
+    const int64_t blocks = end == 0 ? 0 : std::min(cap_blocks_, end / kernels::kQsaBlock + 1);
+    // K / V rows: kOverReadRows past end too - the attention kernels load whole key tiles (16-64 rows) and mask the
+    // rows past the query's position afterwards, so a tile ending past end must not reach an unmapped page.
+    constexpr int64_t kOverReadRows = 64;
+    const int64_t kv_end = end == 0 ? 0 : std::min(capacity_, end + kOverReadRows);
+    const int64_t g_end = std::min(kv8_cap_, (kv_end + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group);
+    const PagedDeviceBuffer::Range kv{0, (size_t)(kv_end * W) * e};
+    std::vector<PagedDeviceBuffer::Range> keys;  // the block keys' 8-dimension chunks (kernels/qsa.hpp layout)
+    for (const auto &[off, bytes] : kernels::qsa_block_keys_used_ranges(cap_blocks_, D.idx_d, e, blocks))
+        keys.push_back({off, bytes});
+    for (size_t i = 0; i < sq.block_keys.size(); ++i) {
+        if (sq.k_cache[i].capacity()) f(sq.k_cache[i], {kv});
+        if (sq.v_cache[i].capacity()) f(sq.v_cache[i], {kv});
+        if (sq.block_keys[i].capacity()) f(sq.block_keys[i], keys);
+        if (sq.kv8_store[i].capacity()) {
+            std::vector<PagedDeviceBuffer::Range> r;
+            for (const auto &[off, bytes] : kernels::kv8_used_ranges(kv8_cap_, W, g_end)) r.push_back({off, bytes});
+            f(sq.kv8_store[i], r);
+        }
+    }
+    if (sq.k_cache_mtp.capacity()) {
+        const PagedDeviceBuffer::Range mkv{0, (size_t)(kv_end * D.hkv * D.hd) * e};
+        f(sq.k_cache_mtp, {mkv});
+        f(sq.v_cache_mtp, {mkv});
+        f(sq.block_keys_mtp, keys);
+    }
+}
+
+void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
+    uint64_t missing = 0;
+    for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
+    if (missing == 0) return;
+    if (kv_budget_) {
+        kv_budget_(missing);  // throws to refuse (nothing mapped yet)
+    } else {
+        const uint64_t avail = mem_available_bytes();
+        STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
+                    missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
+                    kSlotFloorBytes >> 30, " GiB floor");
+    }
+    for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
+}
+
+uint64_t Qwen4ExpSession::kv_full_bytes() const {
+    uint64_t n = 0;
+    for_paged(*seqs_.front(), capacity_, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) {
+        n += b.touched_bytes(r);
+    });
+    return n;
+}
+
+uint64_t Qwen4ExpSession::kv_mapped_bytes(int seq) const {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::kv_mapped_bytes: seq ", seq, ", expected 0..",
+                n_slots() - 1);
+    uint64_t n = 0;
+    for_paged(*seqs_[(size_t)seq], 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) { n += b.size(); });
+    return n;
+}
+
 Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                                 PrefillMath prefill_math, bool mtp, KvFormat kv)
+                                 PrefillMath prefill_math, bool mtp, KvFormat kv, int64_t n_slots)
     : m_(model), capacity_(capacity), max_tokens_(max_tokens), prefill_math_(prefill_math), kv_format_(kv),
       mtp_(mtp) {
     STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8, "Qwen4ExpSession: unknown KV format ", (int)kv);
@@ -317,6 +481,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
                 "Qwen4ExpSession: unknown prefill math ", (int)prefill_math);
     STRIX_CHECK(!mtp || model.has_mtp(), "Qwen4ExpSession: MTP asked for, but the loaded weights have no MTP head "
                 "(no mtp.fc_embedding.weight)");
+    STRIX_CHECK(n_slots >= 1, "Qwen4ExpSession: n_slots = ", n_slots, ", expected >= 1");
     const Qwen4ExpDims &D = m_.dims();
     STRIX_CHECK(capacity >= 1 && capacity <= (1ll << 24), "Qwen4ExpSession: capacity = ", capacity, ", expected 1..2^24");
     STRIX_CHECK(capacity <= D.max_positions(), "Qwen4ExpSession: capacity = ", capacity, " is past the model's ",
@@ -331,30 +496,12 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     const bool q8 = kv == KvFormat::Q8;
     kv8_cap_ = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
     const int64_t W = D.hkv * D.hd;
-    for (int64_t i = 0; i < D.layers; ++i) {
-        const std::string tag = "layer " + std::to_string(i);
-        const bool attn = D.is_attention[(size_t)i];
-        k_cache_.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "K cache " + tag)
-                                          : DeviceBuffer<uint8_t>());
-        v_cache_.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "V cache " + tag)
-                                          : DeviceBuffer<uint8_t>());
-        kv8_store_.emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_bytes(kv8_cap_, W), "8-bit K/V " + tag)
-                                           : DeviceBuffer<uint8_t>());
-        for (int k = 0; k < 2; ++k)
-            kv8_tail_[k].emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_tail_bytes(W, m_.act()),
-                                                                         "K/V tail " + std::to_string(k) + " " + tag)
-                                                 : DeviceBuffer<uint8_t>());
-        block_keys_.emplace_back(attn ? DeviceBuffer<uint8_t>((size_t)(cap_blocks_ * D.idx_d) * e, "block keys " + tag)
-                                      : DeviceBuffer<uint8_t>());
-        for (int k = 0; k < 2; ++k)
-            tail_[k].emplace_back(attn ? DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "indexer tail " + tag)
-                                       : DeviceBuffer<uint8_t>());
-        conv_state_.emplace_back(!attn ? DeviceBuffer<uint8_t>((size_t)((kernels::kGdnConvWidth - 1) * D.conv_c) * e,
-                                                               "conv state " + tag)
-                                       : DeviceBuffer<uint8_t>());
-        rec_state_.emplace_back(!attn ? DeviceBuffer<float>((size_t)(D.gv * kHD * kHD), "recurrent state " + tag)
-                                      : DeviceBuffer<float>());
-    }
+    // Slot 0's state first: everything below and every single-sequence call is per-forward workspace, but st() and
+    // the checks after this need it to exist. The other slots' states come last, each only if it fits (below).
+    const uint64_t avail0 = mem_available_bytes();
+    seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv));
+    const uint64_t avail1 = mem_available_bytes();
+    const uint64_t slot_cost = avail0 > avail1 ? avail0 - avail1 : 0;  // what one slot's state took from RAM
     auto act_buf = [&](int64_t per_token, const std::string &name) {
         return DeviceBuffer<uint8_t>((size_t)(M * per_token) * e, name);
     };
@@ -392,7 +539,6 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     }
     if (D.ple_layer >= 0) {
         const int64_t S = (D.ple_taps - 1) * D.ple_dil;
-        ple_state_ = DeviceBuffer<uint8_t>((size_t)(S * n4) * e, "PLE conv state");
         ple_e_ = act_buf(D.ple_e, "PLE n-gram rows");
         for (int k = 0; k < 2; ++k)
             ple_host_[k] = PinnedHostBuffer((size_t)(M * D.ple_e) * e, "PLE n-gram rows (host) " + std::to_string(k));
@@ -407,8 +553,8 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         const kernels::AttentionShape s{T, capacity - T, D.hq, D.hkv, D.hd, D.astride, 2 * D.hd};
         attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_workspace_bytes(s));
         if (qsa) attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_gathered_workspace_bytes(s, qsa_k));
-        if (wmma_attn && T >= kWmmaMinTokens) {
-            // The matrix-unit attention for prefill-sized forwards, dense at any depth below the limit.
+        if (wmma_attn && T >= kWmmaAttnMinTokens) {
+            // The matrix-unit attention, dense at any depth below the limit.
             for (int64_t p0 : {(int64_t)0, std::min(capacity, D.dense_key_limit()) - T})
                 if (p0 >= 0)
                     attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_wmma_workspace_bytes(
@@ -433,6 +579,11 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         kv8_err_ = DeviceBuffer<uint32_t>(3, "8-bit K/V error");
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "zero 8-bit K/V error");
     }
+    // The batched path's logits-row workspace (feat/multi-sequence): the compacted logits rows of a
+    // multi-run forward, so the LM head's weights are read once for the batch. (A batched verify's q8 new
+    // K | V rows need no such staging - each run writes them straight into its own saved rows, as the
+    // single-run verify does.)
+    lg_src_ = DeviceBuffer<uint8_t>((size_t)(std::max(M, kMaxLogits) * D.d) * e, "batched logits rows");
     attn_ws_ = DeviceBuffer<float>(attn_ws_bytes_ / 4 + 1, "attention workspace");
     expert_err_ = DeviceBuffer<uint32_t>(3, "expert error");
     if (prefill_math_ == PrefillMath::WmmaBf16 && M >= kWmmaMinTokens) {
@@ -456,19 +607,21 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         mtp_norm_hid_ = act_buf(n4, "MTP normed streams");
         mtp_proj_emb_ = act_buf(D.d, "MTP fc_embedding output");
         mtp_x_ = act_buf(n4, "MTP streams");
-        mtp_prev_ = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP previous streams");
-        k_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP K cache");
-        v_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP V cache");
-        block_keys_mtp_ = DeviceBuffer<uint8_t>((size_t)(cap_blocks_ * D.idx_d) * e, "MTP block keys");
-        for (int k = 0; k < 2; ++k)
-            tail_mtp_[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
-        // mtp_x_'s twin: a chain step swaps the two, so the step before's output is kept without a copy.
-        mtp_chain_prev_ = act_buf(n4, "MTP chain previous streams");
-        for (int k = 0; k < 2; ++k)
-            mtp_chain_tail_[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP chain indexer tail " + std::to_string(k));
         std::vector<float> ones((size_t)(M * D.H), 1.0f);
         mtp_ones_ = DeviceBuffer<float>(ones.size(), "MTP ones");
         STRIX_HIP_CHECK(hipMemcpy(mtp_ones_.get(), ones.data(), ones.size() * 4, hipMemcpyHostToDevice), "MTP ones");
+    }
+    // The other slots' states (each at the full capacity), each only while it leaves MemAvailable above the floor
+    // (its cost measured on slot 0's, +10% for what varies): on this machine the GPU allocates from system RAM, and RAM
+    // run down this far hard-hangs it - so a total_slots far too high for the machine fails here, cleanly, before the
+    // startup memory plan (serve/memory_plan.hpp) checks the full rule (margin + one full-capacity state).
+    for (int64_t k = 1; k < n_slots; ++k) {
+        const uint64_t avail = mem_available_bytes(), need = kSlotFloorBytes + slot_cost + slot_cost / 10;
+        STRIX_CHECK(avail >= need, "Qwen4ExpSession: slot ", k, " of ", n_slots, " needs ~", slot_cost >> 20,
+                    " MiB (slot 0's state at capacity ", capacity, " took that), MemAvailable ", avail >> 20,
+                    " MiB would leave less than the ", kSlotFloorBytes >> 30, " GiB floor after it - ", k,
+                    " slot(s) fit: lower total-slots (or the capacity)");
+        seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv));
     }
     reset();
 }
@@ -557,7 +710,11 @@ Qwen4ExpSession::VisionStats Qwen4ExpSession::vision_stats() const {
     return s;
 }
 
-void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t first) {
+void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t first) { prefetch_ple(0, ids, first); }
+
+void Qwen4ExpSession::prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::prefetch_ple: seq ", seq, ", expected 0..", n_slots() - 1);
+    const Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     const int64_t T = (int64_t)ids.size();
     STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::prefetch_ple: ", T, " ids, expected 1..", max_tokens_);
     STRIX_CHECK(first >= 0 && first < T, "Qwen4ExpSession::prefetch_ple: first = ", first, ", expected 0..", T - 1);
@@ -565,7 +722,7 @@ void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t firs
     // Rows of every id (the history runs through them), then the ones asked for. While a verify awaits its outcome
     // the ids start where the verify did (a rejection's kept prefix + the corrected token).
     std::vector<int64_t> tok(ids.begin(), ids.end()), rows((size_t)(T * 16));
-    PleHistory h = verify_pending_ ? verify_hist_ : ple_hist_;
+    PleHistory h = sq.verify_pending ? sq.verify_hist : sq.ple_hist;
     ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), T, h, rows.data());
     rows.erase(rows.begin(), rows.begin() + first * 16);
     // A prefetch that doesn't keep up is worth nothing: past a few queued, skip (the gather reads the rows itself).
@@ -578,8 +735,8 @@ void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t firs
             } catch (const std::exception &ex) {
                 // Not the forward's failure: the gather that needs these rows reads them and reports its own.
                 if (ple_prefetch_failed_++ < 10)
-                    std::fprintf(stderr, "Qwen4ExpSession::prefetch_ple: prefetch failed (the gather retries): %s\n",
-                                 ex.what());
+                    slog(LogLevel::Warning, "Qwen4ExpSession::prefetch_ple: prefetch failed (the gather retries): %s",
+                         ex.what());
             }
             ++ple_prefetches_;
             ple_prefetch_ns_ +=
@@ -592,22 +749,23 @@ void Qwen4ExpSession::prefetch_ple(const std::vector<int32_t> &ids, int64_t firs
 // Row ids [T, 16] -> ple_host_[buf] as the activation dtype: on the persistent worker (small forwards) or an async
 // thread (prefill chunks, lookahead). The caller guarantees nothing reads the buffer (no upload from it pending)
 // until the returned future is ready.
-std::future<void> Qwen4ExpSession::start_ple_gather(std::vector<int64_t> rows, int64_t T, int buf, PleRun run) {
+std::future<void> Qwen4ExpSession::start_ple_gather(std::vector<int64_t> rows, int64_t T, PinnedHostBuffer &dst,
+                                                    PleRun run) {
     const int64_t pe = m_.dims().ple_e;
-    STRIX_CHECK(buf == 0 || buf == 1, "Qwen4ExpSession: PLE host buffer ", buf);
     STRIX_CHECK(T >= 1 && T <= max_tokens_ && (int64_t)rows.size() == T * 16, "Qwen4ExpSession: PLE gather of ", T,
                 " tokens with ", rows.size(), " row ids, expected 1..", max_tokens_, " tokens x 16");
-    STRIX_CHECK(ple_host_[buf].size() >= (size_t)(T * pe) * es(m_.act()), "Qwen4ExpSession: PLE host buffer ", buf,
-                " holds ", ple_host_[buf].size(), " bytes, needs ", (size_t)(T * pe) * es(m_.act()));
-    auto job = [this, rows = std::move(rows), T, pe, buf] {
+    STRIX_CHECK(dst.size() >= (size_t)(T * pe) * es(m_.act()), "Qwen4ExpSession: PLE host buffer of ", dst.size(),
+                " bytes, needs ", (size_t)(T * pe) * es(m_.act()));
+    void *dstp = dst.get();
+    auto job = [this, rows = std::move(rows), T, pe, dstp] {
         const auto t0 = std::chrono::steady_clock::now();
         const NgramRowSource &ng = m_.ngram_rows();
         if (m_.act() == Act::BF16) {
-            ng.gather(rows.data(), (int64_t)rows.size(), static_cast<uint16_t *>(ple_host_[buf].get()));
+            ng.gather(rows.data(), (int64_t)rows.size(), static_cast<uint16_t *>(dstp));
         } else {
             std::vector<uint16_t> bits((size_t)(T * pe));
             ng.gather(rows.data(), (int64_t)rows.size(), bits.data());
-            float *f = static_cast<float *>(ple_host_[buf].get());
+            float *f = static_cast<float *>(dstp);
             for (size_t k = 0; k < bits.size(); ++k) f[k] = bf16_bits_to_f32(bits[k]);
         }
         ++ple_gathers_;
@@ -730,17 +888,17 @@ void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
     const char *fn = "Qwen4ExpSession::set_positions";
     STRIX_CHECK(pos3.size() % 3 == 0, fn, ": ", pos3.size(), " values, expected a whole number of (t,h,w) triples");
     if (pos3.empty()) {  // clear: the next forward is on the scalar path again (any text-only call may do this)
-        pending3_.clear();
+        st().pending3.clear();
         return;
     }
     const int64_t rows = (int64_t)pos3.size() / 3;
-    STRIX_CHECK(!verify_pending_, fn, ": a forward_verify awaits keep_verify / drop_verify - the next forward's "
+    STRIX_CHECK(!st().verify_pending, fn, ": a forward_verify awaits keep_verify / drop_verify - the next forward's "
                 "rows are undefined until then");
-    STRIX_CHECK(pending3_.empty(), fn, ": positions for the next forward are already set (", pending3_.size() / 3,
+    STRIX_CHECK(st().pending3.empty(), fn, ": positions for the next forward are already set (", st().pending3.size() / 3,
                 " rows) - forward them or clear with an empty vector");
     STRIX_CHECK(rows >= 1 && rows <= max_tokens_, fn, ": ", rows, " rows, expected 1..", max_tokens_,
                 " (one forward of at most max_tokens rows)");
-    STRIX_CHECK(pos_ + rows <= capacity_, fn, ": rows [", pos_, ", ", pos_ + rows, ") exceed the capacity ",
+    STRIX_CHECK(st().pos + rows <= capacity_, fn, ": rows [", st().pos, ", ", st().pos + rows, ") exceed the capacity ",
                 capacity_);
     const int64_t max_pos = m_.dims().max_positions();
     for (int64_t r = 0; r < rows; ++r)
@@ -752,32 +910,32 @@ void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
         }
     // The span must continue the history exactly (the vision position-walk design note). Rows at or past the
     // position are the pending span's - a set_positions while a previous span is still un-forwarded was
-    // refused above, and no other call advances pos_ with a span pending.
+    // refused above, and no other call advances st().pos with a span pending.
     // The span must continue the history exactly (the vision position-walk design note). While the history is
     // empty (a text-only session that never set positions, or one resumed after the image) there is nothing
-    // to continue - the first interleaved span can start anywhere valid. Once non-empty it must reach pos_
-    // (every forward extends it), and rows at or past pos_ are the pending span's.
-    if (!pos3_host_.empty()) {
-        STRIX_CHECK(pos3Hend() == pos_, fn, ": the triple history covers [", pos3_start_, ", ", pos3Hend(),
-                    ") but the position is ", pos_, " (internal: every forward extends the history to pos_)");
-        const int64_t *last = pos3_host_.data() + (size_t)((pos3Hend() - pos3_start_ - 1) * 3);
-        const Cont want = continuation_of(last, pos3_host_.data(), (int64_t)pos3_host_.size() / 3);
-        STRIX_CHECK(accepts(want, pos3.data()), fn, ": row ", pos_, " is ", triple_str(pos3.data()), " but the "
-                    "history's row ", pos_ - 1, " ", triple_str(last),
+    // to continue - the first interleaved span can start anywhere valid. Once non-empty it must reach st().pos
+    // (every forward extends it), and rows at or past st().pos are the pending span's.
+    if (!st().pos3_host.empty()) {
+        STRIX_CHECK(st().pos3Hend() == st().pos, fn, ": the triple history covers [", st().pos3_start, ", ", st().pos3Hend(),
+                    ") but the position is ", st().pos, " (internal: every forward extends the history to st().pos)");
+        const int64_t *last = st().pos3_host.data() + (size_t)((st().pos3Hend() - st().pos3_start - 1) * 3);
+        const Cont want = continuation_of(last, st().pos3_host.data(), (int64_t)st().pos3_host.size() / 3);
+        STRIX_CHECK(accepts(want, pos3.data()), fn, ": row ", st().pos, " is ", triple_str(pos3.data()), " but the "
+                    "history's row ", st().pos - 1, " ", triple_str(last),
                     " continues at " + triple_str(want.exact.data()) +
                         (want.kind == ContKind::kEndOrImage ? " (or an image step at the block edge)"
                                                             : std::string()));
     } else {
         // First interleaved span of a text-only (or after-image resumed) session: its first row continues the
         // uniform prefix, so it sits at the scalar continuation of the current position.
-        const int64_t want[3] = {pos_ + rope_delta_, pos_ + rope_delta_, pos_ + rope_delta_};
-        STRIX_CHECK(triple_eq(pos3.data(), want), fn, ": row ", pos_, " is ", triple_str(pos3.data()), " but the "
+        const int64_t want[3] = {st().pos + st().rope_delta, st().pos + st().rope_delta, st().pos + st().rope_delta};
+        STRIX_CHECK(triple_eq(pos3.data(), want), fn, ": row ", st().pos, " is ", triple_str(pos3.data()), " but the "
                     "uniform prefix continues at ", triple_str(want), " (the first interleaved row must sit at "
-                    "the walk's current position ", pos_, " + delta)");
+                    "the walk's current position ", st().pos, " + delta)");
     }
-    history_ever_interleaved_ = history_ever_interleaved_ || rope_delta_ != 0 || !pos3_host_.empty();  // (delta is
+    st().history_ever_interleaved = st().history_ever_interleaved || st().rope_delta != 0 || !st().pos3_host.empty();  // (delta is
     // <= 0 by invariant - nonzero only after an image packed positions ahead of the sequence indices)
-    pending3_ = std::move(pos3);
+    st().pending3 = std::move(pos3);
 }
 
 // Point the rope triple array at the forward's block span [4*(seq/4), seq+n) and fill mk_block_ / mk_jobs_.
@@ -792,28 +950,31 @@ void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
 // Called once per forward (after its pending rows joined the history - its MTP part runs the same rows), by
 // keep_verify_prefix and by run_mtp. seq is a sequence index - the scalar kernels' angle positions get
 // rope_delta added by the callers, never here.
-void Qwen4ExpSession::prepare_positions(int64_t seq, int64_t n) {
+void Qwen4ExpSession::prepare_positions(Qwen4ExpSeqState &sq, int64_t seq, int64_t n) {
     const char *fn = "Qwen4ExpSession::prepare_positions";
     STRIX_CHECK(n >= 1 && seq >= 0 && seq + n <= capacity_, fn, ": span [", seq, ", ", seq + n, ") outside [0, ",
                 capacity_, ")");
-    STRIX_CHECK(pending3_.empty(), fn, ": set_positions rows for the forward are not in the history yet "
+    STRIX_CHECK(sq.pending3.empty(), fn, ": set_positions rows for the forward are not in the history yet "
                 "(forward consumes them first)");
-    STRIX_CHECK(rope_delta_ <= 0, fn, ": rope_delta_ = ", rope_delta_, ", expected <= 0 (internal: an image "
+    STRIX_CHECK(sq.rope_delta <= 0, fn, ": sq.rope_delta = ", sq.rope_delta, ", expected <= 0 (internal: an image "
                 "block's h*w rows consume max(h,w) positions, so positions only ever pack ahead of sequence "
                 "indices)");
+    // keep_verify_prefix and run_mtp come through here too, and the draft head's rows can run any number of steps
+    // past the last forward: the paged K/V for the span is mapped now.
+    ensure_rows(sq, seq + n);
     mk_block_ = kernels::MropePos{}, mk_jobs_ = kernels::MropePos{};
     const int64_t t0 = (seq / kernels::kQsaBlock) * kernels::kQsaBlock;  // the block span's first row
-    const int64_t hstart = pos3_start_, hend = pos3Hend();  // the history holds rows [hstart, hend)
+    const int64_t hstart = sq.pos3_start, hend = sq.pos3Hend();  // the history holds rows [hstart, hend)
     bool span_diff = false;  // a row of the forward's span [seq, seq+n) with a non-scalar triple
     bool window_diff = false;  // ... or anywhere in the block window [t0, seq+n)
     for (int64_t r = std::max(t0, hstart); r < std::min(hend, seq + n); ++r) {
-        const int64_t *tr = pos3_host_.data() + (size_t)((r - hstart) * 3);
-        const int64_t v = rope_pos(r);
+        const int64_t *tr = sq.pos3_host.data() + (size_t)((r - hstart) * 3);
+        const int64_t v = (r + sq.rope_delta);
         const bool differs = !(tr[0] == v && tr[1] == v && tr[2] == v);
         span_diff = span_diff || (r >= seq && differs);
         window_diff = window_diff || differs;
     }
-    const bool uploaded = window_diff || rope_delta_ != 0;  // (delta is <= 0 once a block packed positions ahead)
+    const bool uploaded = window_diff || sq.rope_delta != 0;  // (delta is <= 0 once a block packed positions ahead)
     UploadTrace probe{seq, n, -1, -1, -1, -1};
     auto finish = [&] {
         if (uploaded) {  // hand the kernels their views (the calls re-validate base / rows / alignment)
@@ -834,17 +995,19 @@ void Qwen4ExpSession::prepare_positions(int64_t seq, int64_t n) {
     stage3_.reserve((size_t)(rows * 3));
     const int64_t hs = std::max(t0, hstart), he = std::max(hs, std::min(hend, seq + n));
     auto push_scalar = [&](int64_t r) {
-        const int64_t v = rope_pos(r);
+        const int64_t v = (r + sq.rope_delta);
         stage3_.insert(stage3_.end(), {v, v, v});
     };
     for (int64_t r = t0; r < hs; ++r) push_scalar(r);
     if (hs < he)
-        stage3_.insert(stage3_.end(), pos3_host_.begin() + (hs - hstart) * 3, pos3_host_.begin() + (he - hstart) * 3);
+        stage3_.insert(stage3_.end(), sq.pos3_host.begin() + (hs - hstart) * 3, sq.pos3_host.begin() + (he - hstart) * 3);
     for (int64_t r = he; r < seq + n; ++r) push_scalar(r);
     STRIX_CHECK((int64_t)stage3_.size() == rows * 3, fn, ": staged ", stage3_.size() / 3, " rows for the span [", t0,
                 ", ", seq + n, ")");
     if (pos3_dev_.size() == 0)  // (get() throws on the empty buffer - size() is the allocation test)
         pos3_dev_ = DeviceBuffer<int64_t>((size_t)capacity_ * 3, "mRoPE triples");
+    // stage3_ is pageable, not pinned: moving it to a pinned buffer needs an event gate before its next write
+    // (the gfx1151 pinned-reuse hazard).
     STRIX_HIP_CHECK(hipMemcpyAsync(pos3_dev_.get(), stage3_.data(), (size_t)(rows * 3) * sizeof(int64_t),
                                    hipMemcpyHostToDevice, stream_),
                     fn, ": uploading rows [", t0, ", ", seq + n, ")");
@@ -873,42 +1036,77 @@ void Qwen4ExpSession::reset() {
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero attention error");
     if (kv_format_ == KvFormat::Q8)
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero 8-bit K/V error");
-    pos_ = 0, tail_cur_ = 0, mtp_tail_cur_ = 0, broken_ = false, mtp_chain_step_ = -1, verify_pending_ = false;  // GDN states reset on the first call (reset_state); KV overwritten
-    rope_delta_ = 0, history_ever_interleaved_ = false, verify_delta_before_ = 0, verify_ever_before_ = false,
-        verify_hist_start_before_ = 0;
-    pos3_start_ = 0;
-    pos3_host_.clear(), pending3_.clear(), verify_hist_before_.clear();
+    // Every state (the slots) back to position 0; the error words / position upload machinery above are per-forward.
+    for (size_t k = 0; k < seqs_.size(); ++k) reset_seq_state(*seqs_[k]);
+    broken_ = false;
     mk_block_ = kernels::MropePos{}, mk_jobs_ = kernels::MropePos{};
-    imported_at_ = -1;
-    if (mtp_)  // position 0's MTP row pairs its token with no trunk state: zeros
-        STRIX_HIP_CHECK(hipMemset(mtp_prev_.get(), 0, mtp_prev_.size()), "Qwen4ExpSession: zero MTP previous streams");
     ple_lookahead_.clear();  // a pending gather stays: the next forward's ids / history decide whether it's used
-    rewind_to_.push_back(0);
-    if (m_.dims().ple_layer >= 0) {
-        STRIX_HIP_CHECK(hipMemset(ple_state_.get(), 0, ple_state_.size()), "Qwen4ExpSession: zero PLE state");
-        ple_hist_ = PleHistory::fresh(m_.ngram_rows().hash_params());
+}
+
+void Qwen4ExpSession::reset(int seq) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::reset: seq ", seq, ", expected 0..", n_slots() - 1);
+    STRIX_CHECK(!broken_, "Qwen4ExpSession::reset: seq ", seq, ": an earlier call failed midway - any slot's state may "
+                "be half-written, reset() them all");
+    STRIX_CHECK(!seqs_[(size_t)seq]->verify_pending, "Qwen4ExpSession::reset: seq ", seq,
+                " has a verify pending - resolve it first (the other runs of its batch share the forward)");
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::reset(seq)");
+    reset_seq_state(*seqs_[(size_t)seq]);
+}
+
+void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
+    // Paged K/V keeps its pages: the next conversation reuses them (runtime/paged_buffer.hpp - no page is released
+    // while the buffer lives).
+    {
+        s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
+        s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;
+        s.rope_delta = 0, s.history_ever_interleaved = false, s.verify_delta_before = 0, s.verify_ever_before = false,
+            s.verify_hist_start_before = 0;
+        s.pos3_start = 0;
+        s.pos3_host.clear(), s.pending3.clear(), s.verify_hist_before.clear();
+        s.imported_at = -1;
+        if (mtp_)  // position 0's MTP row pairs its token with no trunk state: zeros
+            STRIX_HIP_CHECK(hipMemset(s.mtp_prev.get(), 0, s.mtp_prev.size()), "Qwen4ExpSession: zero MTP previous streams");
+        if (m_.dims().ple_layer >= 0) {
+            STRIX_HIP_CHECK(hipMemset(s.ple_state.get(), 0, s.ple_state.size()), "Qwen4ExpSession: zero PLE state");
+            s.ple_hist = PleHistory::fresh(m_.ngram_rows().hash_params());
+        }
+        s.rewind_to.push_back(0);
     }
 }
 
+int64_t Qwen4ExpSession::pos(int seq) const {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::pos: seq ", seq, ", expected 0..", n_slots() - 1);
+    return seqs_[(size_t)seq]->pos;
+}
+
 Qwen4ExpSnapshot Qwen4ExpSession::make_snapshot() const {
+    return make_snapshot(0);
+}
+
+// A snapshot of one slot's state (feat/multi-sequence): the buffers are that state's; saving / restoring
+// one never touches another's (the engine keeps a snapshot set per slot).
+Qwen4ExpSnapshot Qwen4ExpSession::make_snapshot(int seq) const {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::make_snapshot: seq ", seq, ", expected 0..",
+                n_slots() - 1);
+    Qwen4ExpSeqState &st = *seqs_[(size_t)seq];
     const Qwen4ExpDims &D = m_.dims();
     Qwen4ExpSnapshot s;
     for (int64_t i = 0; i < D.layers; ++i) {
         const std::string tag = "snapshot layer " + std::to_string(i);
         const size_t l = (size_t)i;
-        s.conv_.emplace_back(conv_state_[l].size() ? DeviceBuffer<uint8_t>(conv_state_[l].size(), "conv state " + tag)
+        s.conv_.emplace_back(st.conv_state[l].size() ? DeviceBuffer<uint8_t>(st.conv_state[l].size(), "conv state " + tag)
                                                     : DeviceBuffer<uint8_t>());
-        s.rec_.emplace_back(rec_state_[l].size() ? DeviceBuffer<float>(rec_state_[l].size(), "recurrent state " + tag)
+        s.rec_.emplace_back(st.rec_state[l].size() ? DeviceBuffer<float>(st.rec_state[l].size(), "recurrent state " + tag)
                                                   : DeviceBuffer<float>());
-        s.tail_.emplace_back(tail_[0][l].size() ? DeviceBuffer<uint8_t>(tail_[0][l].size(), "indexer tail " + tag)
+        s.tail_.emplace_back(st.tail[0][l].size() ? DeviceBuffer<uint8_t>(st.tail[0][l].size(), "indexer tail " + tag)
                                                  : DeviceBuffer<uint8_t>());
-        s.kv8_tail_.emplace_back(kv8_tail_[0][l].size() ? DeviceBuffer<uint8_t>(kv8_tail_[0][l].size(), "K/V tail " + tag)
+        s.kv8_tail_.emplace_back(st.kv8_tail[0][l].size() ? DeviceBuffer<uint8_t>(st.kv8_tail[0][l].size(), "K/V tail " + tag)
                                                          : DeviceBuffer<uint8_t>());
     }
-    if (ple_state_.size()) s.ple_state_ = DeviceBuffer<uint8_t>(ple_state_.size(), "snapshot PLE conv state");
+    if (st.ple_state.size()) s.ple_state_ = DeviceBuffer<uint8_t>(st.ple_state.size(), "snapshot PLE conv state");
     if (mtp_) {
-        s.mtp_tail_ = DeviceBuffer<uint8_t>(tail_mtp_[0].size(), "snapshot MTP indexer tail");
-        s.mtp_prev_ = DeviceBuffer<uint8_t>(mtp_prev_.size(), "snapshot MTP previous streams");
+        s.mtp_tail_ = DeviceBuffer<uint8_t>(st.tail_mtp[0].size(), "snapshot MTP indexer tail");
+        s.mtp_prev_ = DeviceBuffer<uint8_t>(st.mtp_prev.size(), "snapshot MTP previous streams");
     }
     return s;
 }
@@ -925,51 +1123,73 @@ void copy_state(const DeviceBuffer<T> &from, const DeviceBuffer<T> &to, hipStrea
 }  // namespace
 
 void Qwen4ExpSession::save(Qwen4ExpSnapshot &s) {
+    save(0, s);
+}
+
+void Qwen4ExpSession::save(int seq, Qwen4ExpSnapshot &s) {
+    const char *fn = "Qwen4ExpSession::save";
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
+    Qwen4ExpSeqState &st = *seqs_[(size_t)seq];
     STRIX_CHECK(!broken_, "Qwen4ExpSession::save: an earlier call failed midway; the state is not worth saving");
-    STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::save: a forward_verify awaits keep_verify / drop_verify");
-    STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::save: set_positions holds ", pending3_.size() / 3,
+    STRIX_CHECK(!st.verify_pending, "Qwen4ExpSession::save: a forward_verify awaits keep_verify / drop_verify");
+    STRIX_CHECK(st.pending3.empty(), "Qwen4ExpSession::save: set_positions holds ", st.pending3.size() / 3,
                 " interleaved rows the position doesn't include yet - forward them first");
-    STRIX_CHECK(s.conv_.size() == conv_state_.size(), "Qwen4ExpSession::save: snapshot has ", s.conv_.size(),
-                " layers, the session ", conv_state_.size(), " (make it with make_snapshot)");
-    for (size_t l = 0; l < conv_state_.size(); ++l) {
-        copy_state(conv_state_[l], s.conv_[l], stream_, "conv state");
-        copy_state(rec_state_[l], s.rec_[l], stream_, "recurrent state");
-        copy_state(tail_[tail_cur_][l], s.tail_[l], stream_, "indexer tail");
-        copy_state(kv8_tail_[tail_cur_][l], s.kv8_tail_[l], stream_, "K/V tail");
+    STRIX_CHECK(s.conv_.size() == st.conv_state.size(), "Qwen4ExpSession::save: snapshot has ", s.conv_.size(),
+                " layers, the session ", st.conv_state.size(), " (make it with make_snapshot)");
+    for (size_t l = 0; l < st.conv_state.size(); ++l) {
+        copy_state(st.conv_state[l], s.conv_[l], stream_, "conv state");
+        copy_state(st.rec_state[l], s.rec_[l], stream_, "recurrent state");
+        copy_state(st.tail[st.tail_cur][l], s.tail_[l], stream_, "indexer tail");
+        copy_state(st.kv8_tail[st.tail_cur][l], s.kv8_tail_[l], stream_, "K/V tail");
     }
-    copy_state(ple_state_, s.ple_state_, stream_, "PLE conv state");
-    copy_state(tail_mtp_[mtp_tail_cur_], s.mtp_tail_, stream_, "MTP indexer tail");
-    copy_state(mtp_prev_, s.mtp_prev_, stream_, "MTP previous streams");
+    copy_state(st.ple_state, s.ple_state_, stream_, "PLE conv state");
+    copy_state(st.tail_mtp[st.mtp_tail_cur], s.mtp_tail_, stream_, "MTP indexer tail");
+    copy_state(st.mtp_prev, s.mtp_prev_, stream_, "MTP previous streams");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::save");
-    s.ple_hist_ = ple_hist_;
-    s.pos_ = pos_;
-    s.epoch_ = rewind_to_.size() - 1;
+    s.ple_hist_ = st.ple_hist;
+    s.pos_ = st.pos;
+    s.epoch_ = st.rewind_to.size() - 1;
     // mRoPE: rope_delta and the last three history rows (the continuation rule a resume needs; whole-history
     // resume isn't a thing until image serving refuses less, vision Phase A - and restore
     // refuses an image-row tail outright, so what a snapshot really carries is the delta and the proof the
     // tail is text). Throws when the tail can't derive a continuation (a saved row in the middle of a single
     // image block row with nothing to derive the width from) - guessing is not an option.
-    s.rope_delta_ = rope_delta_;
-    const int64_t hlen = (int64_t)pos3_host_.size() / 3;
+    s.rope_delta_ = st.rope_delta;
+    const int64_t hlen = (int64_t)st.pos3_host.size() / 3;
     s.ntriples_ = std::min<int64_t>(3, hlen);
-    s.triples_.assign(pos3_host_.end() - (size_t)(s.ntriples_ * 3), pos3_host_.end());
+    s.triples_.assign(st.pos3_host.end() - (size_t)(s.ntriples_ * 3), st.pos3_host.end());
     s.first_cont_ = hlen > 0
-                        ? continuation_value_of(pos3_host_.data() + (size_t)((hlen - 1) * 3), pos3_host_.data(),
+                        ? continuation_value_of(st.pos3_host.data() + (size_t)((hlen - 1) * 3), st.pos3_host.data(),
                                                 hlen, "Qwen4ExpSession::save")
-                        : std::array<int64_t, 3>{pos_ + rope_delta_, pos_ + rope_delta_, pos_ + rope_delta_};
+                        : std::array<int64_t, 3>{st.pos + st.rope_delta, st.pos + st.rope_delta, st.pos + st.rope_delta};
 }
 
 bool Qwen4ExpSession::can_restore(const Qwen4ExpSnapshot &s) const {
-    if (s.pos_ < 0 || s.conv_.size() != conv_state_.size() || s.epoch_ >= rewind_to_.size()) return false;
-    for (size_t e = s.epoch_ + 1; e < rewind_to_.size(); ++e)
-        if (rewind_to_[e] < s.pos_) return false;
+    return can_restore(0, s);
+}
+
+bool Qwen4ExpSession::can_restore(int seq, const Qwen4ExpSnapshot &s) const {
+    if (seq < 0 || seq >= n_slots()) return false;
+    const Qwen4ExpSeqState &st = *seqs_[(size_t)seq];
+    if (s.pos_ < 0 || s.conv_.size() != st.conv_state.size() || s.epoch_ >= st.rewind_to.size()) return false;
+    for (size_t e = s.epoch_ + 1; e < st.rewind_to.size(); ++e)
+        if (st.rewind_to[e] < s.pos_) return false;
     // Every rewind since was to >= s.pos_, and forwards only write at or past the position they start from, so
     // KV and block keys below s.pos_ are the ones the snapshot's state was built with.
     return true;
 }
 
 void Qwen4ExpSession::restore(const Qwen4ExpSnapshot &s) {
-    STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::restore: set_positions holds ", pending3_.size() / 3,
+    restore(0, s);
+}
+
+// Restoring a slot's state (feat/multi-sequence) - snapshot discipline as the docs above (one snapshot
+// belongs to the state it was made against; the epoch check is that state's rewind history).
+void Qwen4ExpSession::restore(int seq, const Qwen4ExpSnapshot &s) {
+    const char *fn = "Qwen4ExpSession::restore";
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
+    Qwen4ExpSeqState &st = *seqs_[(size_t)seq];
+    STRIX_CHECK(st.pending3.empty(), "Qwen4ExpSession::restore: set_positions holds ", st.pending3.size() / 3,
                 " interleaved rows the snapshot doesn't cover - forward them or clear first");
     STRIX_CHECK(s.pos_ >= 0, "Qwen4ExpSession::restore: the snapshot was never saved");
     // Image-position resumes are refused (vision Phase A decision): a snapshot saved inside or
@@ -986,32 +1206,32 @@ void Qwen4ExpSession::restore(const Qwen4ExpSnapshot &s) {
                 "span (its last saved row ", triple_str(s.triples() + (s.ntriples_ - 1) * 3),
                 " continues at ", triple_str(s.first_continuation()),
                 ", not uniformly) - resuming mid-image isn't implemented; rewind or restart the prompt");
-    verify_pending_ = false;  // a restore replaces all state a pending verify could have left
-    STRIX_CHECK(can_restore(s), "Qwen4ExpSession::restore: the session rewound below the snapshot's position ", s.pos_,
+    st.verify_pending = false;  // a restore replaces all state a pending verify could have left
+    STRIX_CHECK(can_restore(seq, s), "Qwen4ExpSession::restore: the session rewound below the snapshot's position ", s.pos_,
                 " since it was saved, so its KV cache no longer matches");
-    for (size_t l = 0; l < conv_state_.size(); ++l) {
-        copy_state(s.conv_[l], conv_state_[l], stream_, "conv state");
-        copy_state(s.rec_[l], rec_state_[l], stream_, "recurrent state");
-        copy_state(s.tail_[l], tail_[tail_cur_][l], stream_, "indexer tail");
-        copy_state(s.kv8_tail_[l], kv8_tail_[tail_cur_][l], stream_, "K/V tail");
+    for (size_t l = 0; l < st.conv_state.size(); ++l) {
+        copy_state(s.conv_[l], st.conv_state[l], stream_, "conv state");
+        copy_state(s.rec_[l], st.rec_state[l], stream_, "recurrent state");
+        copy_state(s.tail_[l], st.tail[st.tail_cur][l], stream_, "indexer tail");
+        copy_state(s.kv8_tail_[l], st.kv8_tail[st.tail_cur][l], stream_, "K/V tail");
     }
-    copy_state(s.ple_state_, ple_state_, stream_, "PLE conv state");
-    copy_state(s.mtp_tail_, tail_mtp_[mtp_tail_cur_], stream_, "MTP indexer tail");
-    copy_state(s.mtp_prev_, mtp_prev_, stream_, "MTP previous streams");
+    copy_state(s.ple_state_, st.ple_state, stream_, "PLE conv state");
+    copy_state(s.mtp_tail_, st.tail_mtp[st.mtp_tail_cur], stream_, "MTP indexer tail");
+    copy_state(s.mtp_prev_, st.mtp_prev, stream_, "MTP previous streams");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::restore");
-    ple_hist_ = s.ple_hist_;
-    pos_ = s.pos_;
+    st.ple_hist = s.ple_hist_;
+    st.pos = s.pos_;
     // mRoPE: the scalar continuation state; with a needs_tail resume also the last saved rows, so the first
     // forward's block window can rope its tail keys with them (rows below them never re-enter a window).
-    rope_delta_ = s.rope_delta_;
-    history_ever_interleaved_ = s.has_triples();
-    pos3_host_.clear();
-    if (needs_tail) pos3_host_ = s.triples_;
-    pos3_start_ = pos_ - (int64_t)pos3_host_.size() / 3;
-    STRIX_CHECK(pos3Hend() == pos_, "Qwen4ExpSession::restore: history [", pos3_start_, ", ", pos3Hend(),
-                ") doesn't end at the restored position ", pos_, " (internal)");
-    broken_ = false, mtp_chain_step_ = -1;
-    rewind_to_.push_back(s.pos_);
+    st.rope_delta = s.rope_delta_;
+    st.history_ever_interleaved = s.has_triples();
+    st.pos3_host.clear();
+    if (needs_tail) st.pos3_host = s.triples_;
+    st.pos3_start = st.pos - (int64_t)st.pos3_host.size() / 3;
+    STRIX_CHECK(st.pos3Hend() == st.pos, "Qwen4ExpSession::restore: history [", st.pos3_start, ", ", st.pos3Hend(),
+                ") doesn't end at the restored position ", st.pos, " (internal)");
+    broken_ = false, st.mtp_chain_step = -1;
+    st.rewind_to.push_back(s.pos_);
 }
 
 size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
@@ -1023,14 +1243,14 @@ size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
     const size_t kv = 2 * (size_t)((n - from) * D.hkv * D.hd) * e,
                  keys = (size_t)((n / kernels::kQsaBlock - from / kernels::kQsaBlock) * D.idx_d) * e;
     size_t b = sizeof(PleHistory) + sizeof(Qwen4ExpStateHeader);
-    for (size_t l = 0; l < conv_state_.size(); ++l) {
+    for (size_t l = 0; l < st().conv_state.size(); ++l) {
         if (D.is_attention[l])
-            b += (kv_format_ == KvFormat::Q8 ? kv8_state_bytes(n, from) : kv) + keys + tail_[0][l].size();
+            b += (kv_format_ == KvFormat::Q8 ? kv8_state_bytes(n, from) : kv) + keys + st().tail[0][l].size();
         else
-            b += conv_state_[l].size() + rec_state_[l].size() * sizeof(float);
+            b += st().conv_state[l].size() + st().rec_state[l].size() * sizeof(float);
     }
-    b += ple_state_.size();
-    if (mtp_) b += kv + keys + tail_mtp_[0].size() + mtp_prev_.size();
+    b += st().ple_state.size();
+    if (mtp_) b += kv + keys + st().tail_mtp[0].size() + st().mtp_prev.size();
     return b;
 }
 
@@ -1046,12 +1266,16 @@ void block_keys_copy(uint8_t *&cur, const void *dev, int64_t b0, int64_t b1, int
     if (b1 == b0) return;
     const size_t row = (size_t)((b1 - b0) * 8) * e, pitch = (size_t)(cap_blocks * 8) * e, rows = (size_t)(D / 8);
     uint8_t *d = static_cast<uint8_t *>(const_cast<void *>(dev)) + (size_t)(b0 * 8) * e;
-    if (to_host)
-        STRIX_HIP_CHECK(hipMemcpy2DAsync(cur, row, d, pitch, row, rows, hipMemcpyDeviceToHost, stream),
-                        "Qwen4ExpSession export: block keys");
-    else
-        STRIX_HIP_CHECK(hipMemcpy2DAsync(d, pitch, cur, row, row, rows, hipMemcpyHostToDevice, stream),
-                        "Qwen4ExpSession import: block keys");
+    // One copy per 8-dimension chunk, not a 2D copy: the cache is paged, and the pitch's gaps between the chunks' used
+    // blocks are unmapped (a 2D copy over them is refused). The host bytes are the same, chunk after chunk.
+    for (size_t c = 0; c < rows; ++c) {
+        if (to_host)
+            STRIX_HIP_CHECK(hipMemcpyAsync(cur + c * row, d + c * pitch, row, hipMemcpyDeviceToHost, stream),
+                            "Qwen4ExpSession export: block keys, chunk ", c);
+        else
+            STRIX_HIP_CHECK(hipMemcpyAsync(d + c * pitch, cur + c * row, row, hipMemcpyHostToDevice, stream),
+                            "Qwen4ExpSession import: block keys, chunk ", c);
+    }
     cur += row * rows;
 }
 
@@ -1077,20 +1301,21 @@ size_t Qwen4ExpSession::kv8_state_bytes(int64_t n, int64_t from) const {
            kernels::kv8_tail_bytes(W, m_.act());
 }
 
-void Qwen4ExpSession::kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t from, const DeviceBuffer<uint8_t> &tail,
-                               bool to_host, std::vector<std::pair<uint8_t *, size_t>> *unused) {
+void Qwen4ExpSession::kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t layer, int64_t n, int64_t from,
+                               const DeviceBuffer<uint8_t> &tail, bool to_host,
+                               std::vector<std::pair<uint8_t *, size_t>> *unused) {
     const Qwen4ExpDims &D = m_.dims();
     const int64_t W = D.hkv * D.hd, G = kernels::kKv8Group, cap = kv8_cap_, ga = from / G, gb = n / G;
-    STRIX_CHECK(layer < kv8_store_.size() && kv8_store_[layer].size() == kernels::kv8_bytes(cap, W),
+    STRIX_CHECK(layer < sq.kv8_store.size() && sq.kv8_store[layer].capacity() >= kernels::kv8_bytes(cap, W),
                 "Qwen4ExpSession::kv8_copy: layer ", layer, " has no 8-bit K/V storage");
     STRIX_CHECK(tail.size() == kernels::kv8_tail_bytes(W, m_.act()), "Qwen4ExpSession::kv8_copy: tail of ",
                 tail.size(), " bytes, expected ", kernels::kv8_tail_bytes(W, m_.act()));
-    uint8_t *st = kv8_store_[layer].get();
+    uint8_t *store = sq.kv8_store[layer].get();
     const size_t kc = (size_t)(cap * W), kp = (size_t)((cap / G) * W) * 4, nb = (size_t)(W / kernels::kKv8Block);
-    host_copy(cur, st + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_, "8-bit K codes");
-    host_copy(cur, st + kc + (size_t)(ga * W) * 4, (size_t)((gb - ga) * W) * 4, to_host, stream_, "8-bit K params");
-    host_copy(cur, st + kc + kp + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_, "8-bit V codes");
-    host_copy(cur, st + 2 * kc + kp + (size_t)(ga * G) * nb * 4, (size_t)((gb - ga) * G) * nb * 4, to_host, stream_,
+    host_copy(cur, store + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_, "8-bit K codes");
+    host_copy(cur, store + kc + (size_t)(ga * W) * 4, (size_t)((gb - ga) * W) * 4, to_host, stream_, "8-bit K params");
+    host_copy(cur, store + kc + kp + (size_t)(ga * G * W), (size_t)((gb - ga) * G * W), to_host, stream_, "8-bit V codes");
+    host_copy(cur, store + 2 * kc + kp + (size_t)(ga * G) * nb * 4, (size_t)((gb - ga) * G) * nb * 4, to_host, stream_,
               "8-bit V params");
     // The tail: rows [gb * G, n) valid in each half (K, V).
     const size_t es_ = es(m_.act()), half = (size_t)(G * W) * es_, valid = (size_t)((n - gb * G) * W) * es_;
@@ -1100,8 +1325,14 @@ void Qwen4ExpSession::kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t f
 }
 
 void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
+    export_state(0, s, out, bytes, from);
+}
+
+void Qwen4ExpSession::export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::export_state: seq ", seq, ", expected 0..", n_slots() - 1);
+    const Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     STRIX_CHECK(out != nullptr, "Qwen4ExpSession::export_state: null output");
-    STRIX_CHECK(can_restore(s), "Qwen4ExpSession::export_state: the snapshot (position ", s.pos(),
+    STRIX_CHECK(can_restore(seq, s), "Qwen4ExpSession::export_state: the snapshot (position ", s.pos(),
                 ") is not valid for this session's KV cache any more");
     const int64_t n = s.pos();
     STRIX_CHECK(from >= 0 && from < n, "Qwen4ExpSession::export_state: from = ", from, ", expected 0..", n - 1,
@@ -1118,7 +1349,7 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     Qwen4ExpStateHeader hdr;
     hdr.rope_delta = s.rope_delta_;
     hdr.cont_t = s.first_cont_[0], hdr.cont_h = s.first_cont_[1], hdr.cont_w = s.first_cont_[2];
-    hdr.has_image = history_ever_interleaved_ ? 1 : 0;  // the snapshot's own flag would miss an after-image
+    hdr.has_image = sq.history_ever_interleaved ? 1 : 0;  // the snapshot's own flag would miss an after-image
                                                         // resume (its history was scalarized at restore)
     hdr.ntriples = s.has_triples() ? s.ntriples_ : 0;
     for (int64_t k = 0; k < hdr.ntriples * 3; ++k) hdr.triples[k] = s.triples_[(size_t)k];
@@ -1131,16 +1362,16 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     // sequence. The zeroing waits for the copies.
     const size_t tail_valid = (size_t)((n % kernels::kQsaBlock) * D.idx_d) * e;
     std::vector<std::pair<uint8_t *, size_t>> tail_unused;
-    for (size_t l = 0; l < conv_state_.size(); ++l) {
+    for (size_t l = 0; l < sq.conv_state.size(); ++l) {
         if (D.is_attention[l]) {
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
             if (kv_format_ == KvFormat::Q8) {
-                kv8_copy(cur, l, n, from, s.kv8_tail_[l], true, &tail_unused);
+                kv8_copy(sq, cur, l, n, from, s.kv8_tail_[l], true, &tail_unused);
             } else {
-                host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, true, stream_, "K cache");
-                host_copy(cur, v_cache_[l].get() + (size_t)from * row, kv, true, stream_, "V cache");
+                host_copy(cur, sq.k_cache[l].get() + (size_t)from * row, kv, true, stream_, "K cache");
+                host_copy(cur, sq.v_cache[l].get() + (size_t)from * row, kv, true, stream_, "V cache");
             }
-            block_keys_copy(cur, block_keys_[l].get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
+            block_keys_copy(cur, sq.block_keys[l].get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
             STRIX_CHECK(s.tail_[l].size() >= tail_valid, "Qwen4ExpSession::export_state: indexer tail of ",
                         s.tail_[l].size(), " bytes, ", tail_valid, " valid");
             tail_unused.emplace_back(cur + tail_valid, s.tail_[l].size() - tail_valid);
@@ -1153,9 +1384,9 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, stream_, "PLE conv state");
     if (mtp_) {
         const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-        host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
-        host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
-        block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
+        host_copy(cur, sq.k_cache_mtp.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
+        host_copy(cur, sq.v_cache_mtp.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
+        block_keys_copy(cur, sq.block_keys_mtp.get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
         STRIX_CHECK(s.mtp_tail_.size() >= tail_valid, "Qwen4ExpSession::export_state: MTP indexer tail of ",
                     s.mtp_tail_.size(), " bytes, ", tail_valid, " valid");
         tail_unused.emplace_back(cur + tail_valid, s.mtp_tail_.size() - tail_valid);
@@ -1168,16 +1399,22 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
 }
 
 void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, int64_t from) {
+    import_state(0, in, bytes, n, from);
+}
+
+void Qwen4ExpSession::import_state(int seq, const uint8_t *in, size_t bytes, int64_t n, int64_t from) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::import_state: seq ", seq, ", expected 0..", n_slots() - 1);
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     STRIX_CHECK(in != nullptr, "Qwen4ExpSession::import_state: null input");
     STRIX_CHECK(n >= 1 && n < capacity_, "Qwen4ExpSession::import_state: n = ", n, ", expected 1..", capacity_ - 1);
     STRIX_CHECK(from >= 0 && from < n, "Qwen4ExpSession::import_state: from = ", from, ", expected 0..", n - 1);
     STRIX_CHECK(bytes >= sizeof(Qwen4ExpStateHeader), "Qwen4ExpSession::import_state: ", bytes,
                 " bytes, shorter than a state header (", sizeof(Qwen4ExpStateHeader), ")");
     // A delta lands on the base it was cut from: the rows below `from` must be that base's, imported just before.
-    STRIX_CHECK(from == 0 || (pos_ == from && imported_at_ == from), "Qwen4ExpSession::import_state: a delta from ",
-                from, " needs its base imported just before (position ", pos_, ", last import ended at ", imported_at_,
+    STRIX_CHECK(from == 0 || (sq.pos == from && sq.imported_at == from), "Qwen4ExpSession::import_state: a delta from ",
+                from, " needs its base imported just before (position ", sq.pos, ", last import ended at ", sq.imported_at,
                 ")");
-    STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::import_state: set_positions holds ", pending3_.size() / 3,
+    STRIX_CHECK(sq.pending3.empty(), "Qwen4ExpSession::import_state: set_positions holds ", sq.pending3.size() / 3,
                 " interleaved rows the state doesn't cover - forward them or clear first");
     // The mRoPE header comes first; a blob without it (version 0, exported before this header existed) is
     // named as such and refused - never guessed at (no fallback path). Checked before the exact-size test so a
@@ -1217,6 +1454,8 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     const bool carry_tail = hdr.has_image == 1 && hdr.ntriples > 0 && !triple_uniform(hdr.triples + (hdr.ntriples - 1) * 3);
     const int64_t b0 = from / kernels::kQsaBlock, b1 = n / kernels::kQsaBlock;
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::import_state");
+    // Paged K/V: maps what rows [0, n) need; a deeper previous conversation's pages stay mapped (never released).
+    ensure_rows(sq, n);
     const Qwen4ExpDims &D = m_.dims();
     const size_t e = es(m_.act());
     uint8_t *cur = const_cast<uint8_t *>(in);
@@ -1224,43 +1463,43 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     PleHistory hist;
     std::memcpy(&hist, cur, sizeof(PleHistory));
     cur += sizeof(PleHistory);
-    for (size_t l = 0; l < conv_state_.size(); ++l) {
+    for (size_t l = 0; l < sq.conv_state.size(); ++l) {
         if (D.is_attention[l]) {
             const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
             if (kv_format_ == KvFormat::Q8) {
-                kv8_copy(cur, l, n, from, kv8_tail_[tail_cur_][l], false, nullptr);
+                kv8_copy(sq, cur, l, n, from, sq.kv8_tail[sq.tail_cur][l], false, nullptr);
             } else {
-                host_copy(cur, k_cache_[l].get() + (size_t)from * row, kv, false, stream_, "K cache");
-                host_copy(cur, v_cache_[l].get() + (size_t)from * row, kv, false, stream_, "V cache");
+                host_copy(cur, sq.k_cache[l].get() + (size_t)from * row, kv, false, stream_, "K cache");
+                host_copy(cur, sq.v_cache[l].get() + (size_t)from * row, kv, false, stream_, "V cache");
             }
-            block_keys_copy(cur, block_keys_[l].get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
-            host_copy(cur, tail_[tail_cur_][l].get(), tail_[tail_cur_][l].size(), false, stream_, "indexer tail");
+            block_keys_copy(cur, sq.block_keys[l].get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
+            host_copy(cur, sq.tail[sq.tail_cur][l].get(), sq.tail[sq.tail_cur][l].size(), false, stream_, "indexer tail");
         } else {
-            host_copy(cur, conv_state_[l].get(), conv_state_[l].size(), false, stream_, "conv state");
-            host_copy(cur, rec_state_[l].get(), rec_state_[l].size() * sizeof(float), false, stream_, "recurrent state");
+            host_copy(cur, sq.conv_state[l].get(), sq.conv_state[l].size(), false, stream_, "conv state");
+            host_copy(cur, sq.rec_state[l].get(), sq.rec_state[l].size() * sizeof(float), false, stream_, "recurrent state");
         }
     }
-    host_copy(cur, ple_state_.get(), ple_state_.size(), false, stream_, "PLE conv state");
+    host_copy(cur, sq.ple_state.get(), sq.ple_state.size(), false, stream_, "PLE conv state");
     if (mtp_) {
         const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
-        host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP K cache");
-        host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP V cache");
-        block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
-        host_copy(cur, tail_mtp_[mtp_tail_cur_].get(), tail_mtp_[mtp_tail_cur_].size(), false, stream_,
+        host_copy(cur, sq.k_cache_mtp.get() + (size_t)from * row, kv, false, stream_, "MTP K cache");
+        host_copy(cur, sq.v_cache_mtp.get() + (size_t)from * row, kv, false, stream_, "MTP V cache");
+        block_keys_copy(cur, sq.block_keys_mtp.get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
+        host_copy(cur, sq.tail_mtp[sq.mtp_tail_cur].get(), sq.tail_mtp[sq.mtp_tail_cur].size(), false, stream_,
                   "MTP indexer tail");
-        host_copy(cur, mtp_prev_.get(), mtp_prev_.size(), false, stream_, "MTP previous streams");
+        host_copy(cur, sq.mtp_prev.get(), sq.mtp_prev.size(), false, stream_, "MTP previous streams");
     }
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::import_state");
-    ple_hist_ = hist;
-    rope_delta_ = hdr.rope_delta;
-    history_ever_interleaved_ = hdr.has_image == 1;
-    pos3_host_.clear();
-    if (carry_tail) pos3_host_.assign(hdr.triples, hdr.triples + (size_t)(hdr.ntriples * 3));
-    pos3_start_ = n - (int64_t)pos3_host_.size() / 3;
+    sq.ple_hist = hist;
+    sq.rope_delta = hdr.rope_delta;
+    sq.history_ever_interleaved = hdr.has_image == 1;
+    sq.pos3_host.clear();
+    if (carry_tail) sq.pos3_host.assign(hdr.triples, hdr.triples + (size_t)(hdr.ntriples * 3));
+    sq.pos3_start = n - (int64_t)sq.pos3_host.size() / 3;
     STRIX_CHECK((size_t)(cur - in) == bytes, "Qwen4ExpSession::import_state: read ", cur - in, " of ", bytes, " bytes");
-    pos_ = n, broken_ = false, mtp_chain_step_ = -1, verify_pending_ = false;
-    imported_at_ = n;
-    rewind_to_.push_back(0);  // the KV cache below n was rewritten (or completed): no older snapshot matches it
+    sq.pos = n, broken_ = false, sq.mtp_chain_step = -1, sq.verify_pending = false;
+    sq.imported_at = n;
+    sq.rewind_to.push_back(0);  // the KV cache below n was rewritten (or completed): no older snapshot matches it
 }
 
 // The end of a forward: the error words and the logits come back in one go - async copies into pinned memory on
@@ -1434,23 +1673,54 @@ void Qwen4ExpSession::run_tower_and_scatter(const std::vector<int32_t> &ids, con
     ++vision_images_, vision_patches_ += n, vision_merged_ += (int64_t)rows.size(), vision_ns_ += elapsed_ns;
     for (int64_t m = vision_max_ns_.load(); elapsed_ns > m && !vision_max_ns_.compare_exchange_weak(m, elapsed_ns);) {
     }
-    std::fprintf(stderr, "vision tower: grid %lldx%lld, %lld patches, %lld merged rows, %.2f s\n",
-                 (long long)image.grid_h, (long long)image.grid_w, (long long)n, (long long)rows.size(),
-                 (double)elapsed_ns * 1e-9);
-    std::fflush(stderr);
+    slog(LogLevel::Debug, "vision tower: grid %lldx%lld, %lld patches, %lld merged rows, %.2f s", (long long)image.grid_h,
+         (long long)image.grid_w, (long long)n, (long long)rows.size(), (double)elapsed_ns * 1e-9);
 }
 
 std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int64_t n_logits,
                                             const ImageInput *image, const Qwen4ExpProbe &probe) {
+    std::vector<BatchRun> batch{{0, ids, n_logits}};
+    return forward_batch(batch, image, probe);
+}
+
+// The batched forward (feat/multi-sequence design): one code path over K row-groups, the runs' rows laid
+// into the shared workspaces in batch order (the returned logits rows follow it). The stateless sublayers (embedding, HC mixes, dense linears,
+// router, MoE) launch once over all N rows - the weights read once for every run, the batch's gain; the
+// state-touching sublayers (PLE gate/conv, GDN front + delta rule, the KV writes, the indexer keys / scores /
+// attention, the MTP head's K/V catch-up) launch per run against that state's pointers at the run's row
+// offset, with unchanged kernels. A batch of one is exactly the old forward(): same kernels, same arguments,
+// same launch order - verified by token identity. Multi-run batches are decode-sized and scalar: no image
+// rows, no mRoPE state (checked below); the verify mechanism is per state (forward_batch_verify).
+std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, const ImageInput *image,
+                                                  const Qwen4ExpProbe &probe) {
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward: an earlier call failed midway; reset() the session first");
-    STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::forward: a forward_verify awaits keep_verify / drop_verify");
+    STRIX_CHECK(!batch.empty() && batch.size() <= (size_t)n_slots(), "Qwen4ExpSession::forward: ", batch.size(),
+                " runs, expected 1..", n_slots());
+    // A verify awaiting resolution anywhere blocks the session: its replay state (verify_in / ple_hist_buf_ /
+    // the projection rows keep_verify_prefix needs) lives in the shared workspaces a forward overwrites.
+    for (size_t k = 0; k < seqs_.size(); ++k)
+        STRIX_CHECK(!seqs_[k]->verify_pending, "Qwen4ExpSession::forward: a forward_verify on seq ", k,
+                    " awaits keep_verify / drop_verify - resolve every run of the pending batch before the next forward");
+    for (size_t k = 0; k < batch.size(); ++k) {
+        STRIX_CHECK(batch[k].seq >= 0 && batch[k].seq < n_slots(), "Qwen4ExpSession::forward: run ", k, " on seq ",
+                    batch[k].seq, ", expected 0..", n_slots() - 1);
+        for (size_t j = 0; j < k; ++j)
+            STRIX_CHECK(batch[j].seq != batch[k].seq, "Qwen4ExpSession::forward: seq ", batch[k].seq,
+                        " carries two runs (", j, " and ", k, ") - one state runs one row group per forward");
+        // keep_verify(seq, .., carry)'s owed token: a run of a state that carries one must start with it (the
+        // MTP cycle's rejection sample - the run's rows continue right after the kept prefix with it at row 0).
+        const int32_t carry = seqs_[(size_t)batch[k].seq]->verify_carry;
+        if (carry != 0)
+            STRIX_CHECK(!batch[k].ids.empty() && batch[k].ids[0] == carry, "Qwen4ExpSession::forward: seq ",
+                        batch[k].seq, " carries token ", carry, " from keep_verify - its run ", k, " of the next "
+                        "forward must start with it (its ids[0] is ",
+                        batch[k].ids.empty() ? std::string("nothing)") : std::to_string(batch[k].ids[0]) + ")");
+    }
     const Qwen4ExpDims &D = m_.dims();
     const Act act = m_.act();
     const size_t e = es(act);
     const bool sep = m_.shared_separate();
     const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;
-    STRIX_TRACE_RANGE(std::string(gdn_to_spare_ ? "verify" : ids.size() == 1 ? "decode" : "prefill") + " T=" +
-                      std::to_string(ids.size()));
     STRIX_TRACE_STAGE(stage);
     STRIX_TRACE_SET(stage, "embed");
     // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on.
@@ -1460,19 +1730,66 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     };
     const kernels::MoeMath moe_math = wmma ? kernels::MoeMath::WmmaBf16 : kernels::MoeMath::F32;
     // Expert slots per token: top-k + the shared expert's when it's stacked.
-    const int64_t T = (int64_t)ids.size(), n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
-    STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::forward: ", T, " tokens, expected 1..", max_tokens_);
-    STRIX_CHECK(pos_ + T <= capacity_, "Qwen4ExpSession::forward: positions [", pos_, ", ", pos_ + T,
-                ") exceed the capacity ", capacity_);
-    STRIX_CHECK(n_logits >= 0 && n_logits <= std::min(T, kMaxLogits), "Qwen4ExpSession::forward: n_logits = ",
-                n_logits, ", expected 0..", std::min(T, kMaxLogits));
+    const int64_t n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
+    struct Run {
+        int seq;
+        Qwen4ExpSeqState *sq;
+        int64_t base, Tr, nL, p;  // row base in the batch buffers, rows, logits rows, the run's start position
+        bool fresh;               // the run starts at position 0 (the GDN states' reset marker)
+        int64_t rope0;            // the scalar-path rope base (the run's pos + its rope_delta)
+        std::future<void> ple_ready;  // multi-run: this run's PLE gather (joined at the PLE layer)
+    };
+    std::vector<Run> runs;
+    runs.reserve(batch.size());
+    std::vector<int32_t> all_ids;  // the runs' ids concatenated in batch order
+    int64_t nL_total = 0;
+    for (auto &br : batch) {
+        Qwen4ExpSeqState &sq = *seqs_[(size_t)br.seq];
+        const int64_t Tr = (int64_t)br.ids.size();
+        STRIX_CHECK(Tr >= 1 && (int64_t)all_ids.size() + Tr <= max_tokens_, "Qwen4ExpSession::forward: ", Tr,
+                    " tokens in a run of a forward of at most ", max_tokens_, " rows");
+        STRIX_CHECK(sq.pos + Tr <= capacity_, "Qwen4ExpSession::forward: positions [", sq.pos, ", ", sq.pos + Tr,
+                    ") exceed the capacity ", capacity_);
+        STRIX_CHECK(br.n_logits >= 0 && br.n_logits <= std::min(Tr, kMaxLogits),
+                    "Qwen4ExpSession::forward: n_logits = ", br.n_logits, ", expected 0..", std::min(Tr, kMaxLogits));
+        runs.push_back({br.seq, &sq, (int64_t)all_ids.size(), Tr, br.n_logits, sq.pos, sq.pos == 0, 0, {}});
+        all_ids.insert(all_ids.end(), br.ids.begin(), br.ids.end());
+        nL_total += br.n_logits;
+    }
+    const int64_t T = (int64_t)all_ids.size();  // the stateless sublayers' row count = every run's rows
+    STRIX_CHECK(nL_total <= kMaxLogits, "Qwen4ExpSession::forward: ", nL_total, " logits rows across ", runs.size(),
+                " runs, expected <=", kMaxLogits);
+    if (runs.size() > 1) {  // the batch's decode-size row contract (the header's forward_batch: the batch-wide
+                            // path choice stays a decode-sized forward, and the kMaxLogits-row logits
+                            // workspace (lg_src_) and the saved verify rows cover it)
+        STRIX_CHECK(T <= kMaxLogits, "Qwen4ExpSession::forward: ", T, " rows across ", runs.size(),
+                    " runs - a multi-run forward is decode-sized, expected <=", kMaxLogits, " total");
+        if (D.ple_layer >= 0)  // the PLE history windows are laid end to end in ple_hist_buf_ [S + rows]
+            STRIX_CHECK((int64_t)runs.size() * ((D.ple_taps - 1) * D.ple_dil) + T <=
+                            (D.ple_taps - 1) * D.ple_dil + max_tokens_,
+                        "Qwen4ExpSession::forward: ", runs.size(), " runs x the PLE state window + ", T,
+                        " rows exceed the history buffer's ", (D.ple_taps - 1) * D.ple_dil + max_tokens_);
+    }
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
     const int64_t mask_rows = mask_rows_, mask_words = mask_words_;
     cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0;
-    STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == n_logits), "Qwen4ExpSession::forward: ",
-                mask_rows, " structured-output mask rows for a forward of ", n_logits, " logits rows");
+    STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == nL_total), "Qwen4ExpSession::forward: ",
+                mask_rows, " structured-output mask rows for a forward of ", nL_total, " logits rows");
+    STRIX_TRACE_RANGE(std::string(batch.size() == 1 && runs[0].sq->gdn_to_spare ? "verify"
+                                : T == 1 ? "decode" : "prefill") + " T=" + std::to_string(T) +
+                      " runs=" + std::to_string(batch.size()));
+    if (runs.size() > 1) {  // the batch's decode-size scalar contract (see the header's forward_batch)
+        STRIX_CHECK(image == nullptr, "Qwen4ExpSession::forward: ", runs.size(),
+                    " runs and an image forward - image rows run alone (vision's one-forward-one-image contract)");
+        for (const Run &r : runs)
+            STRIX_CHECK(r.sq->pending3.empty() && !r.sq->history_ever_interleaved && r.sq->rope_delta == 0,
+                        "Qwen4ExpSession::forward: run on seq ", r.seq,
+                        " carries mRoPE position state - a multi-run forward is scalar positions only");
+    }
     // Image forward (vision): every check that can fail without touching session state runs here, before
     // the pending positions are consumed. run_tower_and_scatter checks the rest (the row count, against ids).
+    // Single-run by the check above: `ids` is that run's.
+    const std::vector<int32_t> &ids = batch[0].ids;
     const VisionTower *tower = nullptr;
     if (image != nullptr) {
         const char *ifn = "Qwen4ExpSession::forward(image)";
@@ -1491,10 +1808,14 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         STRIX_CHECK((int64_t)image->pixel_values.size() == np * tower->dims().patch_in, ifn, ": ",
                     image->pixel_values.size(), " pixel values, expected ", np, " patches x ",
                     tower->dims().patch_in, " columns");
-        STRIX_CHECK(!pending3_.empty(), ifn, ": an image forward carries its set_positions triples (the "
+        // set_positions addresses slot 0 only (the per-slot form comes with the engine's slots): an image
+        // forward on another slot would be checked against slot 0's triples.
+        STRIX_CHECK(batch[0].seq == 0, ifn, ": an image forward on seq ", batch[0].seq,
+                    ", expected seq 0 (set_positions / mRoPE are slot 0's only so far)");
+        STRIX_CHECK(!runs[0].sq->pending3.empty(), ifn, ": an image forward carries its set_positions triples (the "
                     "image rows' (t,h,w) section positions) - set them first (Phase A's walk rule)");
-        STRIX_CHECK((int64_t)pending3_.size() / 3 == T, ifn, ": set_positions holds ", pending3_.size() / 3,
-                    " rows, this forward runs ", T);
+        STRIX_CHECK((int64_t)runs[0].sq->pending3.size() / 3 == T, ifn, ": set_positions holds ",
+                    runs[0].sq->pending3.size() / 3, " rows, this forward runs ", T);
         const int64_t n_img = std::count(ids.begin(), ids.end(), kVisionImageTokenId);
         STRIX_CHECK(n_img == np / (tower->dims().merge * tower->dims().merge), ifn, ": ids carry ", n_img,
                     " image_token_id rows (", kVisionImageTokenId, "), the image produces ", np, " patches / ",
@@ -1503,42 +1824,59 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                     "to the merged token count before the forward");
     }
     // mRoPE: consume this forward's pending triples into the history (set_positions checked the continuation at
-    // set time; pos_ cannot have moved - restore / import refuse a pending span). Once interleaved, every
+    // set time; st().pos cannot have moved - restore / import refuse a pending span). Once interleaved, every
     // forward's rows join the history - scalar rows materialized at their rope_pos - so it stays contiguous and
     // set_positions can keep checking continuations. Text-only forwards: both no-ops, no upload, no allocation.
     // After broken_ = true: a mismatching span (rows != T) takes the session down cleanly instead of leaving
     // a half-consumed history.
     broken_ = true;
-    if (!pending3_.empty()) {
-        STRIX_CHECK((int64_t)pending3_.size() / 3 == T, "Qwen4ExpSession::forward: set_positions holds ",
-                    pending3_.size() / 3, " rows, this forward runs ", T, " - the triples cover exactly one forward");
-        // The history holds rows [pos3_start_, pos_); a text-only prefix needs no rows (their triples are the
-        // scalar rope_pos values), so the first interleaved forward starts the history at its own row 0.
-        if (pos3_host_.empty()) pos3_start_ = pos_;
-        pos3_host_.insert(pos3_host_.end(), pending3_.begin(), pending3_.end());
-        pending3_.clear();
-        history_ever_interleaved_ = true;
-    } else if (!pos3_host_.empty()) {
-        for (int64_t r = 0; r < T; ++r) {
-            const int64_t v = rope_pos(pos_ + r);
-            pos3_host_.insert(pos3_host_.end(), {v, v, v});
+    for (Run &r : runs) {
+        Qwen4ExpSeqState &sq = *r.sq;
+        if (!sq.pending3.empty()) {
+            STRIX_CHECK((int64_t)sq.pending3.size() / 3 == r.Tr, "Qwen4ExpSession::forward: set_positions holds ",
+                        sq.pending3.size() / 3, " rows, its run forwards ", r.Tr, " - the triples cover exactly one forward");
+            // The history holds rows [sq.pos3_start, sq.pos); a text-only prefix needs no rows (their triples are
+            // the scalar rope_pos values), so the first interleaved forward starts the history at its own row 0.
+            if (sq.pos3_host.empty()) sq.pos3_start = sq.pos;
+            sq.pos3_host.insert(sq.pos3_host.end(), sq.pending3.begin(), sq.pending3.end());
+            sq.pending3.clear();
+            sq.history_ever_interleaved = true;
+        } else if (!sq.pos3_host.empty()) {
+            for (int64_t row = 0; row < r.Tr; ++row) {
+                const int64_t v = sq.pos + row + sq.rope_delta;
+                sq.pos3_host.insert(sq.pos3_host.end(), {v, v, v});
+            }
+        }
+        // rope_delta: with an interleaved prefix, every later scalar row's angle sits at (the continuation of
+        // the history) - (the sequence index). Recomputed only when the next row is a scalar one: a span ending
+        // on a uniform row steps by 1, one ending at a complete image block row continues at the block's max
+        // position + 1; a span ending mid-block-row (an image split across forwards) has image rows next - the
+        // delta stays at its last block-end value (unused until the image completes, then recomputed).
+        if (sq.history_ever_interleaved && !sq.pos3_host.empty()) {  // (a session resumed after the image has the delta
+            const Cont next = continuation_of(sq.pos3_host.data() + (size_t)((sq.pos3Hend() - sq.pos3_start - 1) * 3),
+                                              sq.pos3_host.data(), (int64_t)sq.pos3_host.size() / 3);
+            if (next.kind == ContKind::kUniform || next.kind == ContKind::kEndOrImage)  // its rows are all scalar
+                sq.rope_delta = next.exact[0] - (sq.pos + r.Tr);
+        }
+        // Paged K/V for this run's rows (a multi-run forward skips prepare_positions below).
+        ensure_rows(sq, r.p + r.Tr);
+        // The batch's last prepared span is what the kernels get (mk_block_ / mk_jobs_): a single run is today's
+        // call; a multi-run forward is scalar-only (checked above) and needs no uploads at all.
+        if (runs.size() == 1) {
+            prepare_positions(sq, r.p, r.Tr);
+            r.rope0 = mk_jobs_.pos3 == nullptr ? r.p + sq.rope_delta : r.p;  // scalar-path rope base (Phase A:
+            // interleaved calls pass the kernels their positions, so pos0 is unused there)
+        } else {
+            r.rope0 = r.p;  // scalar with rope_delta 0 (checked above); a pure-text state's rope_pos(p) == p
+            // A multi-run forward is scalar-only (checked above), so it must carry no mRoPE window to the
+            // kernels: clear whatever the last single-run forward prepared. Left stale, an image's triples
+            // (a non-null mk_block_ / mk_jobs_) would be matched against these runs' positions by
+            // qk_norm_rope_jobs / qsa_block_keys - a confusing error, or (p == the stale base) silently
+            // roping text rows with the image's (t,h,w) angles.
+            mk_block_ = {};
+            mk_jobs_ = {};
         }
     }
-    // rope_delta: with an interleaved prefix, every later scalar row's angle sits at (the continuation of
-    // the history) - (the sequence index). Recomputed only when the next row is a scalar one: a span ending
-    // on a uniform row steps by 1, one ending at a complete image block row continues at the block's max
-    // position + 1; a span ending mid-block-row (an image split across forwards) has image rows next - the
-    // delta stays at its last block-end value (unused until the image completes, then recomputed).
-    if (history_ever_interleaved_ && !pos3_host_.empty()) {  // (a session resumed after the image has the delta
-        const Cont next = continuation_of(pos3_host_.data() + (size_t)((pos3Hend() - pos3_start_ - 1) * 3),  // but
-                                          pos3_host_.data(), (int64_t)pos3_host_.size() / 3);  // no history -
-        if (next.kind == ContKind::kUniform || next.kind == ContKind::kEndOrImage)  // its rows are all scalar
-            rope_delta_ = next.exact[0] - (pos_ + T);
-    }
-    prepare_positions(pos_, T);
-    const int64_t rope0 = mk_jobs_.pos3 == nullptr ? rope_pos(pos_) : pos_;  // scalar-path rope base (Phase A:
-    // interleaved calls pass the kernels their positions, so pos0 is unused there)
-    const bool fresh = pos_ == 0;
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     const ProbeType pt = act == Act::F32 ? ProbeType::F32 : ProbeType::BF16;
     auto show = [&](const std::string &name, const void *dev, int64_t cols, ProbeType type) {
@@ -1581,25 +1919,38 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             kernels::hc_mix_up(h_.get(), hc.up.q4, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
     };
 
-    // PLE rows for this forward: the ids advance the n-gram history now; the rows come from set_lookahead's gather
-    // when it was for exactly these ids and history, else a gather starts now on a worker - overlapping the
-    // embedding and the layers before the PLE layer. Joined there (a gather failure fails the forward).
+    // PLE rows for this forward: the ids advance each run's own n-gram history now; the rows come from
+    // set_lookahead's gather when it was for exactly these ids and history (single-run serving), else a gather
+    // starts now on a worker - overlapping the embedding and the layers before the PLE layer. Joined there (a
+    // gather failure fails the forward). Multi-run: every run gathers into its own state's pinned staging
+    // (the lookahead / ping-pong buffers are the single-sequence path); the host-side gathers queue on the
+    // worker, so they overlap the GPU's embedding + layer 0 like today's.
     int ple_buf = 0;
-    std::future<void> ple_ready;
+    std::future<void> ple_ready;  // single-run: the batch's gather (the look-ahead's when it matches)
     std::vector<int32_t> lookahead = std::move(ple_lookahead_);
     ple_lookahead_.clear();
     if (D.ple_layer >= 0) {
-        const PleHistory before = ple_hist_;
-        std::vector<int64_t> tok(ids.begin(), ids.end()), rows((size_t)(T * 16));
-        ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), T, ple_hist_, rows.data());
-        if (ple_pending_.active && ple_pending_.ids == ids && ple_pending_.hist.prev == before.prev) {
-            ple_buf = ple_pending_.buf, ple_ready = std::move(ple_pending_.done);
-            ple_pending_ = PleGather{};
-        } else {
-            drop_ple_pending();  // a stale hint: let it finish before its buffer is reused
-            // Small forwards (decode, MTP verify): on the persistent worker, overlapping the embedding and layer 0.
-            ple_ready = start_ple_gather(std::move(rows), T, ple_buf,
-                                         T >= kWmmaMinTokens ? PleRun::Async : PleRun::Worker);
+        for (Run &r : runs) {
+            Qwen4ExpSeqState &sq = *r.sq;
+            const std::vector<int32_t> &rids = batch[(size_t)(&r - runs.data())].ids;
+            std::vector<int64_t> tok(rids.begin(), rids.end()), rows((size_t)(r.Tr * 16));
+            const PleHistory before = sq.ple_hist;  // before the advance: what a pending gather was keyed on
+            ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), r.Tr, sq.ple_hist, rows.data());
+            if (runs.size() > 1) {  // per-state gather into its own staging, joined at the PLE layer
+                if (sq.ple_stage.size() == 0)
+                    sq.ple_stage = PinnedHostBuffer((size_t)(kMaxLogits * D.ple_e) * e, "batched PLE rows");
+                r.ple_ready = start_ple_gather(std::move(rows), r.Tr, sq.ple_stage, PleRun::Worker);
+                continue;
+            }
+            if (ple_pending_.active && ple_pending_.ids == rids && ple_pending_.hist.prev == before.prev) {
+                ple_buf = ple_pending_.buf, ple_ready = std::move(ple_pending_.done);
+                ple_pending_ = PleGather{};
+            } else {
+                drop_ple_pending();  // a stale hint: let it finish before its buffer is reused
+                // Small forwards (decode, MTP verify): on the persistent worker, overlapping the embedding and layer 0.
+                ple_ready = start_ple_gather(std::move(rows), r.Tr, ple_host_[ple_buf],
+                                             r.Tr >= kWmmaMinTokens ? PleRun::Async : PleRun::Worker);
+            }
         }
     }
 
@@ -1613,8 +1964,9 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     };
     bool inv_ready = false;  // X changed since inv_ was computed (the embedding)
 
-    // Embedding, written straight into all 4 streams (one launch).
-    STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream_),
+    // Embedding, written straight into all 4 streams (one launch over every run's rows). all_ids is pageable, not
+    // pinned: a pinned buffer here would need an event gate before its next write (the gfx1151 pinned-reuse hazard).
+    STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), all_ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream_),
                     "uploading ", T, " token ids");
     kernels::reset_embedding_error(emb_err_.get(), stream_);
     if (m_.is_embed_q8()) {
@@ -1635,35 +1987,60 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         if (i == D.ple_layer) {
             // n-gram rows (gathered on the host since the forward started), key|value projection, gate + conv into X.
             show(L + "ple_in", x_.get(), n4, pt);
-            {
+            auto join_wait = [&](std::future<void> &f, int64_t rows_at, void *stage) {
                 const auto t0 = std::chrono::steady_clock::now();
-                ple_ready.get();
+                f.get();
                 const int64_t ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                 ++ple_waits_, ple_wait_ns_ += ns;
                 for (int64_t m = ple_wait_max_ns_.load(); ns > m && !ple_wait_max_ns_.compare_exchange_weak(m, ns);) {
                 }
-            }
-            STRIX_HIP_CHECK(hipMemcpyAsync(ple_e_.get(), ple_host_[ple_buf].get(), (size_t)(T * D.ple_e) * e,
-                                           hipMemcpyHostToDevice, stream_),
-                            "uploading PLE rows");
-            // The next forward's rows (set_lookahead) into the other buffer, during this forward's GPU work: that
-            // buffer's last upload was in an earlier forward, which ended with a stream sync.
-            if (!lookahead.empty()) {
-                std::vector<int64_t> tok(lookahead.begin(), lookahead.end()), rows(lookahead.size() * 16);
-                PleHistory h = ple_hist_;
-                ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), (int64_t)tok.size(), h, rows.data());
-                ple_pending_.buf = 1 - ple_buf;
-                ple_pending_.done = start_ple_gather(std::move(rows), (int64_t)tok.size(), ple_pending_.buf,
-                                                     PleRun::Async);
-                ple_pending_.ids = std::move(lookahead), ple_pending_.hist = ple_hist_, ple_pending_.active = true;
+                (void)rows_at, (void)stage;
+            };
+            if (runs.size() == 1) {
+                join_wait(ple_ready, T, nullptr);
+                STRIX_HIP_CHECK(hipMemcpyAsync(ple_e_.get(), ple_host_[ple_buf].get(), (size_t)(T * D.ple_e) * e,
+                                               hipMemcpyHostToDevice, stream_),
+                                "uploading PLE rows");
+                // The next forward's rows (set_lookahead) into the other buffer, during this forward's GPU work: that
+                // buffer's last upload was in an earlier forward, which ended with a stream sync. The
+                // look-ahead is the single-sequence serving path (the engine's); a multi-run batch drops the hint.
+                if (!lookahead.empty()) {
+                    std::vector<int64_t> tok(lookahead.begin(), lookahead.end()), rows(lookahead.size() * 16);
+                    PleHistory h = runs[0].sq->ple_hist;
+                    ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), (int64_t)tok.size(), h, rows.data());
+                    ple_pending_.buf = 1 - ple_buf;
+                    ple_pending_.done = start_ple_gather(std::move(rows), (int64_t)tok.size(),
+                                                         ple_host_[ple_pending_.buf], PleRun::Async);
+                    ple_pending_.ids = std::move(lookahead), ple_pending_.hist = runs[0].sq->ple_hist,
+                        ple_pending_.active = true;
+                }
+            } else {
+                for (Run &r : runs) {
+                    join_wait(r.ple_ready, r.Tr, nullptr);
+                    STRIX_HIP_CHECK(hipMemcpyAsync(ple_e_.get() + (size_t)(r.base * D.ple_e) * e,
+                                                   r.sq->ple_stage.get(), (size_t)(r.Tr * D.ple_e) * e,
+                                                   hipMemcpyHostToDevice, stream_),
+                                    "uploading batched PLE rows");
+                }
             }
             lin(ple_e_.get(), l.ple_kv, ple_kv_.get(), T, act);
-            const kernels::PleShape sh{T, D.H, D.d, D.ple_taps, D.ple_dil, D.ple_ld};
-            kernels::ple_gate(ple_kv_.get(), x_.get(), l.ple_norm_key, l.ple_norm_query, l.ple_norm_conv,
-                              ple_state_.get(), sh, D.eps, ple_hist_buf_.get(), ple_sigma_.get(), act, stream_);
-            kernels::ple_conv(ple_hist_buf_.get(), ple_sigma_.get(), ple_kv_.get(), l.ple_conv, sh, x_.get(),
-                              ple_state_.get(), act, stream_);
+            // The gate + conv per run: its rows out of the shared projection, its own conv state, and its own
+            // history window slice [S state rows][its rows] of ple_hist_buf_ (the gate kernel writes the state
+            // rows itself; windows are laid end to end - S + run 0's rows, then S + run 1's, ...).
+            const int64_t ple_S = (D.ple_taps - 1) * D.ple_dil;
+            int64_t wbase = 0;
+            for (Run &r : runs) {
+                const kernels::PleShape sh{r.Tr, D.H, D.d, D.ple_taps, D.ple_dil, D.ple_ld};
+                uint8_t *hist_w = ple_hist_buf_.get() + (size_t)(wbase * n4) * e;
+                kernels::ple_gate(ple_kv_.get() + (size_t)(r.base * D.ple_ld) * e, x_.get() + (size_t)(r.base * n4) * e,
+                                  l.ple_norm_key, l.ple_norm_query, l.ple_norm_conv, r.sq->ple_state.get(), sh, D.eps,
+                                  hist_w, ple_sigma_.get() + (size_t)(r.base * D.H), act, stream_);
+                kernels::ple_conv(hist_w, ple_sigma_.get() + (size_t)(r.base * D.H),
+                                  ple_kv_.get() + (size_t)(r.base * D.ple_ld) * e, l.ple_conv, sh,
+                                  x_.get() + (size_t)(r.base * n4) * e, r.sq->ple_state.get(), act, stream_);
+                wbase += ple_S + r.Tr;
+            }
             show(L + "ple_out", x_.get(), n4, pt);
         }
 
@@ -1673,135 +2050,177 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         show(L + "attn_in", u_.get(), D.d, pt);
         show(L + "attn_w_in", w_in_.get(), D.H, ProbeType::F32);
         if (!D.is_attention[(size_t)i]) {
-            // A verify writes its in_proj rows straight into the layer's verify_in_ buffer (keep_verify_prefix may
-            // replay them) instead of proj_ and a copy.
-            uint8_t *gp = gdn_to_spare_ ? verify_in_[(size_t)i].get() : proj_.get();
+            // A verify writes its in_proj rows straight into the layer's verify_in buffer (keep_verify_prefix may
+            // replay them) instead of proj_ and a copy - single-run as today; a batch projects all N rows to
+            // proj_ and copies each verifying run's slice (the same bytes the direct write would have stored).
+            const bool direct_verify_rows = runs.size() == 1 && runs[0].sq->gdn_to_spare;
+            uint8_t *gp = direct_verify_rows ? runs[0].sq->verify_in[(size_t)i].get() : proj_.get();
             lin(u_.get(), l.in_proj, gp, T, act);
-            kernels::gdn_front(gp, {T, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
-                               l.conv_w, conv_state_[(size_t)i].get(),
-                               (gdn_to_spare_ ? conv_spare_ : conv_state_)[(size_t)i].get(), fresh, l.A_log,
-                               l.dt_bias, qkv_.get(), beta_.get(), g_.get(), act, stream_);
-            // Prefill-sized WMMA forwards: the chunked delta rule on the matrix units; decode / MTP verify per token.
-            kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {T, D.gk, D.gv, D.conv_c}, rec_state_[(size_t)i].get(),
-                                (gdn_to_spare_ ? rec_spare_ : rec_state_)[(size_t)i].get(), fresh, core_.get(), act,
-                                stream_,
-                                wmma && T >= kWmmaMinTokens ? kernels::DeltaRulePath::ChunkedWmma
-                                                            : kernels::DeltaRulePath::Auto,
-                                precision_.gdn);
-            // z (gv heads of kHD a token) read in place from the in_proj rows.
-            kernels::rmsnorm_gated(core_.get(), gp + (size_t)D.conv_c * e, l.gdn_norm, gnorm_.get(), T * D.gv, kHD, D.eps,
+            if (!direct_verify_rows)
+                for (Run &r : runs)
+                    if (r.sq->gdn_to_spare)
+                        STRIX_HIP_CHECK(hipMemcpyAsync(r.sq->verify_in[(size_t)i].get(),
+                                                       gp + (size_t)(r.base * D.gstride) * e,
+                                                       (size_t)(r.Tr * D.gstride) * e, hipMemcpyDeviceToDevice, stream_),
+                                        "Qwen4ExpSession::forward: the batched verify's in_proj rows");
+            for (Run &r : runs) {
+                Qwen4ExpSeqState &sq = *r.sq;
+                const int64_t qkv_off = (size_t)(r.base * D.conv_c) * e;
+                kernels::gdn_front(gp + (size_t)(r.base * D.gstride) * e,
+                                   {r.Tr, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
+                                   l.conv_w, sq.conv_state[(size_t)i].get(),
+                                   (sq.gdn_to_spare ? sq.conv_spare : sq.conv_state)[(size_t)i].get(), r.fresh, l.A_log,
+                                   l.dt_bias, qkv_.get() + qkv_off, beta_.get() + (size_t)(r.base * D.gv),
+                                   g_.get() + (size_t)(r.base * D.gv), act, stream_);
+                // Prefill-sized WMMA forwards: the chunked delta rule on the matrix units; decode / MTP verify per token.
+                kernels::delta_rule(qkv_.get() + qkv_off, beta_.get() + (size_t)(r.base * D.gv),
+                                    g_.get() + (size_t)(r.base * D.gv), {r.Tr, D.gk, D.gv, D.conv_c},
+                                    sq.rec_state[(size_t)i].get(),
+                                    (sq.gdn_to_spare ? sq.rec_spare : sq.rec_state)[(size_t)i].get(), r.fresh,
+                                    core_.get() + (size_t)(r.base * D.gz) * e, act, stream_,
+                                    wmma && r.Tr >= kWmmaMinTokens ? kernels::DeltaRulePath::ChunkedWmma
+                                                                   : kernels::DeltaRulePath::Auto,
+                                    precision_.gdn);
+            }
+            // z (gv heads of kHD a token) read in place from the in_proj rows (gp: all rows; the verifying
+            // runs' rows are in proj_ too, the bytes their verify_in copies).
+            kernels::rmsnorm_gated(core_.get(),
+                                   (direct_verify_rows ? gp : proj_.get()) + (size_t)D.conv_c * e, l.gdn_norm,
+                                   gnorm_.get(), T * D.gv, kHD, D.eps,
                                    kernels::GateAct::Sigmoid, act, stream_, D.gv, D.gstride);
             show(L + "gdn_core", gnorm_.get(), D.gz, pt);
             lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
         } else {
-            // Plain K/V caches (empty with KvFormat::Q8).
-            uint8_t *kc = k_cache_[(size_t)i].size() ? k_cache_[(size_t)i].get() : nullptr,
-                    *vc = v_cache_[(size_t)i].size() ? v_cache_[(size_t)i].get() : nullptr;
-            // 8-bit K/V: the new rows go to a staging area first ([T][K | V], a verify's into its saved rows for
-            // keep_verify_prefix), then kv8_commit quantizes the groups they complete and writes the new tail.
+            // 8-bit K/V (the served format; the plain caches are empty then): the new rows go to a staging
+            // area first - a run's into kv_new_, or (verify, any batch size) straight into its own saved
+            // rows for keep_verify_prefix - and kv8_commit per run then quantizes the groups it completes
+            // and writes that state's new tail.
             const bool q8 = kv_format_ == KvFormat::Q8;
             const int64_t W = D.hkv * hd;
-            uint8_t *kv_rows = !q8 ? nullptr
-                               : gdn_to_spare_ ? verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
-                                               : kv_new_.get();
-            uint8_t *k_out = q8 ? kv_rows : kc + (size_t)(pos_ * W) * e, *v_out = q8 ? kv_rows + (size_t)W * e
-                                                                                       : vc + (size_t)(pos_ * W) * e;
-            const int64_t kv_ts = q8 ? 2 * W : W;
             lin(u_.get(), l.qkv, proj_.get(), T, act);
-            // One launch: q normed + roped in place, k into the K cache, v copied into the V cache, past the dense
-            // limit the indexer queries (normed + roped in place), and in a verify the raw indexer keys copied into
-            // the layer's verify_in_ (keep_verify_prefix may replay them) - kernels/attention.hpp qk_norm_rope_jobs.
-            const bool qsa_layer = pos_ + T > D.dense_key_limit();
-            kernels::NormRopeJob nr[5] = {
-                {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
-                {at(proj_, D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm},
-                {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr},
-                {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
-                 l.idx_q_norm}};
-            int njobs = 3;
-            if (qsa_layer) ++njobs;
-            else nr[3] = {};
-            if (gdn_to_spare_)
-                nr[njobs++] = {at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, D.idx_d, verify_in_[(size_t)i].get(),
-                               D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
-            kernels::qk_norm_rope_jobs(nr, njobs, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream_, m_.rope_scale(),
-                                       mk_jobs_);
-            // Indexer block keys (every completed block, this call's included) - kept current for when selection
-            // starts to bite; the queries and scores are only needed past the dense limit. pos0 stays the
-            // sequence index (the kernel derives block / tail array indices from it); with a rope_delta the
-            // window's triples carry the shifted angles (a shifted pos0 would shift the block partition too).
-            kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos_,
-                                    pos_ % kernels::kQsaBlock ? tail_[tail_cur_][(size_t)i].get() : nullptr,
-                                    tail_[1 - tail_cur_][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
-                                    D.rot, block_keys_[(size_t)i].get(), cap_blocks_, act, stream_, m_.rope_scale(),
-                                    mk_block_);
-            const kernels::AttentionShape as{T, pos_, D.hq, D.hkv, hd, D.astride, 2 * hd};
-            const float scale = 1.0f / std::sqrt((float)hd);
-            kernels::Kv8View kv8;
-            if (q8) {
-                const size_t li = (size_t)i;
-                kernels::kv8_commit(k_out, v_out, kv_ts, T, pos_,
-                                    pos_ % kernels::kKv8Group ? kv8_tail_[tail_cur_][li].get() : nullptr,
-                                    kv8_tail_[1 - tail_cur_][li].get(), kv8_store_[li].get(), kv8_cap_, W, act,
-                                    kv8_err_.get(), stream_);
-                kv8 = {kv8_store_[li].get(), kv8_cap_, W,
-                       pos_ % kernels::kKv8Group ? kv8_tail_[tail_cur_][li].get() : nullptr, k_out, v_out, kv_ts, pos_};
-            }
-            // Prefill-sized forwards with BF16 activations: the attention on the matrix units (kernels/attention.hpp).
-            const bool wmma_attn = wmma && act == Act::BF16 && T >= kWmmaMinTokens;
-            // Dequantize the rows below the last query's exact_from once, then plain loads (Kv8View staged_k), when
-            // that is cheaper than unpacking in the loop (kv8_stage_pays).
-            const auto stage_kv8 = [&](int64_t keys_per_query) {
-                const int64_t rows = kernels::kv8_exact_from(pos_ + T - 1);
-                if (!(wmma_attn && q8 && rows > 0 && kv8_stage_pays(T, keys_per_query, rows))) return;
-                STRIX_CHECK(kv8_stage_.size() >= (size_t)(2 * kv8_cap_ * W) * 2, "Qwen4ExpSession::forward: ",
-                            "8-bit staging buffer of ", kv8_stage_.size(), " bytes for a ", T, "-token forward");
-                uint8_t *sk = kv8_stage_.get(), *sv = sk + (size_t)(kv8_cap_ * W) * 2;
-                kernels::kv8_dequant(kv8.store, kv8_cap_, W, 0, rows, sk, sv, act, stream_);
-                kv8.staged_k = sk, kv8.staged_v = sv, kv8.staged_rows = rows;
-            };
-            if (!qsa_layer) {
-                stage_kv8(pos_ + T);  // a dense query reads every row up to its own
-                if (wmma_attn && q8)
-                    kernels::attention_wmma(proj_.get(), at(proj_, hd), kv8, as, scale, core_.get(), attn_ws_.get(),
-                                            attn_ws_bytes_, act, stream_, precision_.attention);
-                else if (wmma_attn)
-                    kernels::attention_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(),
-                                            attn_ws_.get(), attn_ws_bytes_, act, stream_, precision_.attention);
-                else if (q8)
-                    kernels::attention(proj_.get(), at(proj_, hd), kv8, as, scale, core_.get(), attn_ws_.get(),
-                                       attn_ws_bytes_, act, stream_);
-                else
-                    kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(),
-                                       attn_ws_.get(), attn_ws_bytes_, act, stream_);
-            } else {
-                // QSA: indexer queries (normed + roped in place), block scores, the top budget / 4 blocks, gathered
-                // attention. Queries that still see every key keep all their blocks - the dense set.
-                const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
-                kernels::qsa_scores(iq, D.astride, D.idx_d, T, pos_, D.idx_h, D.idx_d, block_keys_[(size_t)i].get(),
-                                    cap_blocks_, qsa_scores_.get(), cap_blocks_, act, stream_);
-                kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, pos_, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
-                                  qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-                show(L + "qsa_sel", qsa_sel_.get(), qsa_k, ProbeType::I32);
-                show(L + "qsa_nsel", qsa_nsel_.get(), 1, ProbeType::I32);
-                stage_kv8(std::min<int64_t>(D.qsa_budget, pos_ + T));
-                if (wmma_attn && q8)
-                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(),
-                                                     qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
-                                                     attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
-                else if (wmma_attn)
-                    kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                                     qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
-                                                     attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
-                else if (q8)
-                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(), qsa_nsel_.get(),
-                                                qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_,
-                                                attn_err_.get(), act, stream_);
-                else
-                    kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
-                                                qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
-                                                attn_ws_bytes_, attn_err_.get(), act, stream_);
+            for (const Run &r : runs) {
+                Qwen4ExpSeqState &sq = *r.sq;
+                uint8_t *kc = sq.k_cache[(size_t)i].capacity() ? sq.k_cache[(size_t)i].get() : nullptr,
+                        *vc = sq.v_cache[(size_t)i].capacity() ? sq.v_cache[(size_t)i].get() : nullptr;
+                uint8_t *kv_rows = !q8 ? nullptr
+                                   : sq.gdn_to_spare ? sq.verify_in[(size_t)i].get() +
+                                                             (size_t)(kMaxLogits * D.idx_d) * e
+                                                     : kv_new_.get() + (size_t)(r.base * 2 * W) * e;
+                uint8_t *k_out = q8 ? kv_rows : kc + (size_t)(r.p * W) * e,
+                        *v_out = q8 ? kv_rows + (size_t)W * e : vc + (size_t)(r.p * W) * e;
+                const int64_t kv_ts = q8 ? 2 * W : W;
+                // One launch per run: q normed + roped in place, k into the K cache, v copied into the V
+                // cache, past the dense limit the indexer queries (normed + roped in place), and in a verify
+                // the raw indexer keys copied into the layer's verify_in (keep_verify_prefix may replay
+                // them) - kernels/attention.hpp qk_norm_rope_jobs.
+                const bool qsa_layer = r.p + r.Tr > D.dense_key_limit();
+                kernels::NormRopeJob nr[5] = {
+                    {at(proj_, r.base * D.astride), D.astride, 2 * hd, at(proj_, r.base * D.astride), D.astride,
+                     2 * hd, D.hq, hd, l.q_norm},
+                    {at(proj_, r.base * D.astride + D.hq * 2 * hd), D.astride, hd, k_out, kv_ts, hd, D.hkv, hd,
+                     l.k_norm},
+                    {at(proj_, r.base * D.astride + D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_out, kv_ts, hd,
+                     D.hkv, hd, nullptr},
+                    {at(proj_, r.base * D.astride + D.idx_col), D.astride, D.idx_d,
+                     at(proj_, r.base * D.astride + D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
+                     l.idx_q_norm}};
+                int njobs = 3;
+                if (qsa_layer) ++njobs;
+                else nr[3] = {};
+                if (sq.gdn_to_spare)
+                    nr[njobs++] = {at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride, D.idx_d,
+                                   sq.verify_in[(size_t)i].get(), D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
+                kernels::qk_norm_rope_jobs(nr, njobs, r.Tr, D.eps, D.rot, r.rope0, m_.inv_freq(), act, stream_,
+                                           m_.rope_scale(), mk_jobs_);
+                // Indexer block keys (every completed block, this run's included) - kept current for when
+                // selection starts to bite; the queries and scores are only needed past the dense limit.
+                // pos0 stays the sequence index (the kernel derives block / tail array indices from it); with
+                // a rope_delta the window's triples carry the shifted angles (a shifted pos0 would shift the
+                // block partition too).
+                kernels::qsa_block_keys(at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride,
+                                        r.Tr, r.p, r.p % kernels::kQsaBlock ? sq.tail[sq.tail_cur][(size_t)i].get() : nullptr,
+                                        sq.tail[1 - sq.tail_cur][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
+                                        m_.inv_freq(), D.rot, sq.block_keys[(size_t)i].get(), cap_blocks_, act, stream_,
+                                        m_.rope_scale(), mk_block_);
+                const kernels::AttentionShape as{r.Tr, r.p, D.hq, D.hkv, hd, D.astride, 2 * hd};
+                const float scale = 1.0f / std::sqrt((float)hd);
+                kernels::Kv8View kv8;
+                if (q8) {
+                    const size_t li = (size_t)i;
+                    kernels::kv8_commit(k_out, v_out, kv_ts, r.Tr, r.p,
+                                        r.p % kernels::kKv8Group ? sq.kv8_tail[sq.tail_cur][li].get() : nullptr,
+                                        sq.kv8_tail[1 - sq.tail_cur][li].get(), sq.kv8_store[li].get(), kv8_cap_, W, act,
+                                        kv8_err_.get(), stream_);
+                    kv8 = {sq.kv8_store[li].get(), kv8_cap_, W,
+                           r.p % kernels::kKv8Group ? sq.kv8_tail[sq.tail_cur][li].get() : nullptr, k_out, v_out, kv_ts,
+                           r.p};
+                }
+                uint8_t *q_r = at(proj_, r.base * D.astride), *core_r = core_.get() + (size_t)(r.base * D.hq * hd) * e;
+                // BF16 activations: the attention on the matrix units (kernels/attention.hpp, kWmmaAttnMinTokens),
+                // chosen per run by its own rows; a run reads its queries / writes its outputs at its row base
+                // (forward_qwen4exp_batch_vs_solo: bit-identical to that run alone).
+                const bool wmma_attn = wmma && act == Act::BF16 && r.Tr >= kWmmaAttnMinTokens;
+                // Dequantize the rows below the last query's exact_from once, then plain loads (Kv8View
+                // staged_k), when that is cheaper than unpacking in the loop (kv8_stage_pays).
+                const auto stage_kv8 = [&](int64_t keys_per_query) {
+                    const int64_t rows = kernels::kv8_exact_from(r.p + r.Tr - 1);
+                    if (!(wmma_attn && q8 && rows > 0 && kv8_stage_pays(r.Tr, keys_per_query, rows))) return;
+                    STRIX_CHECK(kv8_stage_.size() >= (size_t)(2 * kv8_cap_ * W) * 2, "Qwen4ExpSession::forward: ",
+                                "8-bit staging buffer of ", kv8_stage_.size(), " bytes for a ", r.Tr, "-token forward");
+                    uint8_t *sk = kv8_stage_.get(), *sv = sk + (size_t)(kv8_cap_ * W) * 2;
+                    kernels::kv8_dequant(kv8.store, kv8_cap_, W, 0, rows, sk, sv, act, true, stream_);  // F16 K
+                    kv8.staged_k = sk, kv8.staged_v = sv, kv8.staged_rows = rows;
+                };
+                if (!qsa_layer) {
+                    stage_kv8(r.p + r.Tr);  // a dense query reads every row up to its own
+                    if (wmma_attn && q8)
+                        kernels::attention_wmma(q_r, q_r + (size_t)hd * e, kv8, as, scale, core_r, attn_ws_.get(),
+                                                attn_ws_bytes_, act, stream_, precision_.attention);
+                    else if (wmma_attn)
+                        kernels::attention_wmma(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as, scale, core_r,
+                                                attn_ws_.get(), attn_ws_bytes_, act, stream_, precision_.attention);
+                    else if (q8)
+                        kernels::attention(q_r, q_r + (size_t)hd * e, kv8, as, scale, core_r, attn_ws_.get(),
+                                           attn_ws_bytes_, act, stream_);
+                    else
+                        kernels::attention(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as, scale, core_r,
+                                           attn_ws_.get(), attn_ws_bytes_, act, stream_);
+                } else {
+                    // QSA: indexer queries (normed + roped in place), block scores, the top budget / 4
+                    // blocks, gathered attention. Queries that still see every key keep all their blocks -
+                    // the dense set. Scores / selection are row-indexed: each run gets its slice.
+                    const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
+                    void *iq = at(proj_, r.base * D.astride + D.idx_col);  // normed + roped by the jobs above
+                    kernels::qsa_scores(iq, D.astride, D.idx_d, r.Tr, r.p, D.idx_h, D.idx_d,
+                                        sq.block_keys[(size_t)i].get(), cap_blocks_,
+                                        qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, act, stream_);
+                    kernels::qsa_topk(qsa_scores_.get() + (size_t)(r.base * cap_blocks_), cap_blocks_, r.Tr, r.p, qsa_k,
+                                      qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
+                                      qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
+                    show(L + "qsa_sel", qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_k, ProbeType::I32);
+                    show(L + "qsa_nsel", qsa_nsel_.get() + r.base, 1, ProbeType::I32);
+                    stage_kv8(std::min<int64_t>(D.qsa_budget, r.p + r.Tr));
+                    if (wmma_attn && q8)
+                        kernels::attention_gathered_wmma(q_r, q_r + (size_t)hd * e, kv8, as,
+                                                         qsa_sel_.get() + (size_t)(r.base * qsa_k),
+                                                         qsa_nsel_.get() + r.base, qsa_k, scale, core_r, attn_ws_.get(),
+                                                         attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+                    else if (wmma_attn)
+                        kernels::attention_gathered_wmma(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as,
+                                                         qsa_sel_.get() + (size_t)(r.base * qsa_k),
+                                                         qsa_nsel_.get() + r.base, qsa_k, scale, core_r, attn_ws_.get(),
+                                                         attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+                    else if (q8)
+                        kernels::attention_gathered(q_r, q_r + (size_t)hd * e, kv8, as,
+                                                    qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
+                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, attn_err_.get(),
+                                                    act, stream_);
+                    else
+                        kernels::attention_gathered(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as,
+                                                    qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
+                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, attn_err_.get(),
+                                                    act, stream_);
+                }
             }
             show(L + "attn_core", core_.get(), D.hq * D.hd, pt);
             lin(core_.get(), l.o_proj, y_.get(), T, act);
@@ -1828,6 +2247,20 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
         show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
+        // The shared expert as dense projections (its h through gu_ / hh_ before the routed experts reuse them).
+        auto shared_expert = [&] {
+            lin(u_.get(), l.shared_gate_up, gu_.get(), T, act);
+            kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
+            show(L + "shared_h", hh_.get(), D.inter, pt);
+            lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
+        };
+        // Prefill (the grouped combine, then the injection's fused form): the shared expert's gated add rides in the
+        // combine's reduce (kernels::MoeSharedAdd, bit-identical to moe_shared_add after it), so it runs first.
+        const bool fold_shared = sep && fuse_inv && T >= kGroupedMinTokens;
+        if (fold_shared) shared_expert();
+        const kernels::MoeSharedAdd shared_add{sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1,
+                                               (uint32_t)D.experts, router_err_.get()};
+        bool h_f16 = false;
         if (T >= kGroupedMinTokens) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
             // until its kernel moves over.
@@ -1837,9 +2270,13 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                             : moe_math;
             kernels::moe_group_routes(route_ids_.get(), T, A, Estack, group_ws_.get(), group_ws_bytes_,
                                       expert_err_.get(), stream_);
-            if (em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4) {  // SwiGLU in the gather's epilogue
+            const bool fused = em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4;
+            // h as F16 bits between the fused gather and a Q4 down: the down's x conversion done once (bit-identical)
+            h_f16 = fused && l.down.bits == 4 && act == Act::BF16;
+            if (fused) {  // SwiGLU in the gather's epilogue
                 kernels::linear_q4_experts_gather_grouped_swiglu(u_.get(), l.gate_up.q4, Estack, group_ws_.get(),
-                                                                 group_ws_bytes_, T, A, hh_.get(), act, em, stream_);
+                                                                 group_ws_bytes_, T, A, hh_.get(), act, em, stream_,
+                                                                 h_f16);
             } else {
                 kernels::linear_qw_experts_gather_grouped(u_.get(), l.gate_up, Estack, group_ws_.get(), group_ws_bytes_,
                                                           T, A, gu_.get(), act, em, stream_);
@@ -1847,20 +2284,16 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             }
             kernels::linear_qw_experts_combine_grouped(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(),
                                                        group_ws_.get(), group_ws_bytes_, group_partial_.get(), T, A,
-                                                       y_.get(), act, em, stream_);
+                                                       y_.get(), act, em, stream_, fold_shared ? &shared_add : nullptr,
+                                                       h_f16);
         } else {
             kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(),
                                                      act, expert_err_.get(), stream_);
             kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A,
                                                y_.get(), act, expert_err_.get(), stream_);
         }
-        show(L + "experts_h", hh_.get(), A * D.inter, pt);  // the routed experts' down input, T rows of A slots
-        if (sep) {  // the shared expert as dense projections, then y += sigmoid(its gate logit) * its output
-            lin(u_.get(), l.shared_gate_up, gu_.get(), T, act);
-            kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
-            show(L + "shared_h", hh_.get(), D.inter, pt);
-            lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
-        }
+        show(L + "experts_h", hh_.get(), A * D.inter, h_f16 ? ProbeType::F16 : pt);  // the routed experts' down input, T rows of A slots
+        if (sep && !fold_shared) shared_expert();  // then y += sigmoid(its gate logit) * its output
         if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,
@@ -1868,7 +2301,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = false;
         } else {
-            if (sep)
+            if (sep && !fold_shared)
                 kernels::moe_shared_add(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                         D.d, (uint32_t)D.experts, act, router_err_.get(), stream_);
             show(L + "moe", y_.get(), D.d, pt);
@@ -1876,14 +2309,33 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         }
         show(L + "out", x_.get(), n4, pt);
     }
-    // Indexer tails: every attention layer wrote tail_out = the other buffer this call.
-    tail_cur_ = 1 - tail_cur_;
+    // Indexer tails: every attention layer wrote tail_out = the other buffer this call, per run.
+    for (Run &r : runs) r.sq->tail_cur = 1 - r.sq->tail_cur;
 
     STRIX_TRACE_SET(stage, "head");
     hc_mix(m_.final_mix(), false, inv_ready);
     show("final_mixed", u_.get(), D.d, pt);
-    if (n_logits > 0)
-        lin(at(u_, (T - n_logits) * D.d), m_.lm_head(), logits_.get(), n_logits, Act::F32);
+    // The logits rows: each run's last nL rows. One run whose rows end the batch (today's serving, and every
+    // batch of one) reads them straight out of the streams; a multi-run batch first compacts the wanted rows
+    // into lg_src_, so the LM head's weights are read once for the whole batch - the batch's point (the head is
+    // ~640 MB). The returned rows are run 0's, then run 1's - the order candidates() comes back in.
+    int64_t lrow = 0;
+    if (runs.size() == 1) {
+        if (runs[0].nL > 0)
+            lin(at(u_, (T - runs[0].nL) * D.d), m_.lm_head(), logits_.get(), runs[0].nL, Act::F32);
+        lrow = runs[0].nL;
+    } else if (nL_total > 0) {
+        for (const Run &r : runs) {
+            if (r.nL == 0) continue;
+            STRIX_HIP_CHECK(hipMemcpyAsync(lg_src_.get() + (size_t)(lrow * D.d) * e,
+                                           at(u_, (r.base + r.Tr - r.nL) * D.d), (size_t)(r.nL * D.d) * e,
+                                           hipMemcpyDeviceToDevice, stream_),
+                            "Qwen4ExpSession::forward: logits-row compaction");
+            lrow += r.nL;
+        }
+        lin(lg_src_.get(), m_.lm_head(), logits_.get(), nL_total, Act::F32);
+    }
+    const int64_t n_logits = lrow;  // the batch's returned logits rows
     const bool cands = cand_n_valid > 0 && n_logits > 0;
     if (cands) {
         auto *cd = reinterpret_cast<kernels::LogitCand *>(cand_dev_.get());
@@ -1900,40 +2352,50 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                              mask_rows > 0 ? mask_words : 0);
     }
 
-    // MTP: the layer's K / V (and indexer keys) for these positions, each from its token and the trunk's streams
-    // after the position before - what a later draft attends to. The rest of the
-    // layer only matters for a draft's own row, so it's skipped here.
+    // MTP: each run gets the head layer's K / V (and indexer keys) for its positions, each row from its
+    // token and the trunk's streams after the position before - what a later draft attends to. The rest of the
+    // head layer only matters for a draft's own row, so it's skipped here. The head's own projections / mixes
+    // launch per run (its weights are a few MB; batching the catch-up across runs is a later small idea).
     if (mtp_) {
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        mtp_input(T, mtp_prev_.get());
+        // The head's input rows per run (its own mtp_prev streams + the trunk's x_ rows before each of its
+        // rows) into the head workspaces' row slices, then the head's own mix / qkv projection once over all
+        // N rows (stateless - the catch-up shares the batch's weight reads too). mtp_input can only mix rows
+        // of one state: run_mtp swaps mtp_x_ against that state's chain buffer mid-draft.
+        for (Run &r : runs) mtp_input(r.base, r.Tr, r.sq->mtp_prev.get());
         hc_mix(ml.hc_attn, true, false, mtp_x_.get());
         lin(u_.get(), ml.qkv, proj_.get(), T, act);
-        const kernels::NormRopeJob nr[2] = {
-            {at(proj_, D.hq * 2 * hd), D.astride, hd, k_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e, D.hkv * hd, hd,
-             D.hkv, hd, ml.k_norm},
-            {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e,
-             D.hkv * hd, hd, D.hkv, hd, nullptr}};
-        kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream_, m_.rope_scale(),
-                                   mk_jobs_);  // k, v into the MTP cache
-        kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos_,
-                                pos_ % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
-                                tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
-        mtp_tail_cur_ = 1 - mtp_tail_cur_;
-        STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), at(x_, (T - 1) * n4), (size_t)n4 * e, hipMemcpyDeviceToDevice,
-                                       stream_),
-                        "MTP previous streams");
+        for (Run &r : runs) {
+            Qwen4ExpSeqState &sq = *r.sq;
+            const kernels::NormRopeJob nr[2] = {
+                {at(proj_, r.base * D.astride + D.hq * 2 * hd), D.astride, hd,
+                 sq.k_cache_mtp.get() + (size_t)(r.p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, ml.k_norm},
+                {at(proj_, r.base * D.astride + D.hq * 2 * hd + D.hkv * hd), D.astride, hd,
+                 sq.v_cache_mtp.get() + (size_t)(r.p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, nullptr}};
+            kernels::qk_norm_rope_jobs(nr, 2, r.Tr, D.eps, D.rot, r.rope0, m_.inv_freq(), act, stream_,
+                                       m_.rope_scale(), mk_jobs_);  // k, v into the MTP cache (at row base)
+            kernels::qsa_block_keys(at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride,
+                                    r.Tr, r.p,
+                                    r.p % kernels::kQsaBlock ? sq.tail_mtp[sq.mtp_tail_cur].get() : nullptr,
+                                    sq.tail_mtp[1 - sq.mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps,
+                                    m_.inv_freq(), D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_,
+                                    m_.rope_scale(), mk_block_);
+            sq.mtp_tail_cur = 1 - sq.mtp_tail_cur;
+            STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), at(x_, (r.base + r.Tr - 1) * n4), (size_t)n4 * e,
+                                           hipMemcpyDeviceToDevice, stream_),
+                            "MTP previous streams");
+        }
     }
     std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.vocab), "");
-    pos_ += T;
+    for (Run &r : runs) r.sq->pos += r.Tr, r.sq->verify_carry = 0;  // the run's rows consumed its carried token
     broken_ = false;
-    mtp_chain_step_ = -1;
+    for (Run &r : runs) r.sq->mtp_chain_step = -1;
     return logits;
-}
-
-std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
+}std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
                                                    const std::vector<int64_t> &pos3) {
-    STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::forward_verify: the last one awaits keep_verify / drop_verify");
+    const int64_t pending = pending_verify_seq();
+    STRIX_CHECK(pending < 0, "Qwen4ExpSession::forward_verify: a forward_verify on seq ", pending,
+                " awaits keep_verify / drop_verify");
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward_verify: an earlier call failed midway; reset() the session first");
     // mRoPE: the verify's rows go through the same pending path as a forward's (set_positions validates them);
     // the forward below appends them (and materializes the scalar ones) to the history, and keep / drop
@@ -1942,163 +2404,306 @@ std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &i
                 "Qwen4ExpSession::forward_verify: pos3 has ", pos3.size() / 3, " rows, the verify runs ",
                 ids.size(), " - one triple per row");
     if (!pos3.empty()) set_positions(pos3);
-    else STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::forward_verify: scalar verify while set_positions holds ",
-                     pending3_.size() / 3, " interleaved rows - pass them as pos3, or clear first");
-    verify_hist_before_ = pos3_host_;              // the forward below appends the rows; keep/drop decide
-    verify_hist_start_before_ = pos3_start_;
-    verify_delta_before_ = rope_delta_;
-    verify_ever_before_ = history_ever_interleaved_;
-    if (conv_spare_.empty()) {
-        for (size_t l = 0; l < conv_state_.size(); ++l) {
+    else STRIX_CHECK(st().pending3.empty(), "Qwen4ExpSession::forward_verify: scalar verify while set_positions holds ",
+                     st().pending3.size() / 3, " interleaved rows - pass them as pos3, or clear first");
+    STRIX_CHECK((int64_t)ids.size() <= kMaxLogits, "Qwen4ExpSession::forward_verify: ", ids.size(), " tokens, expected <= ",
+                kMaxLogits, " (the saved rows for keep_verify_prefix)");
+    verify_prep(st());
+    st().verify_ids = ids;
+    st().verify_rows = (int64_t)ids.size(), st().verify_carry = 0;
+    st().gdn_to_spare = true;
+    try {
+        std::vector<float> logits = forward(ids, n_logits);
+        st().gdn_to_spare = false;
+        st().verify_pending = true;
+        return logits;
+    } catch (...) {
+        st().gdn_to_spare = false;
+        st().verify_pending = false, st().verify_rows = 0;
+        throw;
+    }
+}
+
+// The seq of the first state with a pending verify (-1: none). While one awaits its outcome the session's shared
+// forward / replay buffers are the verify's, so every other call that touches them refuses - with more slots the
+// pending verify must not block reads, only forwards / replays / drafts are gated on it.
+int64_t Qwen4ExpSession::pending_verify_seq() const {
+    for (size_t k = 0; k < seqs_.size(); ++k)
+        if (seqs_[k]->verify_pending) return (int64_t)k;
+    return -1;
+}
+
+// One state's verify preparation, shared by the single-sequence and batched paths: the mRoPE before-state (the
+// forward appends the verify's rows; keep / drop decide), the spare set (allocated on the first use - it needs
+// the session's kMaxLogits row sizing), the kept small states, and the position / history bookkeeping. The
+// caller then records the verify's ids, sets gdn_to_spare and runs the forward.
+void Qwen4ExpSession::verify_prep(Qwen4ExpSeqState &sq) {
+    sq.verify_hist_before = sq.pos3_host;
+    sq.verify_hist_start_before = sq.pos3_start;
+    sq.verify_delta_before = sq.rope_delta;
+    sq.verify_ever_before = sq.history_ever_interleaved;
+    if (sq.conv_spare.empty()) {
+        for (size_t l = 0; l < sq.conv_state.size(); ++l) {
             const std::string tag = "spare layer " + std::to_string(l);
-            conv_spare_.emplace_back(conv_state_[l].size() ? DeviceBuffer<uint8_t>(conv_state_[l].size(), "conv state " + tag)
-                                                           : DeviceBuffer<uint8_t>());
-            rec_spare_.emplace_back(rec_state_[l].size() ? DeviceBuffer<float>(rec_state_[l].size(), "recurrent state " + tag)
-                                                         : DeviceBuffer<float>());
+            sq.conv_spare.emplace_back(sq.conv_state[l].size() ? DeviceBuffer<uint8_t>(sq.conv_state[l].size(), "conv state " + tag)
+                                                        : DeviceBuffer<uint8_t>());
+            sq.rec_spare.emplace_back(sq.rec_state[l].size() ? DeviceBuffer<float>(sq.rec_state[l].size(), "recurrent state " + tag)
+                                                     : DeviceBuffer<float>());
         }
-        if (ple_state_.size()) ple_state_kept_ = DeviceBuffer<uint8_t>(ple_state_.size(), "kept PLE conv state");
-        if (mtp_) mtp_prev_kept_ = DeviceBuffer<uint8_t>(mtp_prev_.size(), "kept MTP previous streams");
+        if (sq.ple_state.size()) sq.ple_state_kept = DeviceBuffer<uint8_t>(sq.ple_state.size(), "kept PLE conv state");
+        if (mtp_) sq.mtp_prev_kept = DeviceBuffer<uint8_t>(sq.mtp_prev.size(), "kept MTP previous streams");
         const Qwen4ExpDims &D = m_.dims();
         const size_t e = es(m_.act());
-        for (size_t l = 0; l < conv_state_.size(); ++l)
-            verify_in_.emplace_back(
+        for (size_t l = 0; l < sq.conv_state.size(); ++l)
+            sq.verify_in.emplace_back(
                 (size_t)(kMaxLogits * (D.is_attention[l] ? D.idx_d + (kv_format_ == KvFormat::Q8 ? 2 * D.hkv * D.hd : 0)
                                                          : D.gstride)) * e,
                 "verify rows, layer " + std::to_string(l));
     }
     // What the forward changes in place (small): kept for drop_verify. The GDN states go to the spare set.
-    copy_state(ple_state_, ple_state_kept_, stream_, "PLE conv state");
-    copy_state(mtp_prev_, mtp_prev_kept_, stream_, "MTP previous streams");
-    STRIX_CHECK((int64_t)ids.size() <= kMaxLogits, "Qwen4ExpSession::forward_verify: ", ids.size(), " tokens, expected <= ",
-                kMaxLogits, " (the saved rows for keep_verify_prefix)");
-    verify_pos_ = pos_, verify_tail_cur_ = tail_cur_, verify_mtp_tail_cur_ = mtp_tail_cur_, verify_hist_ = ple_hist_;
-    verify_ids_ = ids;
-    gdn_to_spare_ = true;
+    copy_state(sq.ple_state, sq.ple_state_kept, stream_, "PLE conv state");
+    copy_state(sq.mtp_prev, sq.mtp_prev_kept, stream_, "MTP previous streams");
+    sq.verify_pos = sq.pos, sq.verify_tail_cur = sq.tail_cur, sq.verify_mtp_tail_cur = sq.mtp_tail_cur,
+        sq.verify_hist = sq.ple_hist;
+    // The batch row / PLE window bases: 0 for a single-sequence verify (forward_batch_verify sets the batched
+    // ones, mirroring the order forward_batch lays the runs in).
+    sq.verify_row_base = 0, sq.verify_ple_wbase = 0;
+}
+
+// forward_batch with the verify mechanism (the batched MTP verify): every run's state is prepared like
+// forward_verify's, the batched forward writes each verifying state's GDN states into its spare set and saves
+// its rows for the prefix replay, and the batch's logits come back run-concatenated. Every run resolves with
+// keep_verify(seq, ..) / drop_verify(seq) before anything else runs on the session; the acceptance decisions
+// differ per run, so the engine resolves them one by one.
+std::vector<float> Qwen4ExpSession::forward_batch_verify(std::vector<BatchRun> &runs) {
+    const char *fn = "Qwen4ExpSession::forward_batch_verify";
+    const int64_t pending = pending_verify_seq();
+    STRIX_CHECK(pending < 0, fn, ": a forward_verify on seq ", pending, " awaits keep_verify / drop_verify - "
+                "resolve the pending batch first");
+    STRIX_CHECK(!broken_, fn, ": an earlier call failed midway; reset() the session first");
+    STRIX_CHECK(!runs.empty() && runs.size() <= (size_t)n_slots(), fn, ": ", runs.size(), " runs, expected 1..",
+                n_slots());
+    for (size_t k = 0; k < runs.size(); ++k) {
+        STRIX_CHECK(runs[k].seq >= 0 && runs[k].seq < n_slots(), fn, ": run ", k, " on seq ", runs[k].seq,
+                    ", expected 0..", n_slots() - 1);
+        for (size_t j = 0; j < k; ++j)
+            STRIX_CHECK(runs[j].seq != runs[k].seq, fn, ": seq ", runs[k].seq, " carries two runs (", j,
+                        " and ", k, ")");
+        STRIX_CHECK((int64_t)runs[k].ids.size() <= kMaxLogits, fn, ": run ", k, " has ", runs[k].ids.size(),
+                    " rows, expected <=", kMaxLogits, " (the saved rows for keep_verify)");
+        // (forward_batch checks the row budget, the capacity, and the scalar / no-image multi-run contract)
+    }
+    // Each run's bases in the batch's shared row buffers mirror the order forward_batch lays the runs in
+    // (the batch vector's): trunk/MTP activation rows at the id prefix sum, PLE history windows laid end to
+    // end (S state rows + the run's rows each). keep_verify_prefix_seq's replay reads them back per state.
+    const int64_t ple_S = m_.dims().ple_layer >= 0 ? (m_.dims().ple_taps - 1) * m_.dims().ple_dil : 0;
+    int64_t base = 0, wbase = 0;
+    for (const BatchRun &br : runs) {
+        Qwen4ExpSeqState &sq = *seqs_[(size_t)br.seq];
+        verify_prep(sq);
+        sq.verify_ids = br.ids;
+        sq.verify_rows = (int64_t)br.ids.size(), sq.verify_carry = 0;
+        sq.verify_row_base = base, sq.verify_ple_wbase = wbase;
+        sq.gdn_to_spare = true;
+        base += (int64_t)br.ids.size();
+        if (ple_S) wbase += ple_S + (int64_t)br.ids.size();
+    }
+    std::vector<float> logits;
     try {
-        std::vector<float> logits = forward(ids, n_logits);
-        gdn_to_spare_ = false;
-        verify_pending_ = true;
-        return logits;
+        logits = forward_batch(runs, nullptr, {});
     } catch (...) {
-        gdn_to_spare_ = false;
+        for (const BatchRun &br : runs) {
+            Qwen4ExpSeqState &sq = *seqs_[(size_t)br.seq];
+            sq.gdn_to_spare = false, sq.verify_pending = false, sq.verify_rows = 0;
+        }
         throw;
     }
+    for (const BatchRun &br : runs) {
+        Qwen4ExpSeqState &sq = *seqs_[(size_t)br.seq];
+        sq.gdn_to_spare = false;
+        sq.verify_pending = true;
+    }
+    return logits;
 }
 
 void Qwen4ExpSession::keep_verify() {
-    STRIX_CHECK(verify_pending_, "Qwen4ExpSession::keep_verify: no forward_verify to keep");
-    std::swap(conv_state_, conv_spare_);
-    std::swap(rec_state_, rec_spare_);
+    STRIX_CHECK(st().verify_pending, "Qwen4ExpSession::keep_verify: no forward_verify to keep");
+    keep_verify_full(st());
+}
+
+// A kept whole verify: the spare set becomes current (as if the verify had been a forward()). The rows past
+// the kept prefix (keep_verify_prefix_seq) are the verify's rows the next forward rewrites.
+void Qwen4ExpSession::keep_verify_full(Qwen4ExpSeqState &sq) {
+    std::swap(sq.conv_state, sq.conv_spare);
+    std::swap(sq.rec_state, sq.rec_spare);
     // mRoPE: the verify's rows are kept - the history / delta already include them (forward appended them).
-    verify_hist_before_.clear();
-    verify_pending_ = false;
+    sq.verify_hist_before.clear();
+    sq.verify_pending = false, sq.verify_rows = 0, sq.verify_carry = 0;
 }
 
 void Qwen4ExpSession::drop_verify() {
-    STRIX_CHECK(verify_pending_, "Qwen4ExpSession::drop_verify: no forward_verify to drop");
-    copy_state(ple_state_kept_, ple_state_, stream_, "PLE conv state");
-    copy_state(mtp_prev_kept_, mtp_prev_, stream_, "MTP previous streams");
+    STRIX_CHECK(st().verify_pending, "Qwen4ExpSession::drop_verify: no forward_verify to drop");
+    drop_verify_seq(st());
+}
+
+// The batched resolution's none-kept: seq's rows never happened, its states roll back to before the verify
+// (the other runs of the batch resolve on their own - their acceptance differs).
+void Qwen4ExpSession::drop_verify(int seq) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::drop_verify: seq ", seq, ", expected 0..",
+                n_slots() - 1);
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    STRIX_CHECK(sq.verify_pending, "Qwen4ExpSession::drop_verify: seq ", seq, " has no pending verify");
+    drop_verify_seq(sq);
+}
+
+void Qwen4ExpSession::drop_verify_seq(Qwen4ExpSeqState &sq) {
+    copy_state(sq.ple_state_kept, sq.ple_state, stream_, "PLE conv state");
+    copy_state(sq.mtp_prev_kept, sq.mtp_prev, stream_, "MTP previous streams");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::drop_verify");
-    pos_ = verify_pos_, tail_cur_ = verify_tail_cur_, mtp_tail_cur_ = verify_mtp_tail_cur_, ple_hist_ = verify_hist_;
+    sq.pos = sq.verify_pos, sq.tail_cur = sq.verify_tail_cur, sq.mtp_tail_cur = sq.verify_mtp_tail_cur,
+        sq.ple_hist = sq.verify_hist;
     // mRoPE: the verify's rows never happened - history and rope_delta revert to before it.
-    pos3_host_ = verify_hist_before_, rope_delta_ = verify_delta_before_;
-    pos3_start_ = verify_hist_start_before_, history_ever_interleaved_ = verify_ever_before_;
-    verify_hist_before_.clear();
-    mtp_chain_step_ = -1;
-    rewind_to_.push_back(verify_pos_);  // rows past it were overwritten: snapshots beyond it no longer match
-    verify_pending_ = false;
+    sq.pos3_host = sq.verify_hist_before, sq.rope_delta = sq.verify_delta_before;
+    sq.pos3_start = sq.verify_hist_start_before, sq.history_ever_interleaved = sq.verify_ever_before;
+    sq.verify_hist_before.clear();
+    sq.mtp_chain_step = -1;
+    sq.rewind_to.push_back(sq.verify_pos);  // rows past it were overwritten: snapshots beyond it no longer match
+    sq.verify_pending = false;
+    sq.verify_rows = 0, sq.verify_carry = 0;
+}
+
+// The batched resolution: end seq's pending verify keeping its first `rows` rows - the whole verify
+// (rows == its verify_rows: today's keep_verify()) or its prefix (today's keep_verify_prefix(rows)), chosen by
+// the count. carry: the token the caller feeds next as the run's row 0 (the MTP rejection's corrected sample,
+// or with the whole verify kept the token sampled from its last row) - recorded on the state and consumed
+// (checked and cleared) by the run's next forward_batch / forward_batch_verify: exactly like the
+// single-sequence engine after keep_verify_prefix, whose corrected token becomes the next verify's row 0,
+// nothing is advanced or replayed for the carry here (its trunk rows would take the full forward to write -
+// the run's PLE rows reach it through prefetch_ple as today). The last resolution frees the session.
+void Qwen4ExpSession::keep_verify(int seq, int64_t rows, int32_t carry) {
+    const char *fn = "Qwen4ExpSession::keep_verify";
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
+    STRIX_CHECK(carry >= 0 && carry < m_.dims().vocab, fn, ": carried token ", carry, ", expected 0..",
+                m_.dims().vocab - 1, " (0: the caller forwards nothing)");
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    STRIX_CHECK(sq.verify_pending, fn, ": seq ", seq, " has no pending verify");
+    const int64_t R = sq.verify_rows;
+    STRIX_CHECK(R >= 1, fn, ": seq ", seq, "'s pending verify recorded ", R, " rows (internal)");
+    STRIX_CHECK(rows >= 1 && rows <= R, fn, ": keep ", rows, " rows of seq ", seq, "'s ", R,
+                "-row verify, expected 1..", R, " (none: drop_verify)");
+    STRIX_CHECK(sq.pending3.empty(), fn, ": seq ", seq, "'s set_positions holds ", sq.pending3.size() / 3,
+                " interleaved rows while a verify is pending - resolve the verify first");
+    if (rows < R)
+        keep_verify_prefix_seq(sq, rows);
+    else
+        keep_verify_full(sq);
+    sq.verify_carry = carry;
 }
 
 void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
-    STRIX_CHECK(verify_pending_, "Qwen4ExpSession::keep_verify_prefix: no forward_verify pending");
-    const int64_t T = (int64_t)verify_ids_.size();
+    STRIX_CHECK(st().verify_pending, "Qwen4ExpSession::keep_verify_prefix: no forward_verify pending");
+    const int64_t T = (int64_t)st().verify_ids.size();
     STRIX_CHECK(rows >= 1 && rows < T, "Qwen4ExpSession::keep_verify_prefix: keep ", rows, " rows of a ", T,
                 "-row verify, expected 1..", T - 1, " (all of them: keep_verify; none: drop_verify)");
-    STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::keep_verify_prefix: set_positions holds ", pending3_.size() / 3,
+    STRIX_CHECK(st().pending3.empty(), "Qwen4ExpSession::keep_verify_prefix: set_positions holds ", st().pending3.size() / 3,
                 " interleaved rows while a verify is pending - resolve the verify first");
+    keep_verify_prefix_seq(st(), rows);
+}
+
+// The prefix body of a state's pending verify (1 <= rows < its verify_rows; the callers check): the state as
+// if the verify had been a forward() over its first rows, replayed from the states before the verify (which
+// the verify left intact) over its saved rows - the engine then continues at this position (with keep_verify's
+// carry token, or with the next verify's row 0).
+void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows) {
     const Qwen4ExpDims &D = m_.dims();
     const Act act = m_.act();
     const size_t e = es(act);
-    const int64_t n4 = D.H * D.d, p0 = verify_pos_;
+    const int64_t n4 = D.H * D.d, p0 = sq.verify_pos;
     // mRoPE: the verify's rows (kept and rejected alike) are already in the history; the block keys of a
     // block completed within the kept rows replay with its first row's triple / the scalar base + delta -
     // exactly like the verify's own forward did.
-    prepare_positions(p0, rows);
+    prepare_positions(sq, p0, rows);
     broken_ = true;  // until the state is whole again
     for (int64_t i = 0; i < D.layers; ++i) {
         const Qwen4ExpModel::Layer &l = m_.layer(i);
         const size_t li = (size_t)i;
         if (!D.is_attention[li]) {
-            // GDN: the verify wrote its states to the spare set, so conv_state_ / rec_state_ are still the ones before
-            // it - replay rows [0, rows) on them in place, with the verify's own path (Auto: per token), so the state
-            // is exactly the verify's after that row (split invariance).
-            kernels::gdn_front(verify_in_[li].get(),
+            // GDN: the verify wrote its states to the spare set, so sq.conv_state / sq.rec_state are still the ones
+            // before it - replay rows [0, rows) on them in place, with the verify's own path (Auto: per token), so
+            // the state is exactly the verify's after that row (split invariance).
+            kernels::gdn_front(sq.verify_in[li].get(),
                                {rows, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
-                               l.conv_w, conv_state_[li].get(), conv_state_[li].get(), false, l.A_log, l.dt_bias,
+                               l.conv_w, sq.conv_state[li].get(), sq.conv_state[li].get(), false, l.A_log, l.dt_bias,
                                qkv_.get(), beta_.get(), g_.get(), act, stream_);
-            kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {rows, D.gk, D.gv, D.conv_c}, rec_state_[li].get(),
-                                rec_state_[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto);
+            kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {rows, D.gk, D.gv, D.conv_c}, sq.rec_state[li].get(),
+                                sq.rec_state[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto);
         } else {
             // Attention: the tail (and any block completed within the kept rows - same keys the verify wrote) from
             // the tail before the verify, which it only read. Same block-window triples as the verify's forward.
-            kernels::qsa_block_keys(verify_in_[li].get(), D.idx_d, rows, p0,
-                                    p0 % kernels::kQsaBlock ? tail_[verify_tail_cur_][li].get() : nullptr,
-                                    tail_[1 - verify_tail_cur_][li].get(), D.idx_d, l.idx_k_norm, D.eps,
-                                    m_.inv_freq(), D.rot, block_keys_[li].get(), cap_blocks_, act, stream_, m_.rope_scale(),
+            kernels::qsa_block_keys(sq.verify_in[li].get(), D.idx_d, rows, p0,
+                                    p0 % kernels::kQsaBlock ? sq.tail[sq.verify_tail_cur][li].get() : nullptr,
+                                    sq.tail[1 - sq.verify_tail_cur][li].get(), D.idx_d, l.idx_k_norm, D.eps,
+                                    m_.inv_freq(), D.rot, sq.block_keys[li].get(), cap_blocks_, act, stream_, m_.rope_scale(),
                                     mk_block_);
             // 8-bit K/V: the groups completed within the kept rows and the tail, from the verify's saved rows and
             // the tail before it (its own commit wrote the other tail buffer, which this overwrites).
             if (kv_format_ == KvFormat::Q8) {
                 const int64_t W = D.hkv * D.hd;
-                const uint8_t *rows_kv = verify_in_[li].get() + (size_t)(kMaxLogits * D.idx_d) * e;
+                const uint8_t *rows_kv = sq.verify_in[li].get() + (size_t)(kMaxLogits * D.idx_d) * e;
                 kernels::kv8_commit(rows_kv, rows_kv + (size_t)W * e, 2 * W, rows, p0,
-                                    p0 % kernels::kKv8Group ? kv8_tail_[verify_tail_cur_][li].get() : nullptr,
-                                    kv8_tail_[1 - verify_tail_cur_][li].get(), kv8_store_[li].get(), kv8_cap_, W, act,
+                                    p0 % kernels::kKv8Group ? sq.kv8_tail[sq.verify_tail_cur][li].get() : nullptr,
+                                    sq.kv8_tail[1 - sq.verify_tail_cur][li].get(), sq.kv8_store[li].get(), kv8_cap_, W, act,
                                     kv8_err_.get(), stream_);
             }
         }
     }
     if (D.ple_layer >= 0) {
-        // PLE: the history held [S state rows][T verify rows]; the state after row rows - 1 is its rows [rows, rows + S).
+        // PLE: the history window held [S state rows][T verify rows]; a multi-run verify lays its states' windows
+        // end to end in ple_hist_buf_ (the batched forward's order), so sq.verify_ple_wbase is this state's window
+        // start (0 for a single-sequence verify). The state after row rows - 1 is its window rows [rows, rows + S).
         const int64_t S = (D.ple_taps - 1) * D.ple_dil;
-        STRIX_HIP_CHECK(hipMemcpyAsync(ple_state_.get(), ple_hist_buf_.get() + (size_t)(rows * n4) * e,
+        STRIX_HIP_CHECK(hipMemcpyAsync(sq.ple_state.get(),
+                                       ple_hist_buf_.get() + (size_t)((sq.verify_ple_wbase + rows) * n4) * e,
                                        (size_t)(S * n4) * e, hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: PLE state");
     }
     if (mtp_) {
-        // The MTP layer's projections are the last thing the verify wrote to proj_; its streams are still in x_.
+        // The MTP layer's projections of this state's rows are in proj_ at sq.verify_row_base (0 for a
+        // single-sequence verify, the run's row base for a batched one); its streams are still in x_.
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        kernels::qsa_block_keys(proj_.get() + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, rows, p0,
-                                p0 % kernels::kQsaBlock ? tail_mtp_[verify_mtp_tail_cur_].get() : nullptr,
-                                tail_mtp_[1 - verify_mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
-        STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), x_.get() + (size_t)((rows - 1) * n4) * e, (size_t)n4 * e,
-                                       hipMemcpyDeviceToDevice, stream_),
+        const int64_t rbase = sq.verify_row_base;
+        kernels::qsa_block_keys(proj_.get() + (size_t)(rbase * D.astride + D.idx_col + D.idx_h * D.idx_d) * e,
+                                D.astride, rows, p0,
+                                p0 % kernels::kQsaBlock ? sq.tail_mtp[sq.verify_mtp_tail_cur].get() : nullptr,
+                                sq.tail_mtp[1 - sq.verify_mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
+                                D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
+        STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), x_.get() + (size_t)((rbase + rows - 1) * n4) * e,
+                                       (size_t)n4 * e, hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
     }
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::keep_verify_prefix");
     // The n-gram history: the one before the verify, advanced over the kept ids.
-    PleHistory h = verify_hist_;
+    PleHistory h = sq.verify_hist;
     if (D.ple_layer >= 0) {
-        std::vector<int64_t> tok(verify_ids_.begin(), verify_ids_.begin() + rows), out((size_t)(rows * 16));
+        std::vector<int64_t> tok(sq.verify_ids.begin(), sq.verify_ids.begin() + rows), out((size_t)(rows * 16));
         ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), rows, h, out.data());
     }
-    ple_hist_ = h;
-    pos_ = p0 + rows;
+    sq.ple_hist = h;
+    sq.pos = p0 + rows;
     // mRoPE: the verify's rows past the kept prefix never happened - truncate the history (the verify's
-    // forward appended all of them, so it reaches past pos_); the rejected draft's image rows would
+    // forward appended all of them, so it reaches past sq.pos); the rejected draft's image rows would
     // otherwise sit at sequence indices the next forward overwrites with different tokens (and triples).
-    if (!pos3_host_.empty()) {
-        const int64_t keep_len = pos_ - pos3_start_;
-        STRIX_CHECK(keep_len >= 0 && keep_len * 3 <= (int64_t)pos3_host_.size(),
-                    "Qwen4ExpSession::keep_verify_prefix: keeping ", pos_, " sequence rows from a history of [",
-                    pos3_start_, ", ", pos3Hend(), ") - internal mismatch");
-        pos3_host_.resize((size_t)(keep_len * 3));
+    if (!sq.pos3_host.empty()) {
+        const int64_t keep_len = sq.pos - sq.pos3_start;
+        STRIX_CHECK(keep_len >= 0 && keep_len * 3 <= (int64_t)sq.pos3_host.size(),
+                    "Qwen4ExpSession::keep_verify_prefix: keeping ", sq.pos, " sequence rows from a history of [",
+                    sq.pos3_start, ", ", sq.pos3Hend(), ") - internal mismatch");
+        sq.pos3_host.resize((size_t)(keep_len * 3));
     }
-    tail_cur_ = 1 - verify_tail_cur_, mtp_tail_cur_ = 1 - verify_mtp_tail_cur_;
-    mtp_chain_step_ = -1;
-    rewind_to_.push_back(pos_);  // the verify's rows past pos_ get overwritten: snapshots beyond it no longer match
-    verify_pending_ = false;
+    sq.tail_cur = 1 - sq.verify_tail_cur, sq.mtp_tail_cur = 1 - sq.verify_mtp_tail_cur;
+    sq.mtp_chain_step = -1;
+    sq.rewind_to.push_back(sq.pos);  // the verify's rows past sq.pos get overwritten: snapshots beyond it no longer match
+    sq.verify_pending = false, sq.verify_rows = 0, sq.verify_carry = 0;
     broken_ = false;
 }
 
@@ -2108,9 +2713,15 @@ void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
     mtp_vocab_ = n;
 }
 
-void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
+// The MTP head's input rows at row_base.. of the forward's row buffers: ids_[row_base + t] with the streams
+// after the position before (prev0 for t = 0, x_ row row_base + t - 1 after it) - into the head workspaces'
+// rows [row_base, row_base + T), so the head's mix and projections run over the whole batch at once. One
+// call's rows must all belong to one state (their prev0 is that state's): the drafts and the catch-up of a
+// multi-run batch call it once per run at the run's row base.
+void Qwen4ExpSession::mtp_input(int64_t row_base, int64_t T, const void *prev0) {
     STRIX_CHECK(mtp_, "Qwen4ExpSession::mtp_input: MTP is off");
-    STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::mtp_input: ", T, " rows, expected 1..", max_tokens_);
+    STRIX_CHECK(T >= 1 && row_base >= 0 && row_base + T <= max_tokens_, "Qwen4ExpSession::mtp_input: rows [",
+                row_base, ", ", row_base + T, "), expected inside the workspace's ", max_tokens_);
     const Qwen4ExpDims &D = m_.dims();
     const Act act = m_.act();
     const size_t e = es(act);
@@ -2122,32 +2733,47 @@ void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
         else kernels::linear_qw(x, w, y, M, act, act, stream_);
     };
     // e = rmsnorm_zc(embed(token)) [T, d]; h = the previous streams, each stream normed [T, H, d].
+    const size_t de = (size_t)(row_base * D.d) * e, hde = (size_t)(row_base * n4) * e;
     if (m_.is_embed_q8())
-        kernels::embedding_lookup(ids_.get(), T, m_.embed_q8(), mtp_emb_.get(), act, emb_err_.get(), stream_);
+        kernels::embedding_lookup(ids_.get() + row_base, T, m_.embed_q8(), mtp_emb_.get() + de, act, emb_err_.get(),
+                                  stream_);
     else
-        kernels::embedding_lookup(ids_.get(), T, m_.embed(), D.vocab, D.d, mtp_emb_.get(), act, emb_err_.get(), stream_);
-    kernels::rmsnorm_zc(mtp_emb_.get(), mtp.pre_fc_norm_embedding, mtp_norm_emb_.get(), T, D.d, D.eps, act, stream_);
+        kernels::embedding_lookup(ids_.get() + row_base, T, m_.embed(), D.vocab, D.d, mtp_emb_.get() + de, act,
+                                  emb_err_.get(), stream_);
+    kernels::rmsnorm_zc(mtp_emb_.get() + de, mtp.pre_fc_norm_embedding, mtp_norm_emb_.get() + de, T, D.d, D.eps, act,
+                        stream_);
     STRIX_CHECK(prev0 != nullptr, "Qwen4ExpSession::mtp_input: null previous streams");
-    kernels::group_rmsnorm_zc(prev0, mtp.pre_fc_norm_hidden, mtp_norm_hid_.get(), 1, D.H, D.d, D.eps, act, stream_);
+    kernels::group_rmsnorm_zc(prev0, mtp.pre_fc_norm_hidden, mtp_norm_hid_.get() + hde, 1, D.H, D.d, D.eps, act,
+                              stream_);
     if (T > 1)
-        kernels::group_rmsnorm_zc(x_.get(), mtp.pre_fc_norm_hidden, mtp_norm_hid_.get() + (size_t)n4 * e, T - 1, D.H,
-                                  D.d, D.eps, act, stream_);
+        kernels::group_rmsnorm_zc(x_.get() + hde, mtp.pre_fc_norm_hidden, mtp_norm_hid_.get() + hde + (size_t)n4 * e,
+                                  T - 1, D.H, D.d, D.eps, act, stream_);
     // Per stream s: x_s = fc_embedding(e) + fc_hidden(h_s) - fc_hidden over the T * H stream rows ([T, H, d] is
     // [T * H, d]), then fc_embedding's row added to each of its token's streams (an injection with weight 1).
-    lin(mtp_norm_emb_.get(), mtp.fc_embedding, mtp_proj_emb_.get(), T);
-    lin(mtp_norm_hid_.get(), mtp.fc_hidden, mtp_x_.get(), T * D.H);
-    kernels::hc_inject(mtp_x_.get(), mtp_ones_.get(), mtp_proj_emb_.get(), T, D.H, D.d, act, stream_);
+    lin(mtp_norm_emb_.get() + de, mtp.fc_embedding, mtp_proj_emb_.get() + de, T);
+    lin(mtp_norm_hid_.get() + hde, mtp.fc_hidden, mtp_x_.get() + hde, T * D.H);
+    kernels::hc_inject(mtp_x_.get() + hde, mtp_ones_.get() + row_base * D.H, mtp_proj_emb_.get() + de, T, D.H, D.d,
+                       act, stream_);
+    ++mtp_x_version_;  // the head's rows were rewritten (the draft chain's interruption stamp, see the field)
 }
 
 std::vector<float> Qwen4ExpSession::forward_mtp(int32_t token_id, int64_t step) {
-    run_mtp(token_id, step);
+    return forward_mtp_seq(0, token_id, step);
+}
+
+std::vector<float> Qwen4ExpSession::forward_mtp_seq(int seq, int32_t token_id, int64_t step) {
+    run_mtp(seq, token_id, step);
     std::vector<float> logits = read_back((size_t)mtp_vocab_, " MTP");
-    mtp_done(step);
+    mtp_done(seq, step);
     return logits;
 }
 
 Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int64_t step) {
-    run_mtp(token_id, step);
+    return forward_mtp_top2_seq(0, token_id, step);
+}
+
+Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step) {
+    run_mtp(seq, token_id, step);
     if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
     auto *dev = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
     kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
@@ -2166,30 +2792,48 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
     kernels::report_embedding_error(p.emb, m_.dims().vocab);
     STRIX_CHECK(p.nan || (p.best >= 0 && p.best < mtp_vocab_), "Qwen4ExpSession::forward_mtp_top2: pick ", p.best,
                 " outside the draft vocabulary [0, ", mtp_vocab_, ")");
-    mtp_done(step);
+    mtp_done(seq, step);
     return {p.best, p.best_v, p.second_v, p.nan != 0};
 }
 
-void Qwen4ExpSession::mtp_done(int64_t step) {
+void Qwen4ExpSession::mtp_done(int seq, int64_t step) {
     broken_ = false;
-    mtp_chain_step_ = step, mtp_chain_pos_ = pos_;
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    sq.mtp_chain_step = step, sq.mtp_chain_pos = sq.pos;
+    sq.mtp_chain_xver = mtp_x_version_;  // this step's streams are in mtp_x_ up to this version (run_mtp checks)
 }
 
-void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
+void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
+    const char *fn = "Qwen4ExpSession::forward_mtp";
     STRIX_TRACE_RANGE("draft " + std::to_string(step));
-    STRIX_CHECK(mtp_, "Qwen4ExpSession::forward_mtp: the session was made without MTP");
-    STRIX_CHECK(!broken_, "Qwen4ExpSession::forward_mtp: an earlier call failed midway; reset() the session first");
+    STRIX_CHECK(mtp_, fn, ": the session was made without MTP");
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    STRIX_CHECK(!broken_, fn, ": an earlier call failed midway; reset() the session first");
     const Qwen4ExpDims &D = m_.dims();
-    STRIX_CHECK(token_id >= 0 && token_id < D.vocab, "Qwen4ExpSession::forward_mtp: token ", token_id,
-                " outside [0, ", D.vocab, ")");
-    STRIX_CHECK(step >= 0, "Qwen4ExpSession::forward_mtp: step ", step, ", expected >= 0");
-    STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::forward_mtp: a forward_verify awaits keep_verify / drop_verify");
-    STRIX_CHECK(step == 0 || (mtp_chain_pos_ == pos_ && mtp_chain_step_ == step - 1), "Qwen4ExpSession::forward_mtp: step ",
-                step, " doesn't continue a chain (last step ", mtp_chain_step_, " at position ", mtp_chain_pos_,
-                ", now at ", pos_, ")");
-    const int64_t p = pos_ + step;  // this row's sequence position (cache row, dense checks; rope angle below)
-    STRIX_CHECK(p < capacity_, "Qwen4ExpSession::forward_mtp: position ", p, " is at the capacity ", capacity_);
-    STRIX_CHECK(pending3_.empty(), "Qwen4ExpSession::forward_mtp: set_positions holds ", pending3_.size() / 3,
+    STRIX_CHECK(token_id >= 0 && token_id < D.vocab, fn, ": token ", token_id, " outside [0, ", D.vocab, ")");
+    STRIX_CHECK(step >= 0, fn, ": step ", step, ", expected >= 0");
+    const int64_t pending = pending_verify_seq();
+    STRIX_CHECK(pending < 0, fn, ": a forward_verify on seq ", pending,
+                " awaits keep_verify / drop_verify - resolve the pending batch before drafting");
+    // The batched MTP cycle's ordering (design "MTP cycle in the batched world"): a slot drafts its whole
+    // chain before the next slot's starts (the batched verify then resolves them together). The draft's
+    // streams live in the shared mtp_x_ (swapped against the state's chain buffer), so the ONE thing that
+    // must not happen is a chain left half-written while another draft (or forward) overwrites mtp_x_: the
+    // version stamp below catches exactly that. A finished, not-yet-verified chain does not block another
+    // slot's fresh chain (its last step's streams are not read again - the trunk verify re-derives them),
+    // and no verify may be pending (checked above - the shared workspaces are the verify's).
+    STRIX_CHECK(step == 0 || (sq.mtp_chain_pos == sq.pos && sq.mtp_chain_step == step - 1), fn, ": step ",
+                step, " doesn't continue a chain (last step ", sq.mtp_chain_step, " at position ", sq.mtp_chain_pos,
+                ", now at ", sq.pos, ")");
+    if (step > 0)
+        STRIX_CHECK(sq.mtp_chain_xver == mtp_x_version_, fn, ": seq ", seq, "'s draft chain (step ", step,
+                    ") was interrupted - mtp_x_ was written ", mtp_x_version_ - (uint64_t)sq.mtp_chain_xver,
+                    " time(s) since its step ", step - 1, " (another draft or a forward ran mid-chain) - finish"
+                    " a chain before drafting another slot's");
+    const int64_t p = sq.pos + step;  // this row's sequence position (cache row, dense checks; rope angle below)
+    STRIX_CHECK(p < capacity_, fn, ": position ", p, " is at the capacity ", capacity_);
+    STRIX_CHECK(sq.pending3.empty(), fn, ": set_positions holds ", sq.pending3.size() / 3,
                 " interleaved rows for the next forward - the draft runs at pos() with the trunk's positions; "
                 "forward them first");
     const Act act = m_.act();
@@ -2199,8 +2843,8 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // mRoPE: the draft row continues the (scalar) text span, so its angle sits at rope_pos(p) = p +
     // rope_delta; the indexer block window may reach an image tail, so its block keys use the history's
     // triples. History rows past p can't exist (no forward ran since the last keep / drop).
-    prepare_positions(p, T);
-    const int64_t rope_p = mk_jobs_.pos3 == nullptr ? rope_pos(p) : p;
+    prepare_positions(sq, p, T);
+    const int64_t rope_p = mk_jobs_.pos3 == nullptr ? p + sq.rope_delta : p;
     const Qwen4ExpModel::MtpHead &mtp = m_.mtp();
     const Qwen4ExpModel::Layer &l = mtp.layer;
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
@@ -2216,26 +2860,26 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
             kernels::hc_mix_up(h_.get(), hc.up.q4, mtp_x_.get(), hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
     };
     broken_ = true;
-    mtp_chain_step_ = -1;
+    sq.mtp_chain_step = -1;
     // Indexer tails: step 0 continues the committed tail into the spare buffer (not flipped); chain steps continue
     // from the step before into their own pair.
-    const void *tail_in = step == 0 ? tail_mtp_[mtp_tail_cur_].get()
-                          : step == 1 ? tail_mtp_[1 - mtp_tail_cur_].get()
-                                      : mtp_chain_tail_[step % 2].get();
-    void *tail_out = step == 0 ? tail_mtp_[1 - mtp_tail_cur_].get() : mtp_chain_tail_[(step + 1) % 2].get();
+    const void *tail_in = step == 0 ? sq.tail_mtp[sq.mtp_tail_cur].get()
+                          : step == 1 ? sq.tail_mtp[1 - sq.mtp_tail_cur].get()
+                                      : sq.mtp_chain_tail[step % 2].get();
+    void *tail_out = step == 0 ? sq.tail_mtp[1 - sq.mtp_tail_cur].get() : sq.mtp_chain_tail[(step + 1) % 2].get();
     if (step > 0) {  // the step before's output streams, kept by swapping buffers (mtp_input overwrites mtp_x_)
-        STRIX_CHECK(mtp_chain_prev_.size() == mtp_x_.size(), "Qwen4ExpSession: MTP chain buffers ", mtp_chain_prev_.size(),
+        STRIX_CHECK(sq.mtp_chain_prev.size() == mtp_x_.size(), "Qwen4ExpSession: MTP chain buffers ", sq.mtp_chain_prev.size(),
                     " / ", mtp_x_.size(), " bytes, expected equal (they're swapped)");
-        std::swap(mtp_x_, mtp_chain_prev_);
+        std::swap(mtp_x_, sq.mtp_chain_prev);
     }
     STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), &token_id, 4, hipMemcpyHostToDevice, stream_), "uploading the MTP token id");
     kernels::reset_embedding_error(emb_err_.get(), stream_);
-    mtp_input(T, step == 0 ? mtp_prev_.get() : mtp_chain_prev_.get());
+    mtp_input(0, T, step == 0 ? sq.mtp_prev.get() : sq.mtp_chain_prev.get());
 
     // The layer, as a trunk full-attention layer at position p. Step 0's KV row and block keys are the ones the next
     // forward's catch-up writes again from the same inputs; a chain step's, until the position runs, its guess.
     hc_mix(l.hc_attn, true);
-    uint8_t *kc = k_cache_mtp_.get(), *vc = v_cache_mtp_.get();
+    uint8_t *kc = sq.k_cache_mtp.get(), *vc = sq.v_cache_mtp.get();
     kernels::linear_qw(u_.get(), l.qkv, proj_.get(), T, act, act, stream_);
     // q, k, v and (past the dense limit) the indexer queries in one launch, as in the trunk's layers.
     const bool qsa_layer = p + T > D.dense_key_limit();
@@ -2250,22 +2894,36 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
                                m_.rope_scale(), mk_jobs_);
     kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, p,
                             p % kernels::kQsaBlock ? tail_in : nullptr, tail_out, D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
-                            D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
+                            D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
     const kernels::AttentionShape as{T, p, D.hq, D.hkv, hd, D.astride, 2 * hd};
     const float scale = 1.0f / std::sqrt((float)hd);
+    // The head's own layer, as a trunk full-attention layer: the same dispatch, including the matrix-unit
+    // attention from one row (kWmmaAttnMinTokens; the trunk's switch, kernels/attention.hpp). The head's K / V
+    // stay BF16 (the 8-bit head cache is the kv-cache-8bit follow-up). Summation order changes -> draft ids and
+    // acceptance move - measured as such (docs "MTP head attention on the matrix units").
+    const bool wmma_attn = prefill_math_ == PrefillMath::WmmaBf16 && act == Act::BF16 && T >= kWmmaAttnMinTokens;
     if (!qsa_layer) {
-        kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
-                           attn_ws_bytes_, act, stream_);
+        if (wmma_attn)
+            kernels::attention_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(),
+                                    attn_ws_.get(), attn_ws_bytes_, act, stream_, precision_.attention);
+        else
+            kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
+                               attn_ws_bytes_, act, stream_);
     } else {
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
         void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
-        kernels::qsa_scores(iq, D.astride, D.idx_d, T, p, D.idx_h, D.idx_d, block_keys_mtp_.get(), cap_blocks_,
+        kernels::qsa_scores(iq, D.astride, D.idx_d, T, p, D.idx_h, D.idx_d, sq.block_keys_mtp.get(), cap_blocks_,
                             qsa_scores_.get(), cap_blocks_, act, stream_);
         kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, p, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
                           qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-        kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(), qsa_nsel_.get(),
-                                    qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_, attn_err_.get(), act,
-                                    stream_);
+        if (wmma_attn)
+            kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
+                                              qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                                              attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+        else
+            kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(),
+                                        qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_,
+                                        attn_err_.get(), act, stream_);
     }
     kernels::linear_qw(core_.get(), l.o_proj, y_.get(), T, act, act, stream_);
     kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);

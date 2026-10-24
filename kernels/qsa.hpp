@@ -25,6 +25,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
+#include <utility>
 
 namespace strix::kernels {
 
@@ -38,6 +40,10 @@ constexpr int64_t kQsaBlock = 4;  // tokens per indexer block (indexer_compress_
 // cos_sin_scale: YaRN's attention factor (kernels/rope.hpp), 1 = plain RoPE. pos3 (kernels/rope.hpp MropePos):
 // interleaved-mRoPE section triples for the sequence positions the block keys rope at (each block's first key),
 // base = 4*(pos0/4), null = scalar (text-only, today's values bit for bit).
+// The byte ranges {offset, bytes} of a block-key cache ([D / 8][cap_blocks][8] elements of es bytes: element (b, d) at
+// ((d / 8) * cap_blocks + b) * 8 + d % 8) that blocks [0, nb) occupy - one range per 8-dimension chunk - for paged
+// storage that maps only what is used.
+std::vector<std::pair<size_t, size_t>> qsa_block_keys_used_ranges(int64_t cap_blocks, int64_t D, size_t es, int64_t nb);
 void qsa_block_keys(const void *raw, int64_t raw_ts, int64_t T, int64_t pos0, const void *tail_in, void *tail_out,
                     int64_t D, const float *k_norm, float eps, const float *inv_freq, int64_t rot_dim,
                     void *block_keys, int64_t cap_blocks, Act act, hipStream_t stream, float cos_sin_scale = 1.0f,

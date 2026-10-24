@@ -202,6 +202,30 @@ struct WmmaWCodes {
             }
         }
     }
+    // fetch() with staged row r taken from global row row_of(r) (< 0: a zero row) - weight rows that aren't one
+    // contiguous range (the experts' stacked matrices, SwiGLU's gate and up halves). K, k0: as fetch() with k_base 0.
+    template <typename RowFn>
+    __device__ void fetch_mapped(const uint8_t *codes, const uint16_t *scale, const uint16_t *minv, RowFn row_of,
+                                 int64_t K, int64_t k0) {
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
+            const int64_t k = k0 + (l % kLoadsPerRow) * kCodesPerLoad, row = row_of(r);
+            q[i] = row >= 0 ? *reinterpret_cast<const uint4 *>(codes + row * (K * BITS / 8) + k * BITS / 8)
+                            : make_uint4(0, 0, 0, 0);
+        }
+        win = opens_window(k0);
+        if (win) {
+            const int64_t groups = K / G, g0 = k0 / G;
+#pragma unroll
+            for (int i = 0; i < kWinLoads; ++i) {
+                const int e = (int)threadIdx.x + i * kWmmaThreads, r = e / kWin;
+                const int64_t g = g0 + e % kWin, row = row_of(r);
+                const bool ok = row >= 0 && g < groups;
+                s[i] = ok ? scale[row * groups + g] : (uint16_t)0, m[i] = ok ? minv[row * groups + g] : (uint16_t)0;
+            }
+        }
+    }
     __device__ void stage(uint16_t *lds, uint16_t *sw, uint16_t *mw) const {
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {

@@ -53,8 +53,8 @@ void StructuredOutput::row_mask(const Cursor &at, uint32_t *out) const {
         for (int32_t id : end_ids_) out[id >> 5] &= ~(1u << (id & 31));
         return;
     }
-    const std::vector<uint32_t> &allowed = masker_.mask(*automaton_, at.state);
-    std::memcpy(out, allowed.data(), (size_t)words * 4);
+    const std::shared_ptr<const std::vector<uint32_t>> allowed = masker_.mask(*automaton_, at.state);
+    std::memcpy(out, allowed->data(), (size_t)words * 4);
     if (automaton_->accepting(at.state))
         for (int32_t id : end_ids_) out[id >> 5] |= 1u << (id & 31);
 }

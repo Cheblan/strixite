@@ -13,6 +13,8 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kRowsPerPass = 8;  // x rows accumulated together per W pass
+// M > 8 (several slots' batched verifies below kWmmaMinTokens): 16 rows a pass, so 9-16 rows read W once.
+constexpr int kWideRowsPerPass = 16;
 constexpr int kChunk = 32;       // codes per lane per load (16 bytes)
 constexpr int64_t kMaxN = 0x7fffffff;
 constexpr int64_t kMaxM = 65535ll * kRowsPerPass;
@@ -51,6 +53,23 @@ __device__ inline void load_x32(const uint16_t *x, int64_t off, float (&v)[kChun
     }
 }
 
+// BF16 activations: the products go through v_dot2_f32_bf16, as linear_q8_kernel (kernels/linear_q8.hip): the codes
+// (0..15, exact in BF16) are converted to packed BF16 pairs once per chunk and shared by every row, x stays in its
+// packed BF16 pairs, and the group sum of x is a second dot2 against (1, 1). At M = 8 the scalar form ran 2.3x its
+// M = 1 time, against 1.47x for the Q8 kernel with dot2 - instruction-bound on the per-row x conversion and FMAs.
+// Products are exact in FP32; only the summation order differs from the scalar form.
+typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
+__device__ inline float dot2(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2, a), __builtin_bit_cast(bf16x2, b), c, false);
+}
+// Codes 2p and 2p+1 of a 32-code chunk (nibbles of `words`, low nibble first) as a packed BF16 pair.
+__device__ inline uint32_t code_pair(const uint32_t (&words)[4], int p) {
+    const uint32_t b = (words[p / 4] >> (8 * (p % 4))) & 0xFFu;
+    const float lo = (float)(b & 0xFu), hi = (float)(b >> 4);
+    return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
+}
+constexpr uint32_t kOnePair = 0x3F803F80u;  // BF16 (1, 1)
+
 // One output row per KS waves of a block: wave w handles row w / KS and the
 // K chunks with index = w % KS (mod KS), interleaved so the KS waves of a row
 // read adjacent 512-byte runs. Partial sums meet in LDS.
@@ -80,6 +99,30 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
             const float mn = bf16_bits_to_f32(mrow[k / G]);
+            if constexpr (std::is_same_v<TX, uint16_t>) {
+                uint32_t cp[kChunk / 2];
+#pragma unroll
+                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    if (r < rows) {
+                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                        float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                        for (int i = 0; i < kChunk / 8; ++i) {
+                            const uint4 u = xp[i];
+                            const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw[j], cp[4 * i + j], dot);
+                                xsum = dot2(xw[j], kOnePair, xsum);
+                            }
+                        }
+                        acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
+                    }
+                }
+                continue;
+            }
 #pragma unroll
             for (int r = 0; r < MR; ++r) {
                 if (r < rows) {
@@ -313,7 +356,8 @@ void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t st
     if (M == 1) launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
     else if (M == 2) launch_mr<TX, TY, 2>(x, w, y, M, split_k(w.K), stream);
     else if (M <= 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
-    else launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    else launch_mr<TX, TY, kWideRowsPerPass>(x, w, y, M, split_k(w.K), stream);
 }
 
 template <typename T, int HB>
@@ -328,6 +372,9 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
     const int waves = kThreads / device_warp_size();
     STRIX_CHECK(waves % KS == 0, "linear_q4 experts: split-K factor ", KS, " must divide the ", waves, " waves");
     const int64_t rows_per_block = waves / KS;
+    // combine walks its A*K reduction as one 32-bit chunk index (the kernel's kc).
+    STRIX_CHECK(!combine || A * (w.K / kChunk) <= (int64_t)UINT32_MAX, "linear_q4 experts combine: A = ", A,
+                " x K / ", kChunk, " = ", A * (w.K / kChunk), " chunks, expected < 2^32 (a 32-bit index)");
     const int64_t out_rows = swiglu ? N / 2 : N;  // swiglu: a wave per (gate, up) row pair
     const unsigned bx = (unsigned)((out_rows + rows_per_block - 1) / rows_per_block);
     dim3 block(kThreads);

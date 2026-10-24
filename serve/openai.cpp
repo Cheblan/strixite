@@ -104,7 +104,7 @@ json::Value merge_leading_system(const json::Value &messages) {
 
 // The fields /v1/chat/completions and /v1/completions share: stream, return_progress, max_tokens, sampling, stop, and
 // the known fields that are refused rather than ignored. R has stream, return_progress, max_tokens, sampling, seeded,
-// stop.
+// sampling_asked, stop.
 template <typename R> void parse_common(const json::Value &body, R &r, bool legacy_completions) {
     if (const json::Value *v = field(body, "stream")) r.stream = get_bool(*v, "stream");
     if (const json::Value *v = field(body, "return_progress")) r.return_progress = get_bool(*v, "return_progress");
@@ -116,17 +116,21 @@ template <typename R> void parse_common(const json::Value &body, R &r, bool lega
     }
     if (const json::Value *v = field(body, "temperature")) {
         r.sampling.temperature = get_number(*v, "temperature");
+        r.sampling_asked.push_back("temperature");
         if (!(r.sampling.temperature >= 0 && r.sampling.temperature <= 2)) bad("temperature", "'temperature' must be in [0, 2]");
     }
     if (const json::Value *v = field(body, "top_p")) {
         r.sampling.top_p = get_number(*v, "top_p");
+        r.sampling_asked.push_back("top_p");
         if (!(r.sampling.top_p > 0 && r.sampling.top_p <= 1)) bad("top_p", "'top_p' must be in (0, 1]");
     }
     if (const json::Value *v = field(body, "top_k")) {
         r.sampling.top_k = get_int(*v, "top_k");
+        r.sampling_asked.push_back("top_k");
         if (r.sampling.top_k < 0) bad("top_k", "'top_k' must be >= 0 (0 = off)");
     }
-    if (const json::Value *v = field(body, "seed")) r.sampling.seed = (uint64_t)get_int(*v, "seed"), r.seeded = true;
+    if (const json::Value *v = field(body, "seed"))
+        r.sampling.seed = (uint64_t)get_int(*v, "seed"), r.seeded = true, r.sampling_asked.push_back("seed");
     if (const json::Value *v = field(body, "stop")) {
         if (v->is_string()) r.stop.push_back(v->as_string("stop"));
         else if (v->is_array())

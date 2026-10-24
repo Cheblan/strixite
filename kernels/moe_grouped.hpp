@@ -31,10 +31,16 @@ namespace strix::kernels {
 // lower-precision path, behind a switch).
 // WmmaF16 (Q4 experts): x as F16 (exact from BF16 in range), the weights dequantized
 // to F16 in registers (code * scale + min, one F16 rounding), FP32 accumulation over the whole K.
-enum class MoeMath { F32, WmmaBf16, WmmaF16 };
+// WmmaF16 picks one of three kernels with the same math (bit-identical outputs) by the call's token count M:
+// WmmaF16Narrow - 64-slot tiles, each wave decoding its own 16 weight rows in registers -, WmmaF16Wide - the dense
+// GEMMs' tile structure, 128-slot x 128-row blocks with each weight tile dequantized once into LDS and read by the
+// waves sharing it - or WmmaF16Wide256 - 128-slot x 256-row blocks, 4 x 4 output tiles a wave -, the wide ones faster
+// once the experts' tiles are full (moe_grouped.hip, kWideMinM*). Narrow / Wide / Wide256 force one (tests, benches).
+enum class MoeMath { F32, WmmaBf16, WmmaF16, WmmaF16Narrow, WmmaF16Wide, WmmaF16Wide256 };
 
 constexpr int kMoeTileRows = 16;       // slots per tile (one expert's rows; a weight pass serves them all)
 constexpr int kMoeWmmaTileRows = 64;   // the WMMA kernels' tiles: up to 4 16-row WMMA tiles per weight pass
+constexpr int kMoeWmmaWideRows = 128;  // MoeMath::WmmaF16Wide's tiles: up to 8 16-row WMMA tiles per weight pass
 constexpr int64_t kMoeMaxExperts = 1023;  // the grouping runs in one 1024-thread block: E + 1 buckets
 constexpr int64_t kMoeMaxSlots = 1 << 20;
 
@@ -55,17 +61,34 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
 
 // The gather with SwiGLU fused (MoeMath::WmmaF16, Q4 only): h [M*A, N/2] = silu(gate) * up of the stacked gate_up
 // rows (each expert's N rows: N/2 gate rows, then N/2 up rows), from the FP32 accumulators, rounded once to the
-// activation dtype - in place of the gather into gu [M*A, N] and kernels/swiglu. h must not overlap x.
+// activation dtype - in place of the gather into gu [M*A, N] and kernels/swiglu. h must not overlap x. h_f16 (BF16
+// activations): h stored as F16 bits of its BF16 rounding (what the F16 down kernels stage from BF16 h, round toward
+// zero), for linear_q4_experts_combine_grouped with h_f16 - the down's x conversion done once, bit-identical.
 void linear_q4_experts_gather_grouped_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const void *ws,
                                              size_t ws_bytes, int64_t M, int64_t A, void *h, Act act, MoeMath math,
-                                             hipStream_t stream);
+                                             hipStream_t stream, bool h_f16 = false);
+
+// The prefill MoE sublayer's last step folded into the combine's reduce: y[m, :] += sigmoid(gate_logit[m * gate_ld]) *
+// s[m, :] on the stored y, as kernels/moe_router.hpp moe_shared_add computes it - bit-identical to the combine then
+// moe_shared_add, without y's extra write and read. A non-finite gate logit sets err as moe_shared_add does (err[0] = 1,
+// err[1] = the token, err[2] = gate_index) and makes that token's row NaN.
+struct MoeSharedAdd {
+    const void *s = nullptr;            // the shared expert's output [M, N], the activation dtype, not overlapping y
+    const float *gate_logit = nullptr;  // token m's gate logit at gate_logit[m * gate_ld]
+    int64_t gate_ld = 0;
+    uint32_t gate_index = 0;
+    uint32_t *err = nullptr;
+};
+
 
 // Combine over grouped routes. partial: M*A*N FP32 scratch (device) - MoeMath::WmmaF16 stores its partials as BF16
 // in the first half of it (moe_grouped.hip, put_partial). ids: the same ids (the reduction checks
-// them per token); coef [M, A] F32. h 16-byte aligned; y must not overlap h or partial.
+// them per token); coef [M, A] F32. h 16-byte aligned; y must not overlap h or partial. h_f16 (BF16 activations, a
+// MoeMath::WmmaF16 kind): h holds F16 bits (linear_q4_experts_gather_grouped_swiglu's h_f16).
 void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,
-                                       int64_t A, void *y, Act act, MoeMath math, hipStream_t stream);
+                                       int64_t A, void *y, Act act, MoeMath math, hipStream_t stream,
+                                       const MoeSharedAdd *shared = nullptr, bool h_f16 = false);
 
 // The same with Q5 experts (formats/q5.hpp rows, K % 128 == 0) - one kernel template with the Q4 ones.
 void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int64_t E, const void *ws,
@@ -73,6 +96,7 @@ void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int6
                                       hipStream_t stream);
 void linear_q5_experts_combine_grouped(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,
-                                       int64_t A, void *y, Act act, MoeMath math, hipStream_t stream);
+                                       int64_t A, void *y, Act act, MoeMath math, hipStream_t stream,
+                                       const MoeSharedAdd *shared = nullptr);
 
 }  // namespace strix::kernels

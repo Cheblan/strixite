@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -141,7 +142,10 @@ private:
 // the transitions cached that walk is a hash lookup per byte instead of a parse-set copy, and states repeat a lot
 // (inside a JSON string every character leads back to the same state). One automaton per compiled grammar, shared
 // by every generation that uses the grammar; states are never forgotten (ids stay valid), bounded by kMaxStates.
-// Not thread-safe (the engine runs one generation at a time).
+// Thread-safe: with the multi-slot engine several workers drive the same
+// cached automaton - every read and insert of its state / transition / mask caches runs under its own mutex
+// (one uncontended lock per byte, against a GPU step per token). Transition computation (a parse-set copy and
+// its advance) runs outside the lock; concurrent duplicates intern to the same state.
 class GrammarAutomaton {
 public:
     // More states than this throws: a grammar whose matcher reaches that many distinct parse sets is too large to
@@ -160,30 +164,33 @@ public:
     int32_t next(int32_t state, std::string_view bytes);
     bool accepting(int32_t state) const;
     bool can_continue(int32_t state) const;
-    size_t state_count() const { return states_.size(); }
-    size_t transition_count() const { return transitions_.size(); }
+    size_t state_count() const;
+    size_t transition_count() const;
     const Grammar &grammar() const { return *grammar_; }
 
     // Token masks cached per state (serve/token_mask fills them; `owner` identifies the vocabulary they were made
-    // for - one automaton serves one vocabulary). nullptr if not cached yet.
-    const std::vector<uint32_t> *cached_mask(int32_t state, const void *owner) const;
-    // Stores a mask (dropping every cached mask first once kMaxCachedMasks are held) and returns the stored copy.
-    // Pointers / references to cached masks stay valid until the next store_mask.
-    const std::vector<uint32_t> &store_mask(int32_t state, const void *owner, std::vector<uint32_t> mask);
+    // for - one automaton serves one vocabulary). null if not cached yet. A cached mask is held by shared_ptr:
+    // a handed-out reference stays valid as long as the caller keeps it, whatever later store_mask / eviction
+    // does to the cache (the pre-item-2 "valid until the next store_mask" contract could not hold across slots).
+    std::shared_ptr<const std::vector<uint32_t>> cached_mask(int32_t state, const void *owner) const;
+    // Stores a mask (dropping every cached mask once kMaxCachedMasks are held) and returns the stored copy.
+    std::shared_ptr<const std::vector<uint32_t>> store_mask(int32_t state, const void *owner,
+                                                            std::vector<uint32_t> mask);
     static constexpr size_t kMaxCachedMasks = 2048;  // 31 KB each at the target's 248,320 rows: <= 62 MiB
-    size_t cached_mask_count() const { return masks_.size(); }
+    size_t cached_mask_count() const;
 
 private:
     int32_t intern(GrammarMatcher matcher);
-    void check_state(int32_t state, const char *what) const;
+    void check_state_locked(int32_t state, const char *what) const;  // mu_ held
 
     std::shared_ptr<const Grammar> grammar_;
     bool colliding_hash_ = false;
+    mutable std::mutex mu_;  // guards everything below (thread-safety comment at the class)
     std::vector<GrammarMatcher> states_;
     std::vector<uint8_t> accepting_, can_continue_;
     std::unordered_map<uint64_t, std::vector<int32_t>> by_hash_;  // parse-set hash -> states with that hash
     std::unordered_map<uint64_t, int32_t> transitions_;            // state << 8 | byte -> next state (or kDead)
-    std::unordered_map<int32_t, std::vector<uint32_t>> masks_;
+    std::unordered_map<int32_t, std::shared_ptr<const std::vector<uint32_t>>> masks_;
     const void *mask_owner_ = nullptr;
 };
 

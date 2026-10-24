@@ -37,6 +37,7 @@ struct ChatRequest {
     std::optional<int64_t> max_tokens;
     SamplingParams sampling;
     bool seeded = false;
+    std::vector<std::string> sampling_asked;  // the sampling fields the request set, in order (logged; the rest are defaults)
     std::vector<std::string> stop;
     ChatTemplateOptions template_options;
     std::optional<int64_t> thinking_budget;  // explicit, from any of the four budget fields
@@ -60,6 +61,7 @@ struct CompletionRequest {
     std::optional<int64_t> max_tokens;
     SamplingParams sampling;
     bool seeded = false;
+    std::vector<std::string> sampling_asked;  // the sampling fields the request set, in order (logged; the rest are defaults)
     std::vector<std::string> stop;
 };
 CompletionRequest parse_completion_request(const json::Value &body, const SamplingParams &defaults);

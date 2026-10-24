@@ -12,6 +12,8 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kRowsPerPass = 8;  // x rows accumulated together per W pass
+// M > 8 (several slots' batched verifies below kWmmaMinTokens): 16 rows a pass, so 9-16 rows read W once.
+constexpr int kWideRowsPerPass = 16;
 constexpr int kChunk = 16;       // codes per lane per load (16 bytes)
 constexpr int64_t kMaxN = 0x7fffffff;
 constexpr int64_t kMaxM = 65535ll * kRowsPerPass;
@@ -185,7 +187,8 @@ void launch(const TX *x, const Q8DeviceView &w, TY *y, int64_t M, hipStream_t st
     if (M == 1) launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
     else if (M == 2) launch_mr<TX, TY, 2>(x, w, y, M, split_k(w.K), stream);
     else if (M <= 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
-    else launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    else launch_mr<TX, TY, kWideRowsPerPass>(x, w, y, M, split_k(w.K), stream);
 }
 
 }  // namespace

@@ -29,6 +29,7 @@
 #include "kernels/norm.hpp"  // Act
 #include "runtime/device_buffer.hpp"
 #include "runtime/ngram_rows.hpp"
+#include "runtime/paged_buffer.hpp"
 #include "runtime/ngram_table.hpp"
 #include "runtime/ple_hash.hpp"
 #include "runtime/q4_device.hpp"
@@ -203,7 +204,8 @@ int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab);
 // A = 11 with the shared expert stacked as #512, 10 when it's separate; past the dense key limit "L<i>.qsa_sel"
 // [T, budget / 4] I32 (the kept blocks, the first "L<i>.qsa_nsel" [T, 1] of each row valid).
 // dev: rows x cols (row stride cols) on the device, valid during the call (the stream is synchronized first).
-enum class ProbeType { F32, BF16, I32 };
+// F16: "L<i>.experts_h" when prefill's grouped experts keep h as F16 bits (BF16 activations, Q4 experts).
+enum class ProbeType { F32, BF16, I32, F16 };
 using Qwen4ExpProbe =
     std::function<void(const std::string &name, const void *dev, int64_t rows, int64_t cols, ProbeType type)>;
 
@@ -262,6 +264,7 @@ static_assert(std::is_standard_layout_v<Qwen4ExpStateHeader> && std::is_triviall
 // interleaved; restore() refuses a saved position whose last rows were image rows (with today's serve there are
 // no interleaved sessions at all - set_positions has no caller until Phase B - so no served snapshot carries
 // triples).
+struct Qwen4ExpSeqState;  // the per-conversation state (below); a snapshot belongs to one
 class Qwen4ExpSnapshot {
 public:
     int64_t pos() const { return pos_; }  // -1 until saved
@@ -285,6 +288,8 @@ private:
     std::array<int64_t, 3> first_cont_{0, 0, 0};  // continuation sections of row pos_ (computed by save())
     int64_t ntriples_ = 0;
     std::vector<int64_t> triples_;  // ntriples_ * 3 host int64 (empty until a save with an interleaved prefix)
+    friend class Qwen4ExpSession;
+    friend struct Qwen4ExpSeqState;
 };
 
 // One image for a forward (the vision build's forward extension): the tower's input rows, FP32 on the
@@ -301,18 +306,124 @@ struct ImageInput {
 
 // The full-attention layers' K/V cache: in the activation dtype, or 8 bits (kernels/kv8.hpp). Q8 keeps ~56% of the
 // bytes; the rows of the newest incomplete 32-token group stay in a small tail in the activation dtype.
+// KvFormat; the attention layers' K/V cache format. The MTP head's own K/V stays in the activation dtype either way.
 enum class KvFormat { Act, Q8 };
 const char *kv_format_name(KvFormat f);  // "bf16" / "q8" (Act is named by the config as bf16)
 KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8; anything else throws
 
+// ---------------------------------------------------------------------------
+// The state of one conversation (feat/multi-sequence): everything a Qwen4ExpSession
+// carried across forwards for one sequence - the buffers one serving slot owns. A session holds one SeqState per
+// slot and its forward / verify API addresses them by run; with one slot this is exactly the old session state.
+// Qwen4ExpSnapshot already saved and restored exactly this set (plus the K/V below the position, which stays in
+// place), so it is now a member: a snapshot belongs to one state and is valid only against it. Everything else
+// in Qwen4ExpSession is per-forward workspace, sized by the largest forward - shared by the slots.
+// ---------------------------------------------------------------------------
+struct Qwen4ExpSeqState {
+    // Allocates the buffers for one position space of `capacity` positions (the MTP head's own K/V cache and
+    // indexer keys exist with `mtp`; the K/V layout is `kv`); everything starts at position 0. `chain_rows`:
+    // the row count of the session's forward workspaces - the draft chain swaps its stream buffer against the
+    // shared mtp_x_, so they must be the same size.
+    Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp, KvFormat kv);
+    // The paged arrays' mapping unit. gfx1151: a 2 MiB page is created in ~45 us and mapped pages read at hipMalloc's
+    // speed; slack per array is under one page.
+    static constexpr size_t kPageBytes = (size_t)2 << 20;
+
+    int64_t pos = 0;
+    // Where the last import_state ended (-1: none since reset): a delta import needs its base's import just
+    // before - and pos still there (any forward moves it; restores need snapshots, which an import invalidates).
+    int64_t imported_at = -1;
+    // Per-layer state (empty buffers for the other kind). The capacity-sized arrays (K / V caches, block keys, the
+    // 8-bit K/V below, the MTP head's) are paged: their address range covers the capacity, their pages are mapped as
+    // the conversation fills them (Qwen4ExpSession::ensure_rows).
+    std::vector<PagedDeviceBuffer> k_cache, v_cache, block_keys;
+    std::vector<DeviceBuffer<uint8_t>> tail[2], conv_state;
+    std::vector<DeviceBuffer<float>> rec_state;
+    int tail_cur = 0;  // the current indexer tails - and with KvFormat::Q8 the current K/V tails
+    // KvFormat::Q8 (k_cache / v_cache empty then): per attention layer the 8-bit storage (kernels/kv8.hpp, for the
+    // capacity rounded up to whole groups) and the K/V tails [2] (kv8_tail[tail_cur] current, double-buffered).
+    std::vector<PagedDeviceBuffer> kv8_store;
+    std::vector<DeviceBuffer<uint8_t>> kv8_tail[2];
+    DeviceBuffer<uint8_t> ple_state;
+    PleHistory ple_hist;
+    // Rewinds for can_restore: epoch e started when the state rewound to rewind_to[e] (reset() = 0).
+    std::vector<int64_t> rewind_to{0};
+    // The MTP head's state (with mtp): the layer's K / V cache, block keys and indexer tails
+    // (tail_mtp[mtp_tail_cur] current); mtp_prev [H*d] the trunk's streams after position pos - 1 (zeros at 0),
+    // row 0's input for the next MTP rows; and the draft chain's own buffers (step - 1's output streams -
+    // swapped against the session's mtp_x_ mid-chain, so only one state may draft at a time - the session
+    // enforces it - and the chain's own indexer tails).
+    PagedDeviceBuffer k_cache_mtp, v_cache_mtp, block_keys_mtp;
+    DeviceBuffer<uint8_t> tail_mtp[2], mtp_prev;
+    DeviceBuffer<uint8_t> mtp_chain_prev, mtp_chain_tail[2];
+    int mtp_tail_cur = 0;
+    int64_t mtp_chain_step = -1, mtp_chain_pos = -1;
+    // The mtp_x_ write stamp at the chain's last step (Qwen4ExpSession::mtp_x_version_, bumped by every
+    // mtp_input): a chain step's prev is the step before's mtp_x_, so if the stamp moved, another draft or
+    // a forward interleaved and the chain must not continue (run_mtp refuses).
+    uint64_t mtp_chain_xver = 0;
+    // forward_verify's machinery, per state (one verify in flight per state): the spare GDN states it writes
+    // (gdn_to_spare during it), what drop_verify puts back, whether a keep / drop is owed, and the verify's
+    // saved rows / bookkeeping for keep_verify_prefix.
+    std::vector<DeviceBuffer<uint8_t>> conv_spare;
+    std::vector<DeviceBuffer<float>> rec_spare;
+    DeviceBuffer<uint8_t> ple_state_kept, mtp_prev_kept;
+    bool gdn_to_spare = false, verify_pending = false;
+    int64_t verify_pos = 0;
+    int verify_tail_cur = 0, verify_mtp_tail_cur = 0;
+    PleHistory verify_hist;
+    // keep_verify_prefix's inputs, saved by the verify forward per layer (kMaxLogits rows each): GDN layers
+    // their in_proj rows [T, gstride], attention layers their raw indexer key rows [T, idx_d] (with
+    // KvFormat::Q8 followed by their new K | V rows [T, 2 hkv hd]); and the verify's ids / size.
+    std::vector<DeviceBuffer<uint8_t>> verify_in;
+    std::vector<int32_t> verify_ids;
+    // The interleaved mRoPE position state (vision Phase A), per conversation: rope_delta /
+    // history_ever_interleaved are the scalars; pos3_host holds the (t,h,w) triples of every row from the first
+    // interleaved forward on (rows before it are uniform at rope_delta 0 - never stored), reaching to pos.
+    // pending3 is set_positions' payload for this state's next forward. Never touched while no positions are
+    // set - the text path's cost is two int64 adds.
+    int64_t rope_delta = 0;
+    bool history_ever_interleaved = false;  // the current prefix contains interleaved (image) rows
+    int64_t pos3_start = 0;
+    std::vector<int64_t> pos3_host;
+    std::vector<int64_t> pending3;
+    // forward_verify's mRoPE bookkeeping: the history / delta / image flag as they were before it (drop_verify
+    // restores them; keep keeps, keep_verify_prefix truncates the forward-appended rows in place).
+    std::vector<int64_t> verify_hist_before;
+    int64_t verify_hist_start_before = 0, verify_delta_before = 0;
+    bool verify_ever_before = false;
+    // A batched forward's verify rows: how many rows of this state forward_batch_verify took part in (0: it
+    // is not in the pending verify's batch), and where its rows sit in the batch's shared row buffers: the
+    // row base of the trunk/MTP activations (verify_row_base) and the start of its PLE history window
+    // (verify_ple_wbase, the windows laid end to end). keep_verify_prefix_seq's replay reads them back.
+    int64_t verify_rows = 0, verify_row_base = 0, verify_ple_wbase = 0;
+    // keep_verify(seq, rows, carry)'s carry: the token owed to the run's next row 0 (the MTP rejection's
+    // corrected sample; 0: none) - forward_batch / forward_batch_verify check a run of this state starts
+    // with it and clear it. Nothing advances on the state for it (see the keep_verify note in the session).
+    int32_t verify_carry = 0;
+    // A batched forward's PLE n-gram rows: this state's rows gather into its own pinned staging (the session's
+    // two ping-pong buffers and the lookahead machinery are the single-run path); the gather's future is joined
+    // at the PLE layer of the forward that queued it.
+    PinnedHostBuffer ple_stage;
+    std::future<void> ple_fut;
+
+    int64_t pos3Hend() const { return pos3_start + (int64_t)pos3_host.size() / 3; }  // == pos when non-empty
+
+    // The MTP head's state exists with mtp (Qwen4ExpSession::forward's MTP catch-up and the draft check this).
+    bool mtp = false;
+
+    friend class Qwen4ExpSession;
+};
+
 class Qwen4ExpSession {
 public:
-    // mtp: keep the MTP draft head's state (its KV cache, filled for every position a forward runs) so
-    // forward_mtp can draft; needs a model with the head. Off, forward_mtp throws and forwards skip that work.
-    // kv: the full-attention layers' K/V cache format (KvFormat; the MTP head's own K/V stays in the activation
-    // dtype either way).
+    // One serving slot = one Qwen4ExpSeqState; n_slots >= 1 (today's server: n_slots 1, the forward API is
+    // unchanged; the multi-sequence build addresses slots by run). mtp: keep the MTP draft head's state (its KV
+    // cache, filled for every position a forward runs) so forward_mtp can draft; needs a model with the head.
+    // Off, forward_mtp throws and forwards skip that work. kv: the attention layers' K/V cache format.
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act);
+                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act,
+                    int64_t n_slots = 1);
     PrefillMath prefill_math() const { return prefill_math_; }
     KvFormat kv_format() const { return kv_format_; }
     // The kernel-step precision choices for every forward from now on (default: all exact).
@@ -322,8 +433,24 @@ public:
     Qwen4ExpSession(const Qwen4ExpSession &) = delete;
     Qwen4ExpSession &operator=(const Qwen4ExpSession &) = delete;
 
-    void reset();
-    int64_t pos() const { return pos_; }
+    int64_t n_slots() const { return (int64_t)seqs_.size(); }
+
+    void reset();  // every slot, and clears a failed call's mark
+    // One slot back to position 0, the others untouched; refused after a failed call (reset() all) or while its
+    // verify is pending.
+    void reset(int seq);
+    // Paged slot K/V: before a slot's arrays map more pages, f(bytes) is asked for
+    // the RAM (the server's prompt cache makes room - K/V first) and throws to refuse; unset, growth is refused only
+    // when it would leave MemAvailable below the slot floor. A refusal fails the call before any page is mapped.
+    void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
+    // The bytes one slot's paged arrays map at the full capacity (the startup memory plan's deep-slot term).
+    uint64_t kv_full_bytes() const;
+    // The bytes slot seq's paged arrays map now: the deepest position any of its conversations reached (pages are
+    // never given back while the session lives - reset and import keep them).
+    uint64_t kv_mapped_bytes(int seq) const;
+    bool broken() const { return broken_; }  // an earlier call failed midway: only reset() clears it
+    int64_t pos() const { return seqs_[0]->pos; }
+    int64_t pos(int seq) const;  // slot seq's position (pos() is seq 0's)
     int64_t capacity() const { return capacity_; }
     int64_t max_tokens() const { return max_tokens_; }
 
@@ -341,14 +468,20 @@ public:
     // be a position the model can represent. set_positions before forward / forward_verify consumes it; before
     // any of the other calls that touch position (forward_mtp, save, import_state) it is refused.
     void set_positions(std::vector<int64_t> pos3);
-    int64_t rope_delta() const { return rope_delta_; }  // rows after the last image: rope angle at seq + delta
+    int64_t rope_delta() const { return st().rope_delta; }  // rows after the last image: rope angle at seq + delta
     // The rope angle position of sequence position seq on the scalar path (seq + rope_delta). Sequence-index
     // uses (cache rows, QSA block counts, dense-limit checks) stay seq - only rope angles use this.
-    int64_t rope_pos(int64_t seq) const { return seq + rope_delta_; }
+    int64_t rope_pos(int64_t seq) const { return seq + st().rope_delta; }
 
     // Snapshots (Qwen4ExpSnapshot): make one (allocates), save the state at pos() into it, and later restore it -
     // which needs every rewind since the save (reset() or a restore()) to have gone no lower than its position.
     Qwen4ExpSnapshot make_snapshot() const;
+    // The per-slot forms (feat/multi-sequence): a snapshot belongs to one state - made from it, saved into
+    // it, restored onto it, and its epoch is that state's rewind history. The calls above are seq 0.
+    Qwen4ExpSnapshot make_snapshot(int seq) const;
+    void save(int seq, Qwen4ExpSnapshot &s);
+    bool can_restore(int seq, const Qwen4ExpSnapshot &s) const;
+    void restore(int seq, const Qwen4ExpSnapshot &s);
     void save(Qwen4ExpSnapshot &s);
     bool can_restore(const Qwen4ExpSnapshot &s) const;
     // throws unless can_restore(s); pos() = s.pos() after. An interleaved snapshot whose saved rows end inside an
@@ -374,6 +507,10 @@ public:
     size_t state_bytes(int64_t n, int64_t from = 0) const;
     void export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from = 0);
     void import_state(const uint8_t *in, size_t bytes, int64_t n, int64_t from = 0);
+    // The per-slot forms (feat/multi-sequence): the state of slot seq (its KV, tails, GDN, PLE, MTP); the calls above
+    // are seq 0. The snapshot passed to export_state must be one saved from that slot.
+    void export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from = 0);
+    void import_state(int seq, const uint8_t *in, size_t bytes, int64_t n, int64_t from = 0);
 
     // Runs ids at positions pos()..pos()+T-1, advances pos(), returns the last n_logits tokens' logits
     // [n_logits, vocab] FP32. If it throws, the session refuses further calls until reset().
@@ -391,6 +528,13 @@ public:
     // (ms): T = 8 65.9 FP32 vs 76.8 WMMA, 10 78.8 vs 80.2, 12 84.7 vs 82.8, 16 101.0 vs 88.6, 24
     // 131.3 vs 97.4 - so 12.
     static constexpr int64_t kWmmaMinTokens = 12;
+    // With PrefillMath::WmmaBf16 and BF16 activations, the trunk's full-attention layers run on the matrix units
+    // (kernels/attention.hpp attention_wmma: a token's query heads as one 16-row tile) from this many rows - every
+    // forward, decode and MTP verify included. Per row the vector kernel's 12 waves each re-read the K / V tile from
+    // LDS and the kernel waits on LDS; the matrix units read it once a tile. Per call (2048 gathered keys, Hq 24):
+    // vector vs WMMA, BF16 K/V, T = 1 46.8 vs 32.7 us, 4 111.0 vs 29.6, 8 201.2 vs 48.0; 8-bit K/V 46.0 vs 26.6,
+    // 114.4 vs 53.7, 214.7 vs 101.6. The MTP head's own layer stays on the vector kernel.
+    static constexpr int64_t kWmmaAttnMinTokens = 1;
     // WMMA prefill attention over the 8-bit cache stages the dequantized rows (dense and QSA-gathered) for forwards
     // of at least kKv8StageMinTokens tokens, when the unpacking it saves outweighs the copy: per (query, key row it
     // reads) over the 12 layers unpacking costs kKv8UnpackNs more than a staged load, and staging costs kKv8StageNs a
@@ -437,6 +581,43 @@ public:
                                       const std::vector<int64_t> &pos3 = {});
     void keep_verify();
     void drop_verify();
+    // ---------------------------------------------------- batched forwards (feat/multi-sequence design)
+    // One row group: the slot `seq`, the ids to run at its pos(), and the trailing rows whose logits come
+    // back. A batched forward reads the dense / expert / HC weights once for all runs' rows - the gain the
+    // design measures - and touches each run's own state (K/V, GDN, PLE, MTP) per run, at the same row
+    // offsets a single-sequence forward() uses. The runs' rows are laid into the shared workspaces in batch
+    // order (any slot order; the returned logits rows follow it).
+    struct BatchRun {
+        int seq = 0;                 // the slot; distinct across a batch
+        std::vector<int32_t> ids;    // 1..kMaxLogits rows at a batched verify; each run's rows at pos(seq)..
+        int64_t n_logits = 1;        // its trailing rows' logits, in the batch's returned rows
+    };
+    // The batched forward. Returns the concatenated per-run logits rows ([run 0's n_logits rows][run 1's ...]
+    // FP32) or, with want_candidates(), the batch's candidates rows in the same order. A batch of one runs
+    // exactly what forward() does (bit-identical); the batch-wide path choice (WMMA / grouped at the total rows)
+    // is why a batched verify is capped at kMaxLogits rows total - it stays a decode-sized forward. A run's
+    // results depend on its own slot and ids only, bit for bit; next to the same run alone they are bit-identical
+    // when the batch's total rows and the run's own fall on the same side of 1, kGroupedMinTokens and
+    // kWmmaMinTokens, otherwise they differ by rounding (tests: forward_qwen4exp_batch_*). Refused while any
+    // verify awaits resolution; with more than one run: no image rows, scalar positions only (the one-sequence
+    // vision / mRoPE path keeps its own code - and an image forward runs on seq 0, set_positions' only slot).
+    std::vector<float> forward_batch(std::vector<BatchRun> &runs, const ImageInput *image = nullptr,
+                                     const Qwen4ExpProbe &probe = nullptr);
+    // forward_batch with the verify mechanism (the batched MTP verify): each run's GDN states write to its
+    // state's spare set and its rows are saved per layer for the prefix replay; then every run is resolved
+    // with keep_verify() / drop_verify() below before anything else runs on the session.
+    std::vector<float> forward_batch_verify(std::vector<BatchRun> &runs);
+    // Resolve one run of a pending batched verify (the single-sequence calls above address the same machine
+    // for one run): keep its first `rows` rows (rows in 1..verify_rows(seq): rows == its rows is the whole
+    // verify - today's keep_verify(), a smaller count is today's keep_verify_prefix(rows)). carry: the token
+    // the run feeds next at row 0 (the MTP rejection's corrected sample; 0: none), checked against that
+    // run's next forward's ids[0] and consumed there - like the single-sequence engine after
+    // keep_verify_prefix, the resolution itself advances nothing for it (its trunk rows take the full
+    // forward to write). The last resolution frees the session: once every pending run is resolved,
+    // forwards and drafts may run again.
+    void keep_verify(int seq, int64_t rows, int32_t carry = 0);
+    void drop_verify(int seq);
+    int64_t verify_rows(int seq) const { return seqs_[(size_t)seq]->verify_rows; }  // a pending verify's rows for keep_verify
     // The third way out of a verify: keep only its first `rows` (1 <= rows < its size) - the state as if forward()
     // had run just ids[0, rows), without running them again (an MTP rejection after rows - 1 accepted drafts; the
     // engine then forwards the corrected token alone). From the states before the verify (still intact): the GDN
@@ -469,6 +650,7 @@ public:
     // rejection's corrected token before keep_verify_prefix). Changes no state the forward reads (only the cache's
     // contents); a no-op for a source without a row cache.
     void prefetch_ple(const std::vector<int32_t> &ids, int64_t first);
+    void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first);  // slot seq's ids (the above: seq 0)
     // Hint for a long prompt in chunks: the ids the next forward() will run. The next forward() then gathers their
     // PLE n-gram rows from the table on a worker thread during its own GPU work (after its PLE layer), and the one
     // after uses them - if its ids and n-gram history match exactly (anything else, e.g. a reset or restore in
@@ -482,6 +664,8 @@ public:
     // output, the position pos() + step; each step must follow step - 1 with no forward, restore or reset between.
     // A chain step's KV row is the draft's guess; the trunk's catch-up writes the real one when the position runs.
     std::vector<float> forward_mtp(int32_t token_id, int64_t step = 0);
+    // The draft on a slot (feat/multi-sequence): the same on seq's state. forward_mtp is seq 0.
+    std::vector<float> forward_mtp_seq(int seq, int32_t token_id, int64_t step = 0);
     // forward_mtp's draft reduced on the GPU (kernels/mtp_pick): the best id (lowest on a tie), its logit, the
     // runner-up's (the multiset second; -inf for one logit) and whether any logit was NaN - serve/sampler.hpp top2()
     // on forward_mtp's logits, bit for bit on non-NaN rows - with one small copy back instead of all mtp_vocab()
@@ -492,6 +676,7 @@ public:
         bool nan = false;
     };
     MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step = 0);
+    MtpTop2 forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step = 0);  // the draft's pick on a slot
     // The draft's vocabulary: forward_mtp scores only ids [0, n) (the LM head's first n rows - BPE ids run roughly
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.
     void set_mtp_vocab(int64_t n);
@@ -499,81 +684,75 @@ public:
 
 private:
     const Qwen4ExpModel &m_;
-    int64_t capacity_, max_tokens_, pos_ = 0, cap_blocks_ = 0;
-    // Where the last import_state ended (-1: none since reset): a delta import needs its base's import just before -
-    // and pos_ still there (any forward moves it; restores need snapshots, which an import invalidates).
-    int64_t imported_at_ = -1;
+    // One sequence state per serving slot (feat/multi-sequence): what the server runs
+    // today is one; batched forwards address them by run. seqs_ is built at the top of the constructor, before
+    // any st() use.
+    std::vector<std::unique_ptr<Qwen4ExpSeqState>> seqs_;
+    // The state a single-sequence call runs on (the batched API takes them by run).
+    void reset_seq_state(Qwen4ExpSeqState &s);  // one state back to position 0 (reset's per-slot part)
+    // The paged arrays of state sq and their byte ranges that positions [0, end) use: f(buffer, ranges) per array.
+    void for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::function<void(PagedDeviceBuffer &,
+                   const std::vector<PagedDeviceBuffer::Range> &)> &f) const;
+    // Maps the pages sq's arrays need for positions [0, end) and a little past (for_paged's headroom for tile
+    // over-reads) - every writer calls it before its kernels: prepare_positions (forward bodies, keep_verify_prefix,
+    // run_mtp), each run of a multi-run batched forward, import_state - after kv_budget_ (or the floor check) allowed
+    // the bytes.
+    void ensure_rows(Qwen4ExpSeqState &sq, int64_t end);
+    std::function<void(uint64_t)> kv_budget_;
+    static uint64_t mem_available_bytes();
+    // The slot allocation guard's floor: a unified-memory machine with MemAvailable near 0.5 GB hard-hangs.
+    static constexpr uint64_t kSlotFloorBytes = 4ull << 30;
+    Qwen4ExpSeqState &st() { return *seqs_.front(); }
+    const Qwen4ExpSeqState &st() const { return *seqs_.front(); }
+    int64_t capacity_, max_tokens_, cap_blocks_ = 0;
     PrefillMath prefill_math_;
     PrecisionOptions precision_;
     hipStream_t stream_ = nullptr;
-    // Per-layer state (empty buffers for the other kind).
-    std::vector<DeviceBuffer<uint8_t>> k_cache_, v_cache_, block_keys_, tail_[2], conv_state_;
-    std::vector<DeviceBuffer<float>> rec_state_;
-    int tail_cur_ = 0;  // the current indexer tails - and with KvFormat::Q8 the current K/V tails
-    // KvFormat::Q8 (k_cache_ / v_cache_ empty then): per attention layer the 8-bit storage (kernels/kv8.hpp, for
-    // kv8_cap_ rows: the capacity rounded up to whole groups) and the K/V tails [2] (kv8_tail_[tail_cur_] current,
-    // double-buffered like the indexer tails); kv_new_ [max_tokens][2W] the forward's new K | V rows before
-    // kv8_commit; kv8_err_ the fp16-overflow flag.
+    // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new
+    // K | V rows before kv8_commit; kv8_err_ the fp16-overflow flag; per attention layer the 8-bit storage
+    // (kernels/kv8.hpp, for kv8_cap_ rows: the capacity rounded up to whole groups) lives in the state.
     KvFormat kv_format_ = KvFormat::Act;
     int64_t kv8_cap_ = 0;
     // An exported state's 8-bit K/V of one layer: the groups [from / 32, n / 32) (codes and params of K, then of V)
     // and the tail (its rows past n % 32 exported as zeros). kv8_copy moves them between the host cursor and the
     // layer's storage / `tail` (to_host: export, else import) and records the unused tail bytes for zeroing.
     size_t kv8_state_bytes(int64_t n, int64_t from) const;
-    void kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t from, const DeviceBuffer<uint8_t> &tail, bool to_host,
-                  std::vector<std::pair<uint8_t *, size_t>> *unused);
-    std::vector<DeviceBuffer<uint8_t>> kv8_store_, kv8_tail_[2];
+    void kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t layer, int64_t n, int64_t from,
+                  const DeviceBuffer<uint8_t> &tail, bool to_host, std::vector<std::pair<uint8_t *, size_t>> *unused);
     DeviceBuffer<uint8_t> kv_new_;
+    // lg_src_: the batched forward's compacted logits rows - each run's last nL rows gathered contiguous so
+    // the LM head's weights are read once for the whole batch. kMaxLogits rows, decode-size (a few MB).
+    DeviceBuffer<uint8_t> lg_src_;
     // WMMA prefill attention over the 8-bit cache reads a staged copy (kernels/kv8.hpp Kv8View::staged_k): one
-    // layer's K | V rows [0, kv8_cap_) in BF16, re-filled per layer and call (kv8_dequant; kv8_stage_pays). Empty
+    // layer's K | V rows [0, kv8_cap_) (K in F16, V in BF16), re-filled per layer and call (kv8_dequant; kv8_stage_pays). Empty
     // unless the session has the 8-bit cache, WMMA prefill and BF16 activations, and forwards of kKv8StageMinTokens
     // or more.
     DeviceBuffer<uint8_t> kv8_stage_;
     DeviceBuffer<uint32_t> kv8_err_;
-    // Rewinds for can_restore: epoch e started when the session rewound to rewind_to_[e] (reset() = 0).
-    std::vector<int64_t> rewind_to_{0};
-    DeviceBuffer<uint8_t> ple_state_;
-    PleHistory ple_hist_;
     // Workspaces [max_tokens, ...], activation dtype unless noted.
     DeviceBuffer<int32_t> ids_, route_ids_;
     DeviceBuffer<uint8_t> x_, u_, y_, sh_y_, proj_, qkv_, core_, gnorm_, gu_, hh_, ple_e_, ple_kv_, ple_hist_buf_;
     DeviceBuffer<float> h_, w_in_, inv_, beta_, g_, router_logits_, route_coef_, ple_sigma_, attn_ws_, logits_;
     DeviceBuffer<uint32_t> expert_err_, router_err_;
-    // MTP (with mtp_ on): the layer's KV cache, block keys and indexer tails (tail_mtp_[mtp_tail_cur_] current);
-    // mtp_prev_ [H*d] the trunk's streams after position pos_ - 1 (zeros at 0), row 0's input for the next MTP
-    // rows; workspaces [max_tokens, ...]: the embedding and its norm [d], the normed streams [H*d], fc_embedding's
-    // output [d], the combined streams [H*d]; mtp_ones_ [max_tokens, H] = 1 (the per-stream broadcast add).
+    // MTP (with mtp_ on) workspaces [max_tokens, ...]: the embedding and its norm [d], the normed streams [H*d],
+    // fc_embedding's output [d], the combined streams [H*d]; mtp_ones_ [max_tokens, H] = 1 (the per-stream
+    // broadcast add). The head's own K/V cache, keys, tails, streams and chain buffers live in the state (a chain
+    // step swaps mtp_x_ against the state's mtp_chain_prev_, so only one state may draft at a time).
     bool mtp_ = false;
-    int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
-    DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_, mtp_prev_;
-    DeviceBuffer<uint8_t> k_cache_mtp_, v_cache_mtp_, block_keys_mtp_, tail_mtp_[2];
+    DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_;
     DeviceBuffer<float> mtp_ones_;
-    // forward_verify: the spare GDN states it writes (gdn_to_spare_ during it), what drop_verify puts back, and
-    // whether a keep / drop is owed.
-    std::vector<DeviceBuffer<uint8_t>> conv_spare_;
-    std::vector<DeviceBuffer<float>> rec_spare_;
-    DeviceBuffer<uint8_t> ple_state_kept_, mtp_prev_kept_;
-    bool gdn_to_spare_ = false, verify_pending_ = false;
-    int64_t verify_pos_ = 0;
-    int verify_tail_cur_ = 0, verify_mtp_tail_cur_ = 0;
-    PleHistory verify_hist_;
-    // keep_verify_prefix's inputs, saved by the verify forward per layer (kMaxLogits rows each): GDN layers their
-    // in_proj rows [T, gstride], attention layers their raw indexer key rows [T, idx_d] (with KvFormat::Q8 followed by
-    // their new K | V rows [T, 2 hkv hd]); and the verify's ids / size.
-    std::vector<DeviceBuffer<uint8_t>> verify_in_;
-    std::vector<int32_t> verify_ids_;
-    // Chained drafts: step - 1's output streams, the chain's own indexer tails (the committed ones stay untouched),
-    // and the last step run at mtp_chain_pos_ (-1: no chain to continue).
-    DeviceBuffer<uint8_t> mtp_chain_prev_, mtp_chain_tail_[2];
-    int64_t mtp_chain_step_ = -1, mtp_chain_pos_ = -1;
-    // The MTP layer's input for T rows at positions pos_..pos_+T-1 into mtp_x_: token ids_[t] with the streams
-    // after position pos_ + t - 1 (prev0 for t = 0, x_ row t - 1 after it).
-    void mtp_input(int64_t T, const void *prev0);
+    // Bumped by every mtp_input (the one writer of mtp_x_'s rows). A draft chain records it after each step
+    // (Qwen4ExpSeqState::mtp_chain_xver); a chain step whose stamp is stale was interrupted by another
+    // draft / forward overwriting the shared mtp_x_ and is refused.
+    uint64_t mtp_x_version_ = 0;
+    // The MTP layer's input for the batch rows [row_base, row_base + T): token ids_[row_base + t] with the
+    // streams after the position before (prev0 for t = 0, x_ row row_base + t - 1 after it).
+    void mtp_input(int64_t row_base, int64_t T, const void *prev0);
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
-    // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(step)).
-    void run_mtp(int32_t token_id, int64_t step);
-    void mtp_done(int64_t step);
+    // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(seq, step)).
+    void run_mtp(int seq, int32_t token_id, int64_t step);
+    void mtp_done(int seq, int64_t step);
     DeviceBuffer<uint8_t> mtp_pick_;  // kernels::MtpPick on the device (allocated on the first forward_mtp_top2)
     // Grouped experts for multi-token forwards (kernels/moe_grouped): the route grouping and combine's FP32
     // per-slot dots. Allocated when max_tokens reaches kGroupedMinTokens.
@@ -591,31 +770,16 @@ private:
     DeviceBuffer<float> group_partial_;
     size_t group_ws_bytes_ = 0;
     DeviceBuffer<kernels::EmbeddingError> emb_err_;
-    // ---------------------------------------- interleaved mRoPE position state (vision Phase A)
-    // rope_delta_ / history_ever_interleaved_ are the scalars; pos3_host_ holds the (t,h,w) triples of every row
-    // from the first interleaved forward on (rows before it are uniform at rope_delta 0 - never stored). The
-    // upload array covers a forward's block span [4*(pos_/4), pos_+T): the jobs read it at an offset (their rows
-    // start at pos_), qsa_block_keys needs the block's first key's triple, which can be a tail row before pos_.
-    // Never touched (not one byte uploaded) while no positions are set - the text path's cost is two int64 adds.
-    int64_t rope_delta_ = 0;
-    bool history_ever_interleaved_ = false;  // the current prefix contains interleaved (image) rows
-    // History rows [pos3_start_, pos3Hend()), pos3Hend() == pos_ always once non-empty: the full spans from the
-    // first interleaved forward on, or (after a restore) the snapshot's last 3 rows - only the rows at or near
-    // pos_ are ever read back. 3 int64 (t,h,w) per row.
-    int64_t pos3_start_ = 0;
-    std::vector<int64_t> pos3_host_;
-    int64_t pos3Hend() const { return pos3_start_ + (int64_t)pos3_host_.size() / 3; }  // == pos_ when non-empty
-    std::vector<int64_t> pending3_;          // set_positions payload for the next forward (empty = scalar path)
+    // ---------------------------------------- interleaved mRoPE (vision Phase A), per-state position data in
+    // Qwen4ExpSeqState; here the per-forward upload machinery (text-only forwards touch none of it - not one
+    // byte uploaded, the cost is two int64 adds). The upload array covers a forward's block span
+    // [4*(pos/4), pos+T): the jobs read it at an offset (their rows start at pos), qsa_block_keys needs the
+    // block's first key's triple, which can be a tail row before pos.
     DeviceBuffer<int64_t> pos3_dev_;         // the upload array, 3 * capacity_ int64, allocated on first use
     // The spans prepare_positions() last prepared (see .cpp): mk_block_'s rows start at 4*(seq/4), mk_jobs_'s at
     // seq; both null while the last prepared forward is on today's scalar path.
     kernels::MropePos mk_block_{}, mk_jobs_{};
     std::vector<int64_t> stage3_;            // host staging for the upload (no allocation on the scalar path)
-    // forward_verify's mRoPE bookkeeping: the history / delta / image flag as they were before it (drop_verify
-    // restores them; keep_verify keeps, keep_verify_prefix truncates the forward-appended rows in place).
-    std::vector<int64_t> verify_hist_before_;
-    int64_t verify_hist_start_before_ = 0, verify_delta_before_ = 0;
-    bool verify_ever_before_ = false;
     // Upload probe for tests (STRIX_POS_PROBE=<dir> env, read once): appends one UploadTrace per prepared span
     // per forward to <dir>/uploads.bin - lets a test see exactly what the kernels would receive, including that
     // a text-only forward prepares nothing. Null when unset (the normal path; the only per-forward extra is a
@@ -630,7 +794,7 @@ private:
     // from the scalar values or the session has a rope_delta) and set mk_block_ / mk_jobs_. Called by every
     // forward body (trunk + MTP parts, after its pending rows joined the history), by keep_verify_prefix and
     // by run_mtp; the scalar kernels' angle base gets rope_delta added by the callers.
-    void prepare_positions(int64_t seq, int64_t n);
+    void prepare_positions(Qwen4ExpSeqState &sq, int64_t seq, int64_t n);
     // ---------------------------------------- image forward (vision Phase B): the tower's scratch and the
     // one image's tower run + scatter. The scratch starts empty and only ever serves an image forward -
     // a text-only session allocates nothing for it (the text path stays byte-identical, upload_probe
@@ -717,8 +881,18 @@ private:
     // the two: whichever runs second finds the rows cached). Declared after the counters it writes.
     PleWorker ple_prefetcher_;
     enum class PleRun { Worker, Async };
-    std::future<void> start_ple_gather(std::vector<int64_t> rows, int64_t T, int buf, PleRun run);
+    std::future<void> start_ple_gather(std::vector<int64_t> rows, int64_t T, PinnedHostBuffer &dst, PleRun run);
     void drop_ple_pending();  // waits for a pending gather (its failure ignored) and forgets it
+    // The seq of the first state with a pending verify (-1: none) - the gate every forward / draft checks:
+    // the pending verify's replay state lives in the shared workspaces.
+    int64_t pending_verify_seq() const;
+    // The per-state halves of the verify mechanism, shared by the single-sequence and batched paths:
+    // verify_prep allocates the state's spare set, keeps the small states, and records the before-state (the
+    // caller then sets st.gdn_to_spare and runs the forward); keep / drop are the resolution bodies.
+    void verify_prep(Qwen4ExpSeqState &sq);
+    void keep_verify_full(Qwen4ExpSeqState &sq);
+    void keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows);
+    void drop_verify_seq(Qwen4ExpSeqState &sq);
 };
 
 }  // namespace strix

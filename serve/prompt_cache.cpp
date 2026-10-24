@@ -349,7 +349,13 @@ bool PromptCache::on_disk(const int32_t *tokens, int64_t n) const {
 
 void PromptCache::release_locked(Entry &e) {
     STRIX_CHECK(e.readers > 0, "PromptCache::release_locked: an entry of ", e.tokens.size(), " tokens has no reader");
-    if (--e.readers == 0 && e.dead) drop_ram_locked(e, true);
+    // The last user also finishes a pending leave-RAM: a removal (dead) or an eviction the writer found still read
+    // (drop_ram, deferring as in remove_locked). An import_state whose base was dropped over it used to get a
+    // moved-from buffer and fail the request with "null input".
+    if (--e.readers == 0 && (e.dead || e.drop_ram)) {
+        drop_ram_locked(e, true);
+        if (!e.dead) e.drop_ram = false;  // a kept entry can come back to RAM (a disk read promotes it) and leave again
+    }
 }
 
 void PromptCache::load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n,
@@ -786,12 +792,17 @@ bool PromptCache::make_room_for(uint64_t bytes) {
     // check after the rule often comes up short although the room is on its way - and a refused load re-prefills its
     // whole prompt. So while evicted entries are still being written, wait for them, up to room_wait_seconds; refuse
     // only when nothing more is leaving or the wait runs out.
+    // The rule decides on the reading that found the shortfall: on separate reads the rule could see "enough" (and
+    // evict nothing) where the check, a few MiB of MemAvailable movement later, saw "short" - a refusal with the RAM
+    // tier full of entries free to leave.
     const double deadline = now_s() + opt_.room_wait_seconds;
     for (;;) {
+        const uint64_t avail = mem_available();
+        if (avail >= opt_.ram_margin + bytes) return true;
         {
             std::vector<HostBuffer> trash;
             std::lock_guard<std::mutex> lock(mu_);
-            make_room_locked(bytes);
+            make_room_locked(bytes, avail);
             trash.swap(trash_);
         }  // the evicted buffers are unmapped here, before MemAvailable is read again
         if (mem_available() >= opt_.ram_margin + bytes) return true;
@@ -832,8 +843,8 @@ uint64_t PromptCache::leaving_bytes_locked() const {
     return b;
 }
 
-void PromptCache::make_room_locked(uint64_t extra) {
-    const uint64_t avail = mem_available(), target = opt_.ram_margin + extra;
+void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
+    const uint64_t avail = avail_in != UINT64_MAX ? avail_in : mem_available(), target = opt_.ram_margin + extra;
     if (avail >= target && opt_.ram_tier) return;
     // No RAM tier: every entry that can leave does (need never reaches 0 below).
     uint64_t need = opt_.ram_tier ? target - avail : UINT64_MAX;
@@ -850,9 +861,10 @@ void PromptCache::make_room_locked(uint64_t extra) {
     }
     while (need > 0) {
         // Candidates: every RAM entry not being imported and not already leaving. One queued for a write (idle, or
-        // being written) counts too - it leaves RAM once written - so the least recently used goes first, never the
-        // newest just because the older ones sat in the write queue (otherwise the entry just saved was dropped,
-        // "write queue full", and its conversation re-prefilled 132k tokens).
+        // being written) counts too - it leaves RAM once written, its last read releasing it if one holds it - so the
+        // least recently used goes first, never the newest just because the older ones sat in the write queue
+        // (otherwise the entry just saved was dropped, "write queue full", and its conversation re-prefilled 132k
+        // tokens).
         Entry *lru = nullptr;
         for (const EntryPtr &e : entries_)
             if (!e->ram.empty() && !e->drop_ram && (e->readers == 0 || e->queued) && (!lru || e->last_used < lru->last_used))
@@ -927,7 +939,7 @@ void PromptCache::summary_locked(double now) {
     int64_t ram_n = 0, disk_n = 0;
     for (const EntryPtr &e : entries_) ram_n += !e->ram.empty(), disk_n += !e->path.empty();
     const double gib = (double)(1ull << 30);
-    slog(LogLevel::Info, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)%s%s",
+    slog(LogLevel::Debug, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)%s%s",
          fmt_n(ram_n).c_str(), fmt_rate(ram_bytes_ / 1e9, 1).c_str(), fmt_rate(spare_bytes_ / 1e9, 1).c_str(),
          fmt_rate(mem_available() / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str(),
          opt_.status_note.empty() ? "" : "; ", opt_.status_note.c_str());
@@ -935,9 +947,9 @@ void PromptCache::summary_locked(double now) {
     if (opt_.write_gib_per_hour > 0)
         std::snprintf(budget, sizeof budget, "write budget %s of %s GiB left this hour",
                       fmt_rate(budget_now_locked() / gib, 1).c_str(), fmt_rate(opt_.write_gib_per_hour, 0).c_str());
-    slog(LogLevel::Info, "%sdisk %s entries, %s of %s GiB; %s", kCont, fmt_n(disk_n).c_str(), fmt_rate(disk_bytes_ / gib, 1).c_str(),
+    slog(LogLevel::Debug, "%sdisk %s entries, %s of %s GiB; %s", kCont, fmt_n(disk_n).c_str(), fmt_rate(disk_bytes_ / gib, 1).c_str(),
          fmt_rate(max_bytes_ / gib, 0).c_str(), budget);
-    slog(LogLevel::Info, "%ssince the start: %s written, %s dropped leaving RAM, %s write failures", kCont,
+    slog(LogLevel::Debug, "%ssince the start: %s written, %s dropped leaving RAM, %s write failures", kCont,
          fmt_n(stats_.writes).c_str(),
          fmt_n(stats_.rejected_queue + stats_.rejected_space + stats_.rejected_budget).c_str(),
          fmt_n(stats_.write_failures).c_str());
@@ -1190,18 +1202,20 @@ void PromptCache::write_entry(Job &job) {
         disk_bytes_ += total;
         const std::string by = e.saved_by > 0 ? " (saved by Request " + std::to_string(e.saved_by) + ")" : "";
         const std::string freeing = releasing && released > 0 ? ", " + fmt_rate(released / 1e9, 1) + " GB gave back RAM as it wrote" : "";
-        slog(LogLevel::Info, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s%s", kind_name(e.kind),
+        slog(LogLevel::Debug, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s%s", kind_name(e.kind),
              fmt_n((long long)n).c_str(), by.c_str(), fmt_rate(total / 1e6, 0).c_str(), fmt_rate(now_s() - t0, 2).c_str(),
              freeing.c_str());
         const std::string delta = base_n > 0 ? "; a delta on the " + fmt_n((long long)base_n) + "-token entry" : "";
-        slog(LogLevel::Info, "%swhy: %s%s", kCont,
+        slog(LogLevel::Debug, "%swhy: %s%s", kCont,
              job.why == Why::Idle    ? ("unused for " + ago(now_s() - e.touched_s)).c_str()
              : job.why == Why::Evict ? "leaving RAM (MemAvailable below the margin)"
                                      : "server shutdown",
              delta.c_str());
-        if (e.drop_ram) drop_ram_locked(e, true), e.drop_ram = false;
+        if (e.drop_ram && e.readers > 1)
+            slog(LogLevel::Info, "prompt cache: the %s-token entry's eviction write finished while a read still holds "
+                 "its RAM - the RAM leaves when the read does", fmt_n((long long)n).c_str());  // strixite #14
     }
-    release_locked(e);
+    release_locked(e);  // the last reader's release also finishes a deferred drop_ram (see release_locked)
     ++stats_.writes, stats_.bytes_written += (int64_t)total, stats_.write_seconds += now_s() - t0;
     (job.why == Why::Evict ? stats_.writes_evict : job.why == Why::Idle ? stats_.writes_idle : stats_.writes_shutdown)++;
     trash.swap(trash_);

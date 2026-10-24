@@ -5,8 +5,9 @@
 #   build-image.sh STRIXITE_CLONE REF [THEROCK_TARBALL]
 #     STRIXITE_CLONE   a clone of github.com/shawnshekari/strixite (clean: no local changes to tracked files)
 #     REF              the tag or commit to build (e.g. v0.2.0); the image is tagged strixite:<REF>
-#     THEROCK_TARBALL  default ~/tools/therock-tarball/therock-dist-linux-gfx1151-10.1.0a20260822.tar.gz; its
-#                      .sha256 file next to it must match (the toolchain every release so far was tested with)
+#     THEROCK_TARBALL  default ~/tools/therock-tarball/therock-dist-linux-gfx1151-10.1.0.tar.gz; its .sha256 file
+#                      next to it must match (TheRock's first GA release for gfx1151, the toolchain the Quick start
+#                      names; pass an older path to rebuild an older tag exactly as it shipped)
 #
 # The build context is a fresh temporary directory holding only the source at REF (git archive - nothing untracked
 # leaks in) and the tarball, so two builds from the same inputs see the same files. Prints the image's size and the
@@ -14,7 +15,7 @@
 set -eo pipefail
 clone=${1:?usage: build-image.sh STRIXITE_CLONE REF [THEROCK_TARBALL]}
 ref=${2:?usage: build-image.sh STRIXITE_CLONE REF [THEROCK_TARBALL]}
-tarball=${3:-$HOME/tools/therock-tarball/therock-dist-linux-gfx1151-10.1.0a20260822.tar.gz}
+tarball=${3:-$HOME/tools/therock-tarball/therock-dist-linux-gfx1151-10.1.0.tar.gz}
 here=$(cd "$(dirname "$0")" && pwd)
 
 command -v podman > /dev/null || { echo "build-image: podman not on PATH"; exit 1; }

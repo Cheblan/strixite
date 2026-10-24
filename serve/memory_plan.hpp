@@ -43,6 +43,12 @@ struct MemoryPlanInput {
     int64_t row_cache_rows = 0;    // ngram-cache-rows as allocated (0: no row cache, e.g. an HF checkpoint source)
     uint64_t row_cache_row_bytes = 0;  // RAM per cached row (data + index)
     int64_t row_cache_min_rows = 0;    // the shrink stops here (NgramTableRows::kDefaultCacheRows)
+    int64_t slots = 1;                 // total-slots: conversation states allocated (each at the full capacity)
+    uint64_t slot_bytes = 0;           // RAM one slot's state costs (slots > 1: the refusal names the count that fits)
+    // Paged slot K/V: the bytes one slot's K/V maps at full
+    // capacity, none of it mapped at startup. One deep slot is committed: the plan holds this much of MemAvailable
+    // back before every rule below (the other slots grow into what the RAM tier would otherwise use).
+    uint64_t kv_unmapped = 0;
 };
 
 struct MemoryPlan {

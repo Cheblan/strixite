@@ -112,13 +112,17 @@ inline void linear_qw_experts_gather_grouped(const void *x, const QWeightView &w
 inline void linear_qw_experts_combine_grouped(const void *h, const QWeightView &w, int64_t E, const int32_t *ids,
                                               const float *coef, const void *ws, size_t ws_bytes, float *partial,
                                               int64_t M, int64_t A, void *y, Act act, MoeMath math,
-                                              hipStream_t stream) {
+                                              hipStream_t stream, const MoeSharedAdd *shared = nullptr,
+                                              bool h_f16 = false) {
     switch (w.bits) {
         case 4:
-            linear_q4_experts_combine_grouped(h, w.q4, E, ids, coef, ws, ws_bytes, partial, M, A, y, act, math, stream);
+            linear_q4_experts_combine_grouped(h, w.q4, E, ids, coef, ws, ws_bytes, partial, M, A, y, act, math, stream,
+                                              shared, h_f16);
             return;
         case 5:
-            linear_q5_experts_combine_grouped(h, w.q5, E, ids, coef, ws, ws_bytes, partial, M, A, y, act, math, stream);
+            STRIX_CHECK(!h_f16, "linear_qw_experts_combine_grouped: F16 h needs Q4 experts, got Q5");
+            linear_q5_experts_combine_grouped(h, w.q5, E, ids, coef, ws, ws_bytes, partial, M, A, y, act, math, stream,
+                                              shared);
             return;
         default: STRIX_FAIL("linear_qw_experts_combine_grouped: experts have ", w.bits, " bits, expected 4 or 5");
     }

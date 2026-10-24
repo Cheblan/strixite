@@ -151,8 +151,9 @@ void ple_conv(const void *hist, const float *sigma, const void *kv, const float 
     const size_t hist_bytes = (size_t)((S + sh.T) * n4) * es;
     STRIX_CHECK(!overlaps(x, (size_t)(sh.T * n4) * es, hist, hist_bytes) &&
                     !overlaps(x, (size_t)(sh.T * n4) * es, kv, (size_t)(sh.T * sh.ld) * es) &&
-                    (S == 0 || !overlaps(state_out, (size_t)(S * n4) * es, hist, hist_bytes)),
-                fn, ": x or state_out overlaps the history or kv");
+                    (S == 0 || (!overlaps(state_out, (size_t)(S * n4) * es, hist, hist_bytes) &&
+                                !overlaps(state_out, (size_t)(S * n4) * es, x, (size_t)(sh.T * n4) * es))),
+                fn, ": x or state_out overlaps the history or kv, or each other");
     const int64_t n = (sh.T + S) * n4;
     const unsigned blocks = (unsigned)std::min<int64_t>((n + kThreads - 1) / kThreads, 8192);
     if (act == Act::F32)

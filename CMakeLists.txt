@@ -128,9 +128,11 @@ function(strix_hip_sources target)
 endfunction()
 
 # --- host flags ----------------------------------------------------------------
+# The engine's machine is Zen 5 (Strix Halo); the xtx-dev user preset overrides this for the gfx1100 dev box.
+set(STRIX_HOST_ARCH "znver5" CACHE STRING "Host -march (default znver5: every shipped target is Zen 5)")
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=znver3 -flto -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=znver3 -flto -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=${STRIX_HOST_ARCH} -flto -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=${STRIX_HOST_ARCH} -flto -g -DNDEBUG")
 add_link_options(-fuse-ld=lld)
 if(CMAKE_BUILD_TYPE MATCHES "Rel")
     add_link_options(-flto)
@@ -209,6 +211,7 @@ add_library(strix_serve STATIC
     serve/sampler.cpp
     serve/output_parser.cpp
     serve/engine.cpp
+    serve/seq_backend.cpp
     serve/think_nudge.cpp
     serve/server_config.cpp
     serve/openai.cpp

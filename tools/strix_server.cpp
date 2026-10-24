@@ -86,6 +86,7 @@ int run(int argc, char **argv) {
         std::fputs(settings.render().c_str(), stdout);
         return 0;
     }
+    set_log_level(parse_log_level(settings.text("log-level")));  // first: every line below is filtered by it
     slog(LogLevel::Info, "startup: config file %s",
          settings.config_path().empty() ? "none (defaults and flags only)" : settings.config_path().c_str());
     for (const ConfigOption &o : settings.options()) {
@@ -97,8 +98,10 @@ int run(int argc, char **argv) {
     ServerConfig cfg;
     cfg.host = settings.text("host");
     cfg.port = (int)settings.integer("port");
+    cfg.request_read_timeout_s = (int)settings.integer("request-read-timeout-s");
     cfg.model_id = settings.text("model-id");
     const int64_t capacity = settings.integer("capacity"), chunk = settings.integer("chunk");
+    const int64_t chunk_shared = settings.integer("chunk-shared");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
     const std::string cache_dir = settings.text("prompt-cache-dir");
     const int64_t cache_gib = settings.integer("prompt-cache-gib");
@@ -203,7 +206,11 @@ int run(int argc, char **argv) {
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
     }
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format);
+    const int64_t total_slots = settings.integer("total-slots");
+    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
+    if (total_slots > 1)
+        slog(LogLevel::Info, "startup: %lld slots: %lld conversations at once, each at the full capacity %s",
+             (long long)total_slots, (long long)total_slots, fmt_n(capacity).c_str());
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");
     {
@@ -240,6 +247,9 @@ int run(int argc, char **argv) {
         mi.row_cache_rows = table ? table->cache_rows() : 0;
         mi.row_cache_row_bytes = table ? table->cache_bytes_per_row() : 0;
         mi.row_cache_min_rows = std::min<int64_t>(mi.row_cache_rows, NgramTableRows::kDefaultCacheRows);
+        mi.slots = total_slots;
+        mi.slot_bytes = backend.state_bytes_at(capacity);
+        mi.kv_unmapped = backend.kv_full_bytes();
         const MemoryPlan plan = plan_memory(mi);
         for (const std::string &l : plan.info) slog(LogLevel::Info, "%s", l.c_str());
         if (plan.refuse) {
@@ -285,6 +295,15 @@ int run(int argc, char **argv) {
                  (long long)cache_gib, used / gib, margin / gib,
                  free <= margin ? "; below the free margin: no entry is written" : "");
     }
+    // K/V first: a slot's K/V growth asks the prompt cache for the RAM - spares go,
+    // then RAM-tier entries leave (least recently used first) - and is refused only when that can't keep the margin.
+    // Without a prompt cache the session's own floor check stands.
+    if (cache)
+        backend.set_kv_budget([c = cache.get()](uint64_t bytes) {
+            STRIX_CHECK(c->make_room_for(bytes), "K/V growth of ", bytes >> 20, " MiB refused: the prompt cache can't ",
+                        "keep its RAM margin after it (MemAvailable ", c->mem_available_now() >> 20, " MiB) - every ",
+                        "slot together holds more K/V than this machine has room for");
+        });
     Engine::Options eng_opts;
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
@@ -295,6 +314,7 @@ int run(int argc, char **argv) {
     eng_opts.think_end_guard = think_end_guard;
     eng_opts.literal_tags = literal_tags;
     eng_opts.think_close_on_call = think_close_on_call;
+    eng_opts.shared_chunk = chunk_shared;
     eng_opts.degraded = degraded;
     slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s, think close before a call %s",
          think_end_guard ? "on" : "off", literal_tags ? "on" : "off", think_close_on_call ? "on" : "off");

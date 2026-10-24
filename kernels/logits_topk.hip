@@ -151,6 +151,13 @@ void logits_topk(const float *logits, int64_t rows, int64_t ld, int64_t n_valid,
     } else {
         STRIX_CHECK(mask_words == 0, fn, ": mask_words = ", mask_words, " without a mask (pass 0 when mask is null)");
     }
+    {  // out is written while the workspace still holds the partial candidates
+        const uintptr_t out_b = reinterpret_cast<uintptr_t>(out),
+                        out_e = out_b + (size_t)rows * kLogitCands * sizeof(LogitCand);
+        const uintptr_t ws_b = reinterpret_cast<uintptr_t>(workspace), ws_e = ws_b + workspace_bytes;
+        STRIX_CHECK(out_e <= ws_b || ws_e <= out_b, fn, ": out [", (void *)out, ", +", out_e - out_b, " B) overlaps the workspace [",
+                    workspace, ", +", workspace_bytes, " B)");
+    }
     const int64_t g1 = groups_of(n_valid);
     auto *buf0 = static_cast<LogitCand *>(workspace);
     LogitCand *buf1 = buf0 + rows * g1 * kLogitCands;

@@ -65,16 +65,24 @@ MemoryPlan plan_memory(const MemoryPlanInput &in) {
                 " rows, minimum ", in.row_cache_min_rows, " - expected >= 0");
     STRIX_CHECK(in.row_cache_rows == 0 || in.row_cache_row_bytes > 0, "plan_memory: ", in.row_cache_rows,
                 " cached rows of 0 bytes each");
+    STRIX_CHECK(in.slots >= 1 && in.slots <= 8, "plan_memory: ", in.slots, " slots, expected 1..8");
+    STRIX_CHECK(in.slots == 1 || in.slot_bytes > 0, "plan_memory: ", in.slots, " slots of 0 bytes each");
 
     MemoryPlan p;
     p.row_cache_rows = in.row_cache_rows;
-    const uint64_t A = in.mem_available, F = kLowMemoryFloor;
+    STRIX_CHECK(in.kv_unmapped < (1ull << 50), "plan_memory: unmapped K/V ", in.kv_unmapped, " bytes, expected < 1 PiB");
+    // One slot's full K/V is committed though not mapped yet: what the rules below see is MemAvailable without it.
+    const uint64_t A = in.mem_available - std::min(in.mem_available, in.kv_unmapped), F = kLowMemoryFloor;
     const uint64_t S = in.prompt_cache ? in.state_bytes(in.capacity) : 0;
     const uint64_t M = std::max(in.ram_margin, F);
     const uint64_t row_cache = (uint64_t)in.row_cache_rows * in.row_cache_row_bytes;
     p.need = in.prompt_cache ? M + S : F;
     const std::string measured = "MemAvailable " + gib(A) + " after loading (GPU buffers " + gib(in.gpu_bytes) +
-                                 ", n-gram row cache " + gib(row_cache) + ")";
+                                 (in.slots > 1 ? " for " + std::to_string(in.slots) + " slots" : std::string()) +
+                                 ", n-gram row cache " + gib(row_cache) + ")" +
+                                 (in.kv_unmapped > 0 ? " less " + gib(in.kv_unmapped) + " held for one slot's K/V at full "
+                                                       "capacity (paged: mapped as conversations fill it)"
+                                                     : std::string());
     const std::string rule = in.prompt_cache
                                  ? "the prompt cache's RAM margin " + gib(M) + " + one state at full capacity (" +
                                        tokens(in.capacity) + " tokens) " + gib(S) + " = " + gib(p.need)
@@ -91,7 +99,15 @@ MemoryPlan plan_memory(const MemoryPlanInput &in) {
     }
 
     if (!in.adapt) {
-        std::string fixes = "free memory (another process?), or change: " + capacity_options(in);
+        std::string fixes = "free memory (another process?), or change: ";
+        if (in.slots > 1) {  // fewer slots: each one's state back (its capacity is the same full one)
+            const uint64_t short_by = p.need - A;
+            const int64_t fewer = (int64_t)((short_by + in.slot_bytes - 1) / in.slot_bytes);
+            if (in.slots - fewer >= 1)
+                fixes += "total-slots = " + std::to_string(in.slots - fewer) + " (each slot's state takes ~" +
+                         gib(in.slot_bytes) + "), ";
+        }
+        fixes += capacity_options(in);
         if (in.row_cache_rows > in.row_cache_min_rows)
             fixes += ", ngram-cache-rows = " + std::to_string(in.row_cache_min_rows) + " (frees " +
                      gib((uint64_t)(in.row_cache_rows - in.row_cache_min_rows) * in.row_cache_row_bytes) + ")";

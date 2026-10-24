@@ -20,7 +20,7 @@ ARG FEDORA=43
 
 # --- build: the toolchain from the context, the code compiled for gfx1151 ---
 FROM registry.fedoraproject.org/fedora:${FEDORA} AS build
-ARG THEROCK=therock-dist-linux-gfx1151-10.1.0a20260822
+ARG THEROCK=therock-dist-linux-gfx1151-10.1.0
 RUN dnf -y install --setopt=install_weak_deps=False cmake ninja-build gcc-c++ libstdc++-devel findutils && dnf clean all
 # Fedora's packages of the upstream projects TheRock bundles (LLVM and its rocm_sysdeps libraries) - installed only for
 # their license texts, which go into the image next to the libraries (deploy/container/NOTICE-image.md).

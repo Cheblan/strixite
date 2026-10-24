@@ -456,7 +456,8 @@ StrixwFile::StrixwFile(const std::string &path) : path_(path) {
                             "' component ", k, " is ", strixw_role_name(g.role), " of ", g.bytes, " bytes, expected ",
                             strixw_role_name(want[k].role), " of ", want[k].bytes, " for ",
                             strixw_encoding_name(t.encoding), " ", shape_str(t.shape));
-                STRIX_CHECK(g.offset >= data_offset_ && g.offset % kStrixwComponentAlign == 0 &&
+                // g.offset <= size first: past it, size - g.offset wraps and any g.bytes would pass.
+                STRIX_CHECK(g.offset >= data_offset_ && g.offset <= size && g.offset % kStrixwComponentAlign == 0 &&
                                 g.bytes <= size - g.offset,
                             where, ": tensor '", t.name, "' ", strixw_role_name(g.role), " at ", g.offset, " (",
                             g.bytes, " bytes) is outside the data region [", data_offset_, ", ", size,
