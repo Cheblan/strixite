@@ -290,7 +290,7 @@ struct EngineStats {
     int64_t cache_hits = 0, cache_misses = 0;
     double prefill_seconds = 0, decode_seconds = 0;
     double last_prefill_tps = 0, last_decode_tps = 0;
-    int64_t queued = 0, busy = 0;
+    int64_t queued = 0, busy = 0, slots = 1;
     // Seconds since the last request finished (or the engine started); 0 while one runs or waits. `busy` alone reads
     // 1 through a steady agent session, so a batch client sampling it saw a "stuck" flag; this lets it
     // wait for a real gap (e.g. idle_seconds >= 2).
@@ -338,17 +338,19 @@ public:
         bool think_close_on_call = true;
     };
 
+    Engine(std::vector<std::unique_ptr<LmBackend>> backends, const Tokenizer &tok, const Options &options);
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
     Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache = nullptr, float mtp_margin = 1.5f);
-    ~Engine();  // finishes the running request, fails the queued ones, joins the worker
+    ~Engine();  // finishes the running requests, fails the queued ones, joins the workers
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
 
     void submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink);
     EngineStats stats() const;
-    BackendStats backend_stats() const { return be_.backend_stats(); }  // thread-safe per the backend's contract
+    BackendStats backend_stats() const;  // thread-safe sum across all slots
     int64_t capacity() const { return capacity_; }
-    const LmBackend &backend() const { return be_; }
+    const LmBackend &backend() const { return *slots_.front().be; }
+    int64_t slots_count() const { return (int64_t)slots_.size(); }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
@@ -356,26 +358,34 @@ public:
     const std::string &degraded() const { return options_.degraded; }
 
 private:
+    struct Slot {
+        int id = 0;
+        LmBackend *be = nullptr;
+        std::vector<int32_t> seq;
+        int64_t running_id = 0;
+        bool busy = false;
+    };
     struct Job {
         GenerationRequest req;
         std::shared_ptr<GenerationSink> sink;
         double enqueued;
     };
-    void worker();
-    void run(Job &job);
+    void worker(int slot_id);
+    void run(Slot &slot, Job &job);
     // Sets the backend up to prefill from the returned position: the longest reusable prefix among the live state,
     // the two snapshot slots and the prompt cache (restoring / importing / resetting as needed). from_disk: from the
     // prompt cache (either tier); from_ram: from its RAM tier.
-    int64_t resume_point(const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram);
+    int64_t resume_point(Slot &slot, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram);
     // Logs where the prompt left the state it shared the most with (the live session before resume_point, or a
     // prompt cache entry) when that cost >= kResumeLossReportTokens of prefill (serve/resume_loss.hpp).
     // Writes the finished request's tokens and MTP steps to options_.capture_dir (serve/capture.hpp); logs, never
     // throws.
-    void capture(const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
+    void capture(const Slot &slot, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason);
     void report_resume_loss(const std::vector<int32_t> &prompt, int64_t start, int64_t live_common, int64_t live_n,
                             int64_t id);
 
-    LmBackend &be_;
+    std::vector<std::unique_ptr<LmBackend>> owned_backends_;
+    std::vector<Slot> slots_;
     const Tokenizer &tok_;
     const Options options_;
     PromptCache *cache_;
@@ -387,17 +397,15 @@ private:
     const std::vector<int32_t> nudge_[2];       // kThinkNudge1 / 2, tokenized
     const std::vector<int32_t> think_close_;    // kThinkCloseBeforeCall, tokenized
     const int32_t call_begin_;                  // <tool_call>
-    std::vector<int32_t> seq_;  // the tokens in the backend (seq_.size() == be_.pos())
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Job> queue_;
     bool stop_ = false;
     std::string fatal_;  // the GpuFatalError's text once one was thrown; under mu_
-    std::string fatal_pending_;  // set by run()'s handler, moved to fatal_ by the worker (worker thread only)
+    std::string fatal_pending_;  // set by run()'s handler under mu_
     EngineStats stats_;
-    double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
-    int64_t running_id_ = 0;  // the id of the request the worker runs (while stats_.busy); under mu_
-    std::thread thread_;
+    double idle_since_ = 0;  // when all requests finished (steady clock, s); under mu_
+    std::vector<std::thread> workers_;
 };
 
 }  // namespace strix

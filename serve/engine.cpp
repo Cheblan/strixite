@@ -33,9 +33,63 @@ bool ends_sentence(std::string_view tail) {
     return std::isalpha(before) || before == ')' || before == '`' || before == '"' || before == '\'' || before >= 0x80;
 }
 
-Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
-    : be_(backend),
+Engine::Engine(std::vector<std::unique_ptr<LmBackend>> backends, const Tokenizer &tok, const Options &options)
+    : owned_backends_(std::move(backends)),
       tok_(tok),
+      options_(options),
+      cache_(options.cache),
+      capacity_([&] {
+          STRIX_CHECK(!owned_backends_.empty(), "Engine: empty backends list");
+          return owned_backends_.front()->capacity();
+      }()),
+      im_start_(tok.id_of("<|im_start|>")),
+      im_end_(tok.id_of("<|im_end|>")),
+      eot_(tok.id_of("<|endoftext|>")),
+      think_end_(tok.id_of("</think>")),
+      masker_(tok, owned_backends_.front()->logits_row()),
+      thinking_stop_(tok.encode(kThinkingStop)),
+      nudge_{tok.encode(think_nudge1_text(options.think_nudge_wording)), tok.encode(kThinkNudge2)},
+      think_close_(tok.encode(kThinkCloseBeforeCall)),
+      call_begin_(tok.id_of("<tool_call>")) {
+    const LmBackend &backend = *owned_backends_.front();
+    STRIX_CHECK(backend.logits_row() >= tok.size(), "Engine: logits rows of ", backend.logits_row(),
+                " are shorter than the tokenizer's ", tok.size(), " tokens");
+    STRIX_CHECK(backend.max_chunk() >= (int64_t)thinking_stop_.size() && backend.capacity() >= 2, "Engine: backend chunk ",
+                backend.max_chunk(), " (the thinking stop is ", thinking_stop_.size(), " tokens), capacity ", backend.capacity());
+    STRIX_CHECK(std::count(thinking_stop_.begin(), thinking_stop_.end(), tok.id_of("</think>")) == 1,
+                "Engine: the thinking stop text doesn't tokenize to exactly one </think>");
+    for (const auto &n : nudge_)
+        STRIX_CHECK(!n.empty() && (int64_t)n.size() <= backend.max_chunk() &&
+                        std::count(n.begin(), n.end(), tok.id_of("</think>")) == 0,
+                    "Engine: a thinking nudge tokenizes to ", n.size(), " tokens (backend chunk ", backend.max_chunk(),
+                    ") or contains </think> - it must leave the think block open");
+    STRIX_CHECK(!think_close_.empty() && think_close_.front() == think_end_ &&
+                    std::count(think_close_.begin(), think_close_.end(), think_end_) == 1 &&
+                    (int64_t)think_close_.size() + 1 <= backend.max_chunk(),
+                "Engine: kThinkCloseBeforeCall tokenizes to ", think_close_.size(),
+                " tokens, expected </think> first and only once, and room for it + <tool_call> in a backend chunk of ",
+                backend.max_chunk());
+    STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
+    STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
+                ", expected 1..15");
+    STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
+                "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
+    (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
+
+    slots_.reserve(owned_backends_.size());
+    for (size_t i = 0; i < owned_backends_.size(); ++i) {
+        slots_.push_back({(int)i, owned_backends_[i].get(), {}, 0, false});
+        slots_.back().be->reset();
+    }
+    stats_.slots = (int64_t)slots_.size();
+    idle_since_ = now_s();
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        workers_.emplace_back([this, i] { worker((int)i); });
+    }
+}
+
+Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
+    : tok_(tok),
       options_(options),
       cache_(options.cache),
       capacity_(backend.capacity()),
@@ -71,9 +125,12 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
-    be_.reset();
+
+    slots_.push_back({0, &backend, {}, 0, false});
+    slots_.back().be->reset();
+    stats_.slots = 1;
     idle_since_ = now_s();
-    thread_ = std::thread([this] { worker(); });
+    workers_.emplace_back([this] { worker(0); });
 }
 
 Engine::Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache, float mtp_margin)
@@ -89,7 +146,9 @@ Engine::~Engine() {
         stop_ = true;
     }
     cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
+    for (auto &t : workers_) {
+        if (t.joinable()) t.join();
+    }
     for (Job &j : queue_) {
         GenerationResult r;
         r.finish_reason = "error", r.error = "server shutting down";
@@ -115,9 +174,9 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
         STRIX_CHECK(fatal_.empty(), "Engine::submit: the GPU failed on an earlier request (", fatal_,
                     "); nothing runs until the server restarts");
         // One line from the HTTP thread for a request that waits; its block prints when it starts.
-        if (stats_.busy || !queue_.empty())
-            slog(LogLevel::Info, "Request %lld queued: %s ahead of it (Request %lld running)", (long long)req.id,
-                 fmt_n((long long)queue_.size() + stats_.busy).c_str(), (long long)running_id_);
+        if (stats_.busy >= (int64_t)slots_.size() || !queue_.empty())
+            slog(LogLevel::Info, "Request %lld queued: %s ahead of it (%lld of %lld slots busy)", (long long)req.id,
+                 fmt_n((long long)queue_.size() + 1).c_str(), (long long)stats_.busy, (long long)slots_.size());
         queue_.push_back({std::move(req), std::move(sink), now_s()});
         ++stats_.queued;
     }
@@ -131,41 +190,86 @@ EngineStats Engine::stats() const {
     return s;
 }
 
-void Engine::worker() {
+BackendStats Engine::backend_stats() const {
+    BackendStats total{};
+    for (const auto &slot : slots_) {
+        BackendStats s = slot.be->backend_stats();
+        total.ple_gathers += s.ple_gathers;
+        total.ple_gather_seconds += s.ple_gather_seconds;
+        total.ple_waits += s.ple_waits;
+        total.ple_wait_seconds += s.ple_wait_seconds;
+        total.ple_wait_max_seconds = std::max(total.ple_wait_max_seconds, s.ple_wait_max_seconds);
+        total.ple_prefetches += s.ple_prefetches;
+        total.ple_prefetch_seconds += s.ple_prefetch_seconds;
+        total.ple_prefetch_skipped += s.ple_prefetch_skipped;
+        total.vision_images += s.vision_images;
+        total.vision_patches += s.vision_patches;
+        total.vision_merged_tokens += s.vision_merged_tokens;
+        total.vision_tower_seconds += s.vision_tower_seconds;
+        total.vision_tower_max_seconds = std::max(total.vision_tower_max_seconds, s.vision_tower_max_seconds);
+        total.ngram_rows_requested += s.ngram_rows_requested;
+        total.ngram_rows_unique += s.ngram_rows_unique;
+        total.ngram_rows_cached += s.ngram_rows_cached;
+        total.ngram_rows_read += s.ngram_rows_read;
+        total.ngram_rows_prefetched += s.ngram_rows_prefetched;
+    }
+    return total;
+}
+
+void Engine::worker(int slot_id) {
+    Slot &slot = slots_[(size_t)slot_id];
     for (;;) {
         Job job;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-            if (stop_) return;
+            cv_.wait(lock, [&] { return stop_ || !fatal_.empty() || !queue_.empty(); });
+            if (stop_ || !fatal_.empty()) return;
             job = std::move(queue_.front());
             queue_.pop_front();
-            --stats_.queued, stats_.busy = 1;
-            running_id_ = job.req.id;
+            --stats_.queued;
+            ++stats_.busy;
+            slot.busy = true;
+            slot.running_id = job.req.id;
         }
-        run(job);
-        if (!fatal_pending_.empty()) {
+        run(slot, job);
+        std::string my_fatal;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            my_fatal = fatal_pending_;
+        }
+        if (!my_fatal.empty()) {
             std::deque<Job> failed;
             {
                 std::lock_guard<std::mutex> lock(mu_);
-                fatal_ = fatal_pending_;
+                fatal_ = my_fatal;
+                stop_ = true;
                 failed.swap(queue_);
-                stats_.queued = 0, stats_.busy = 0, running_id_ = 0;
+                stats_.queued = 0;
+                --stats_.busy;
+                slot.busy = false;
+                slot.running_id = 0;
             }
+            cv_.notify_all();
             for (Job &j : failed) {
                 GenerationResult r;
-                r.finish_reason = "error", r.error = "the GPU failed on an earlier request (" + fatal_pending_ +
+                r.finish_reason = "error", r.error = "the GPU failed on an earlier request (" + my_fatal +
                                                      "); the server is restarting";
                 j.sink->on_done(r);
             }
-            if (options_.on_fatal) options_.on_fatal(fatal_pending_);
+            if (options_.on_fatal) options_.on_fatal(my_fatal);
             return;  // nothing runs on this context again
         }
-        std::lock_guard<std::mutex> lock(mu_);
-        stats_.busy = 0, running_id_ = 0;
-        idle_since_ = now_s();
-        stats_.live_tokens = (int64_t)seq_.size();
-        stats_.snapshot_pos = be_.snapshot_pos(LmBackend::kTurnSlot);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            --stats_.busy;
+            slot.busy = false;
+            slot.running_id = 0;
+            if (stats_.busy == 0 && queue_.empty()) {
+                idle_since_ = now_s();
+            }
+            stats_.live_tokens = (int64_t)slot.seq.size();
+            stats_.snapshot_pos = slot.be->snapshot_pos(LmBackend::kTurnSlot);
+        }
     }
 }
 
@@ -174,17 +278,17 @@ std::string Engine::fatal_error() const {
     return fatal_;
 }
 
-int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
+int64_t Engine::resume_point(Slot &slot, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
     from_disk = false, from_ram = false;
     const int64_t P = (int64_t)prompt.size();
     int64_t lcp = 0;
-    while (lcp < (int64_t)seq_.size() && lcp < P && seq_[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
+    while (lcp < (int64_t)slot.seq.size() && lcp < P && slot.seq[(size_t)lcp] == prompt[(size_t)lcp]) ++lcp;
     // In memory: the live state if the prompt extends it, else the better of the snapshots.
     int64_t best = 0, how = -2;  // -1 = live, >= 0 = slot
-    if (lcp == (int64_t)seq_.size() && lcp < P && be_.pos() == lcp) best = lcp, how = -1;
-    for (int slot : {LmBackend::kTurnSlot, LmBackend::kSystemSlot, LmBackend::kUserSlot}) {
-        const int64_t sp = be_.snapshot_pos(slot);
-        if (sp > best && sp <= lcp && sp < P && be_.can_restore_snapshot(slot)) best = sp, how = slot;
+    if (lcp == (int64_t)slot.seq.size() && lcp < P && slot.be->pos() == lcp) best = lcp, how = -1;
+    for (int s : {LmBackend::kTurnSlot, LmBackend::kSystemSlot, LmBackend::kUserSlot}) {
+        const int64_t sp = slot.be->snapshot_pos(s);
+        if (sp > best && sp <= lcp && sp < P && slot.be->can_restore_snapshot(s)) best = sp, how = s;
     }
     // In the prompt cache (RAM, else disk), if it covers more.
     if (cache_) {
@@ -195,7 +299,7 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
             bool ram = false;
             int64_t delta_from = 0;
             const bool loaded = cache_->with_state(prompt, dn, [&](const HostBuffer &state, int64_t from, int64_t to) {
-                be_.import_state(state, to, from);  // a delta entry: its base (0, base), then the delta (base, dn)
+                slot.be->import_state(state, to, from);  // a delta entry: its base (0, base), then the delta (base, dn)
                 bytes += state.size();
                 if (from > 0) delta_from = from;
             }, &ram);
@@ -207,7 +311,7 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
                 slog_row(LogLevel::Info, "", "%s, %s MB loaded in %s ms", what.c_str(), fmt_rate(bytes / 1e6, 0).c_str(),
                          fmt_rate((now_s() - t0) * 1e3, 0).c_str());
                 from_ram = ram;
-                seq_.assign(prompt.begin(), prompt.begin() + dn);
+                slot.seq.assign(prompt.begin(), prompt.begin() + dn);
                 from_disk = true;
                 return dn;
             }
@@ -228,8 +332,8 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
         return 0;
     }
     if (how >= 0) {
-        be_.restore_snapshot((int)how);
-        seq_.resize((size_t)best);
+        slot.be->restore_snapshot((int)how);
+        slot.seq.resize((size_t)best);
         slog_row(LogLevel::Info, "resume", "%s of %s tokens from the GPU snapshot at %s", fmt_n(best).c_str(),
                  fmt_n(P).c_str(),
                  how == LmBackend::kTurnSlot     ? "the previous prompt's end"
@@ -237,20 +341,20 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
                                                  : "the start of the previous prompt's last user message");
         return best;
     }
-    be_.reset();
-    seq_.clear();
+    slot.be->reset();
+    slot.seq.clear();
     none();
     return 0;
 }
 
-void Engine::capture(const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason) {
+void Engine::capture(const Slot &slot, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason) {
     // A side channel: a failure here is logged as an error and never touches the session or the response.
     try {
         const int64_t P = (int64_t)req.prompt.size();
-        STRIX_CHECK((int64_t)seq_.size() >= P && std::equal(req.prompt.begin(), req.prompt.end(), seq_.begin()),
-                    "Engine::capture: the session (", seq_.size(), " tokens) doesn't start with the ", P, "-token prompt");
+        STRIX_CHECK((int64_t)slot.seq.size() >= P && std::equal(req.prompt.begin(), req.prompt.end(), slot.seq.begin()),
+                    "Engine::capture: the session (", slot.seq.size(), " tokens) doesn't start with the ", P, "-token prompt");
         CaptureRecord rec;
-        rec.id = req.id, rec.prompt_n = P, rec.tokens = seq_, rec.steps = steps;
+        rec.id = req.id, rec.prompt_n = P, rec.tokens = slot.seq, rec.steps = steps;
         rec.tools = req.parser.tools && req.parser.tools->is_array() ? (int64_t)req.parser.tools->as_array("tools").size() : 0;
         rec.one_shot = req.one_shot, rec.user_turn = req.user_turn, rec.finish = reason;
         rec.mtp_draft = options_.mtp_draft, rec.mtp_margin = options_.mtp_margin;
@@ -341,20 +445,26 @@ void log_footer(const GenerationResult &r) {
 
 }  // namespace
 
-void Engine::run(Job &job) {
+void Engine::run(Slot &slot, Job &job) {
     GenerationRequest &req = job.req;
     GenerationSink &sink = *job.sink;
     GenerationResult res;
     const double t_start = now_s();
     res.queue_ms = (t_start - job.enqueued) * 1e3;
     res.prompt_tokens = (int64_t)req.prompt.size();
-    const BackendStats b0 = be_.backend_stats();
+    LmBackend &be = *slot.be;
+    std::vector<int32_t> &seq = slot.seq;
+    const BackendStats b0 = be.backend_stats();
     // The request's log block (serve/log.hpp): the rule, the id and the HTTP layer's rows now; the footer (log_footer)
     // after the saves - whichever way run() returns - then a blank line before the next block.
     // The blank line is one no-break space (U+00A0): journald drops a line that is empty or only ASCII whitespace
     // after the "<N>" prefix.
     slog(LogLevel::Info, "%s", kLogRule);
-    slog(LogLevel::Info, "Request %lld", (long long)req.id);
+    if (slots_.size() > 1) {
+        slog(LogLevel::Info, "Request %lld (slot %d)", (long long)req.id, slot.id);
+    } else {
+        slog(LogLevel::Info, "Request %lld", (long long)req.id);
+    }
     for (const auto &[label, text] : req.log_header) slog_row(LogLevel::Info, label.c_str(), "%s", text.c_str());
     if (!options_.degraded.empty())
         slog_row(LogLevel::Warning, "degraded", "WARNING: performance degraded - %s (the startup WARNINGs say what each costs)",
@@ -369,7 +479,7 @@ void Engine::run(Job &job) {
     const auto finish = [&](const std::string &reason) {
         res.finish_reason = reason;
         res.total_ms = (now_s() - job.enqueued) * 1e3;
-        const BackendStats b = be_.backend_stats();
+        const BackendStats b = be.backend_stats();
         res.backend.ngram_rows_requested = b.ngram_rows_requested - b0.ngram_rows_requested;
         res.backend.ngram_rows_unique = b.ngram_rows_unique - b0.ngram_rows_unique;
         res.backend.ngram_rows_cached = b.ngram_rows_cached - b0.ngram_rows_cached;
@@ -410,10 +520,10 @@ void Engine::run(Job &job) {
                     "Engine::run: ", req.prefill_images.size(), " prefill images with ",
                     req.image_pos3.size() / 3, " triple rows - an image prompt carries both");
         if (has_images) {
-            STRIX_CHECK(be_.has_vision(), "Engine::run: an image prompt on a backend without a vision tower");
+            STRIX_CHECK(be.has_vision(), "Engine::run: an image prompt on a backend without a vision tower");
             STRIX_CHECK(req.image_pos3.size() == 3 * req.prompt.size(),
-                        "Engine::run: ", req.image_pos3.size() / 3, " walk rows for a prompt of ",
-                        req.prompt.size());
+                    "Engine::run: ", req.image_pos3.size() / 3, " walk rows for a prompt of ",
+                    req.prompt.size());
             STRIX_CHECK(!req.cache_key.empty() && req.cache_key.size() == req.prompt.size(),
                         "Engine::run: an image prompt must carry its cache-key stream (",
                         req.cache_key.size(), " ids for a prompt of ", req.prompt.size(), ")");
@@ -428,17 +538,17 @@ void Engine::run(Job &job) {
         const int64_t P = (int64_t)prompt.size();
         bool from_disk = false, from_ram = false;
         int64_t live_common = 0;  // before resume_point moves the live session
-        while (live_common < (int64_t)seq_.size() && live_common < P && seq_[(size_t)live_common] == prompt[(size_t)live_common])
+        while (live_common < (int64_t)seq.size() && live_common < P && seq[(size_t)live_common] == prompt[(size_t)live_common])
             ++live_common;
-        const int64_t live_n = (int64_t)seq_.size();
-        int64_t start = resume_point(prompt, req.id, from_disk, from_ram);
+        const int64_t live_n = (int64_t)seq.size();
+        int64_t start = resume_point(slot, prompt, req.id, from_disk, from_ram);
         if (has_images && start > 0) {  // a state saved mid-image (or a key collision): the image rows would
             bool mid_image = false;     // not be in it - prefill the whole prompt instead
             for (const PrefillImage &im : req.prefill_images)
                 mid_image |= start > im.row_start && start < im.row_start + im.rows;
             if (mid_image) {
-                be_.reset();
-                seq_.clear();
+                be.reset();
+                seq.clear();
                 slog_row(LogLevel::Info, "resume", "lost: a saved state ends inside an image block - all %s "
                          "tokens prefilled", fmt_n(P).c_str());
                 start = 0;
@@ -495,7 +605,7 @@ void Engine::run(Job &job) {
             return nullptr;
         };
         auto chunk_end = [&](int64_t pos) {
-            int64_t end = std::min(P, pos + be_.max_chunk());
+            int64_t end = std::min(P, pos + be.max_chunk());
             if (cut > pos && cut < end) end = cut;
             if (ust > pos && ust < end) end = ust;
             if (save_sys && sys > pos && sys < end) end = sys;
@@ -504,7 +614,7 @@ void Engine::run(Job &job) {
                     const int64_t blk_end = im->row_start + im->rows;
                     STRIX_CHECK(blk_end <= end, "Engine::run: the image block at row ", im->row_start,
                                 " ends at ", blk_end, ", past the forward end ", end, " (max chunk ",
-                                be_.max_chunk(), ") - the block must fit one forward");
+                                be.max_chunk(), ") - the block must fit one forward");
                     end = blk_end;
                 }
                 for (const PrefillImage &im : req.prefill_images)
@@ -516,11 +626,11 @@ void Engine::run(Job &job) {
         const auto progress = [&](int64_t pos) { sink.on_prefill({P, start, pos, (now_s() - t_prefill) * 1e3}); };
         progress(start);
         if (start == ust)  // resumed exactly at the user turn: its start state is the live state right now
-            be_.save_snapshot(LmBackend::kUserSlot);
+            be.save_snapshot(LmBackend::kUserSlot);
         for (int64_t pos = start; pos < P;) {
             const int64_t end = chunk_end(pos);
             if (end < P)  // the real ids: the lookahead feeds ple_ngram_ids, and the negative cache-key ids
-                be_.set_lookahead(std::vector<int32_t>(req.prompt.begin() + end,  // are matchers, never model
+                be.set_lookahead(std::vector<int32_t>(req.prompt.begin() + end,  // are matchers, never model
                                   req.prompt.begin() + chunk_end(end)));          // inputs (vision)
             if (const PrefillImage *im = block_for(pos)) {  // the whole block (chunk_end checked), in one forward
                 STRIX_CHECK(pos == im->row_start && end == im->row_start + im->rows,
@@ -541,20 +651,20 @@ void Engine::run(Job &job) {
                              (long long)im->prefill.grid_h, (long long)im->prefill.grid_w, (now_s() - t_dec) * 1e3);
                     im = &decoded;
                 }
-                logits = be_.forward_image_prefill(
+                logits = be.forward_image_prefill(
                     std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end), *im,
                     std::vector<int64_t>(req.image_pos3.begin() + 3 * pos, req.image_pos3.begin() + 3 * end),
                     end == P ? 1 : 0, cands, n_valid, end == P ? masks_for({}) : nullptr);
             } else {
-                logits = be_.forward_rows(std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end),
+                logits = be.forward_rows(std::vector<int32_t>(req.prompt.begin() + pos, req.prompt.begin() + end),
                                           end == P ? 1 : 0, cands, n_valid,
                                           end == P ? masks_for({}) : nullptr);
             }
-            seq_.insert(seq_.end(), prompt.begin() + pos, prompt.begin() + end);
+            seq.insert(seq.end(), prompt.begin() + pos, prompt.begin() + end);
             pos = end;
-            if (pos == cut) be_.save_snapshot(LmBackend::kTurnSlot);
-            if (pos == ust) be_.save_snapshot(LmBackend::kUserSlot);
-            if (save_sys && pos == sys) be_.save_snapshot(LmBackend::kSystemSlot);
+            if (pos == cut) be.save_snapshot(LmBackend::kTurnSlot);
+            if (pos == ust) be.save_snapshot(LmBackend::kUserSlot);
+            if (save_sys && pos == sys) be.save_snapshot(LmBackend::kSystemSlot);
             progress(pos);
             if (pos < P && sink.cancelled()) {
                 res.prompt_ms = (now_s() - t_start) * 1e3;
@@ -646,8 +756,8 @@ void Engine::run(Job &job) {
             res.completion_tokens += n, res.fed_tokens += n;
             ++res.think_closed_for_call;
             ++res.decode_forwards;
-            logits = be_.forward_rows(fed, 1, cands, n_valid, masks_for({}));
-            seq_.insert(seq_.end(), fed.begin(), fed.end());
+            logits = be.forward_rows(fed, 1, cands, n_valid, masks_for({}));
+            seq.insert(seq.end(), fed.begin(), fed.end());
             step(kThinkingStopStep, 0, n);  // the fed close, then the sampled <tool_call> as a step of its own
             step(0, 0, 1);
             return true;
@@ -669,8 +779,8 @@ void Engine::run(Job &job) {
                 const bool nudge_due = options_.think_nudge && parser.in_reasoning() && watch.due() != 0;
                 if (budget_due || nudge_due) {
                     ++res.decode_forwards;
-                    logits = be_.forward_rows({carry}, 1, cands, n_valid, masks_for({}));
-                    seq_.push_back(carry);
+                    logits = be.forward_rows({carry}, 1, cands, n_valid, masks_for({}));
+                    seq.push_back(carry);
                     step(0, 0, 1);
                     carry = -1;
                 }
@@ -691,8 +801,8 @@ void Engine::run(Job &job) {
                 }
                 if (!events.empty()) sink.on_events(events), events.clear();
                 res.completion_tokens += n;
-                logits = be_.forward_rows(thinking_stop_, 1, cands, n_valid, masks_for({}));
-                seq_.insert(seq_.end(), thinking_stop_.begin(), thinking_stop_.end());
+                logits = be.forward_rows(thinking_stop_, 1, cands, n_valid, masks_for({}));
+                seq.insert(seq.end(), thinking_stop_.begin(), thinking_stop_.end());
                 step(kThinkingStopStep, 0, n);
                 continue;
             }
@@ -715,8 +825,8 @@ void Engine::run(Job &job) {
                         res.completion_tokens += n;
                         ++res.think_nudges;
                         res.fed_tokens += n;
-                        logits = be_.forward_rows(nt, 1, cands, n_valid, masks_for({}));
-                        seq_.insert(seq_.end(), nt.begin(), nt.end());
+                        logits = be.forward_rows(nt, 1, cands, n_valid, masks_for({}));
+                        seq.insert(seq.end(), nt.begin(), nt.end());
                         step(kThinkingStopStep, 0, n);
                         watch.fired();
                         continue;
@@ -760,16 +870,16 @@ void Engine::run(Job &job) {
             // mtp_margin (and no end-of-turn); one verify forward of id + the drafts. Each position's token is still
             // sampled from the trunk's own logits (row j) - a draft only saves the forward when it matches. No drafts
             // when id brought the budget's stop due: the stop follows id directly.
-            if (be_.has_mtp() && !stop_due()) {
+            if (be.has_mtp() && !stop_due()) {
                 const int64_t room = req.max_tokens - res.completion_tokens;  // >= 1 here
                 const int64_t steps = std::min(options_.mtp_draft, room);
                 std::vector<int32_t> ids{id};
                 // Each token's PLE rows start loading as soon as it is known, while the next draft runs - so the
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
-                be_.prefetch_ple(ids, 0);
+                be.prefetch_ple(ids, 0);
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
                 for (int64_t step = 0; step < steps; ++step) {
-                    const Top2 t = be_.forward_mtp_top2(ids.back(), step);
+                    const Top2 t = be.forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
                     if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
@@ -781,13 +891,13 @@ void Engine::run(Job &job) {
                         draft_at = so->after(draft_at, d);
                     }
                     ids.push_back(d);
-                    if (step + 1 < steps) be_.prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
+                    if (step + 1 < steps) be.prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {
                     res.mtp_drafted_tokens += k;
                     ++res.decode_forwards;
-                    LogitRows ml = be_.forward_verify_rows(
+                    LogitRows ml = be.forward_verify_rows(
                         ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
                     STRIX_CHECK(ml.rows == k + 1, "Engine: verify of ", k + 1, " tokens returned ", ml.rows,
                                 " logits rows");
@@ -820,22 +930,25 @@ void Engine::run(Job &job) {
                         }
                     }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
-                        be_.keep_verify_prefix(ids, j + 1);
-                        seq_.insert(seq_.end(), ids.begin(), ids.begin() + j + 1);
+                        be.keep_verify_prefix(ids, j + 1);
+                        seq.insert(seq.end(), ids.begin(), ids.begin() + j + 1);
                         step(k, j, j + 1);
                         logits = ml.row_of(j);
                         continue;
                     }
                     if (ended) {  // keep id + the j accepted drafts in the session, drop the rest
-                        if (j < k) be_.keep_verify_prefix(ids, j + 1);
-                        else be_.keep_verify();
-                        seq_.insert(seq_.end(), ids.begin(), ids.begin() + j + 1);
+                        if (j < k) {
+                            be.keep_verify_prefix(ids, j + 1);
+                        } else {
+                            be.keep_verify();
+                        }
+                        seq.insert(seq.end(), ids.begin(), ids.begin() + j + 1);
                         step(k, j, j + 1);
                         break;
                     }
                     if (j == k) {  // all accepted: the last row is the next token's logits
-                        be_.keep_verify();
-                        seq_.insert(seq_.end(), ids.begin(), ids.end());
+                        be.keep_verify();
+                        seq.insert(seq.end(), ids.begin(), ids.end());
                         step(k, k, k + 1);
                         logits = ml.row_of(k);
                         continue;
@@ -848,10 +961,10 @@ void Engine::run(Job &job) {
                     {  // v's PLE rows load while the prefix is kept (its forward - the next verify's row 0 - comes soon)
                         std::vector<int32_t> next(ids.begin(), ids.begin() + j + 1);
                         next.push_back(v);
-                        be_.prefetch_ple(next, j + 1);
+                        be.prefetch_ple(next, j + 1);
                     }
-                    be_.keep_verify_prefix(ids, j + 1);
-                    seq_.insert(seq_.end(), ids.begin(), ids.begin() + j + 1);
+                    be.keep_verify_prefix(ids, j + 1);
+                    seq.insert(seq.end(), ids.begin(), ids.begin() + j + 1);
                     if (v == im_end_ || v == eot_) {
                         step(k, j, j + 1);
                         reason = "stop";
@@ -879,8 +992,8 @@ void Engine::run(Job &job) {
                 }
             }
             ++res.decode_forwards;
-            logits = be_.forward_rows({id}, 1, cands, n_valid, masks_for({}));
-            seq_.push_back(id);
+            logits = be.forward_rows({id}, 1, cands, n_valid, masks_for({}));
+            seq.push_back(id);
             step(0, 0, 1);
         }
         parser.finish(events);
@@ -909,22 +1022,22 @@ void Engine::run(Job &job) {
         finish(reason);
         // Captures replay token streams - an image prompt's stream carries image_pad rows without their
         // pixels, so image requests are not captured.
-        if (!options_.capture_dir.empty() && reason != "cancelled" && !has_images) capture(req, steps, reason);
+        if (!options_.capture_dir.empty() && reason != "cancelled" && !has_images) capture(slot, req, steps, reason);
         // After the response: the new prefixes go to the prompt cache's RAM tier (the disk only later, if at all).
         if (cache_ && reason != "cancelled") {
             const double t0 = now_s();
             int saved = 0, rows = 0;  // rows: the first gets the "cache" label
-            const auto save = [&](int slot, int64_t n, PromptCache::Kind kind, const char *what) {
+            const auto save = [&](int snap_slot, int64_t n, PromptCache::Kind kind, const char *what) {
                 // Already cached first: a request resumed exactly at its turn entry has no snapshot there, and needs none.
                 const char *skip = n <= 0                                ? "no such point in the prompt"
                                    : cache_->contains(prompt.data(), n) ? nullptr
-                                   : be_.snapshot_pos(slot) != n         ? "no snapshot there"
-                                   : !be_.can_restore_snapshot(slot)     ? "snapshot no longer valid"
+                                   : be.snapshot_pos(snap_slot) != n         ? "no snapshot there"
+                                   : !be.can_restore_snapshot(snap_slot)     ? "snapshot no longer valid"
                                                                          : "";
                 if (skip == nullptr) return;  // already cached
                 if (*skip) {
                     slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - %s (snapshot at %s)",
-                             what, fmt_n(n).c_str(), skip, fmt_n(be_.snapshot_pos(slot)).c_str());
+                             what, fmt_n(n).c_str(), skip, fmt_n(be.snapshot_pos(snap_slot)).c_str());
                     return;
                 }
                 const double t_e = now_s();
@@ -936,7 +1049,7 @@ void Engine::run(Job &job) {
                                                                       : cache_->take_replaced_buffer(prompt.data(), n, base_n);
                 if (state.capacity() == 0) state = cache_->take_buffer();
                 // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin.
-                const uint64_t want = be_.snapshot_bytes(slot, base_n);
+                const uint64_t want = be.snapshot_bytes(snap_slot, base_n);
                 if (want > state.capacity() && !cache_->make_room_for(want - state.capacity())) {
                     slog_row(LogLevel::Warning, rows++ ? "" : "cache",
                              "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s "
@@ -946,7 +1059,7 @@ void Engine::run(Job &job) {
                     cache_->give_back(std::move(state));
                     return;
                 }
-                be_.export_snapshot(slot, state, base_n);
+                be.export_snapshot(snap_slot, state, base_n);
                 const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
                 const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
                 // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
@@ -978,19 +1091,22 @@ void Engine::run(Job &job) {
         slog_row(LogLevel::Error, "error", "FATAL: %s", e.what());
         slog_row(LogLevel::Error, "", "FATAL: no request can run on this GPU context: failing the queued ones, refusing "
                  "new ones%s", options_.on_fatal ? ", the server exits for its supervisor to restart it" : "");
-        fatal_pending_ = e.what();
-        seq_.clear();
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            fatal_pending_ = e.what();
+        }
+        seq.clear();
         res.error = e.what();
         finish("error");
     } catch (const std::exception &e) {
         // A failed forward leaves the session unusable until reset: start clean for the next request.
         slog_row(LogLevel::Error, "error", "ERROR: %s", e.what());
         try {
-            be_.reset();
+            be.reset();
         } catch (const std::exception &e2) {
             slog_row(LogLevel::Error, "", "ERROR: the reset after it failed too: %s", e2.what());
         }
-        seq_.clear();
+        seq.clear();
         res.error = e.what();
         finish("error");
     }

@@ -203,7 +203,14 @@ int run(int argc, char **argv) {
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
     }
-    Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format);
+    const int64_t num_slots = settings.integer("slots");
+    slog(LogLevel::Info, "startup: serving slots = %lld", (long long)num_slots);
+    std::vector<std::unique_ptr<Qwen4ExpBackend>> backends;
+    backends.reserve(num_slots);
+    for (int64_t i = 0; i < num_slots; ++i) {
+        backends.push_back(std::make_unique<Qwen4ExpBackend>(
+            model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format));
+    }
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");
     {
@@ -236,7 +243,7 @@ int run(int argc, char **argv) {
         mi.prompt_cache = cache_gib > 0;
         mi.ram_margin = cache_opts.ram_margin;
         mi.capacity = capacity;
-        mi.state_bytes = [&backend](int64_t n) { return backend.state_bytes_at(n); };
+        mi.state_bytes = [&backends](int64_t n) { return backends.front()->state_bytes_at(n); };
         mi.row_cache_rows = table ? table->cache_rows() : 0;
         mi.row_cache_row_bytes = table ? table->cache_bytes_per_row() : 0;
         mi.row_cache_min_rows = std::min<int64_t>(mi.row_cache_rows, NgramTableRows::kDefaultCacheRows);
@@ -260,7 +267,7 @@ int run(int argc, char **argv) {
     }
     std::unique_ptr<PromptCache> cache;
     if (cache_gib > 0) {
-        cache = std::make_unique<PromptCache>(cache_dir, (uint64_t)cache_gib << 30, backend.state_fingerprint(), cache_opts);
+        cache = std::make_unique<PromptCache>(cache_dir, (uint64_t)cache_gib << 30, backends.front()->state_fingerprint(), cache_opts);
         const PromptCacheStats s = cache->stats();
         slog(LogLevel::Info, "startup: prompt cache %s: %lld entries, %.1f of %lld GiB (%lld invalid dropped)",
              cache_dir.c_str(), (long long)s.entries, (double)s.bytes / (1ull << 30), (long long)cache_gib, (long long)s.invalid);
@@ -318,14 +325,18 @@ int run(int argc, char **argv) {
         gpu_fatal = true;
         if (server_ptr) server_ptr->stop();
     };
-    Engine engine(backend, tok, eng_opts);
+    std::vector<std::unique_ptr<LmBackend>> be_ptrs;
+    be_ptrs.reserve(backends.size());
+    for (auto &b : backends) be_ptrs.push_back(std::move(b));
+    Engine engine(std::move(be_ptrs), tok, eng_opts);
     HttpServer server(engine, tok, cfg);
     const int port = server.bind();
     server_ptr = &server;
     g_server = &server;
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
-    slog(LogLevel::Info, "startup: %s", backend.describe().c_str());
+    slog(LogLevel::Info, "startup: %s (%lld slot%s)", engine.backend().describe().c_str(),
+         (long long)num_slots, num_slots == 1 ? "" : "s");
     slog(LogLevel::Info, "startup: serving %s on %s:%d", cfg.model_id.c_str(), cfg.host.c_str(), port);
     server.serve();
     g_server = nullptr;

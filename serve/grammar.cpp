@@ -330,6 +330,7 @@ int32_t GrammarAutomaton::intern(GrammarMatcher matcher) {
 
 int32_t GrammarAutomaton::next(int32_t state, uint8_t byte) {
     const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(state)) << 8) | byte;
+    std::lock_guard<std::mutex> lock(mu_);
     const auto found = transitions_.find(key);
     if (found != transitions_.end()) return found->second;
     check_state(state, "GrammarAutomaton::next");
@@ -348,16 +349,19 @@ int32_t GrammarAutomaton::next(int32_t state, std::string_view bytes) {
 }
 
 bool GrammarAutomaton::accepting(int32_t state) const {
+    std::lock_guard<std::mutex> lock(mu_);
     check_state(state, "GrammarAutomaton::accepting");
     return accepting_[state] != 0;
 }
 
 bool GrammarAutomaton::can_continue(int32_t state) const {
+    std::lock_guard<std::mutex> lock(mu_);
     check_state(state, "GrammarAutomaton::can_continue");
     return can_continue_[state] != 0;
 }
 
 const std::vector<uint32_t> *GrammarAutomaton::cached_mask(int32_t state, const void *owner) const {
+    std::lock_guard<std::mutex> lock(mu_);
     STRIX_CHECK(mask_owner_ == nullptr || mask_owner_ == owner, "grammar automaton: masks were cached for another "
                 "vocabulary (one automaton serves one tokenizer)");
     const auto found = masks_.find(state);
@@ -365,6 +369,7 @@ const std::vector<uint32_t> *GrammarAutomaton::cached_mask(int32_t state, const 
 }
 
 const std::vector<uint32_t> &GrammarAutomaton::store_mask(int32_t state, const void *owner, std::vector<uint32_t> mask) {
+    std::lock_guard<std::mutex> lock(mu_);
     check_state(state, "GrammarAutomaton::store_mask");
     STRIX_CHECK(owner != nullptr, "grammar automaton: a cached mask needs its vocabulary's identity (got null)");
     STRIX_CHECK(mask_owner_ == nullptr || mask_owner_ == owner, "grammar automaton: masks were cached for another "

@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -160,8 +161,14 @@ public:
     int32_t next(int32_t state, std::string_view bytes);
     bool accepting(int32_t state) const;
     bool can_continue(int32_t state) const;
-    size_t state_count() const { return states_.size(); }
-    size_t transition_count() const { return transitions_.size(); }
+    size_t state_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return states_.size();
+    }
+    size_t transition_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return transitions_.size();
+    }
     const Grammar &grammar() const { return *grammar_; }
 
     // Token masks cached per state (serve/token_mask fills them; `owner` identifies the vocabulary they were made
@@ -171,12 +178,16 @@ public:
     // Pointers / references to cached masks stay valid until the next store_mask.
     const std::vector<uint32_t> &store_mask(int32_t state, const void *owner, std::vector<uint32_t> mask);
     static constexpr size_t kMaxCachedMasks = 2048;  // 31 KB each at the target's 248,320 rows: <= 62 MiB
-    size_t cached_mask_count() const { return masks_.size(); }
+    size_t cached_mask_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return masks_.size();
+    }
 
 private:
     int32_t intern(GrammarMatcher matcher);
     void check_state(int32_t state, const char *what) const;
 
+    mutable std::mutex mu_;
     std::shared_ptr<const Grammar> grammar_;
     bool colliding_hash_ = false;
     std::vector<GrammarMatcher> states_;
