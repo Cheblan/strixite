@@ -1948,6 +1948,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     const bool sep = m.shared_separate();
     const hipStream_t stream = s0.stream_;
     const int64_t n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
+    const int64_t Estack = D.experts + (sep ? 0 : 1);
 
     std::vector<int32_t> h_ids(B);
     for (int64_t k = 0; k < B; ++k) {
@@ -2130,7 +2131,6 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                             sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                             s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
 
-        const int64_t Estack = D.experts + (sep ? 0 : 1);
         if (use_grouped_moe) {
             const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
                                             ? kernels::MoeMath::WmmaF16
