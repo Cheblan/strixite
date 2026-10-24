@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
 
     std::vector<Qwen4ExpSession::BatchSlotStep> batch4 = {
-        {&s0, tok0}, {&s1, tok1}, {&s2, tok2}, {&s3, tok3}
+        {&s0, tok0, {}}, {&s1, tok1, {}}, {&s2, tok2, {}}, {&s3, tok3, {}}
     };
     std::vector<std::vector<float>> batch4_logits;
 
