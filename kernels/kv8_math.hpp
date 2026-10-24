@@ -132,4 +132,29 @@ struct PlainReader {
     __device__ inline uint4 v(int64_t row, int64_t col, int64_t) const { return *reinterpret_cast<const uint4 *>(vc + row * W + col); }
 };
 
+// Paged K/V reader: translates logical token rows to physical page blocks via a block table.
+// BlockSize is a power-of-two (e.g. 16 or 32) so row / BlockSize and row % BlockSize compile to bit shifts and masks.
+template <typename T, int BlockSize = 16>
+struct PagedReader {
+    const T *pool_k, *pool_v;
+    const int32_t *block_table;
+    int64_t W;
+    __host__ __device__ PagedReader(const void *pk, const void *pv, const int32_t *bt, int64_t w)
+        : pool_k(static_cast<const T *>(pk)), pool_v(static_cast<const T *>(pv)),
+          block_table(bt), W(w) {}
+
+    __device__ inline uint4 k(int64_t row, int64_t col, int64_t) const {
+        const int64_t b = row / BlockSize;
+        const int64_t o = row % BlockSize;
+        const int64_t pb = block_table[b];
+        return *reinterpret_cast<const uint4 *>(pool_k + (pb * BlockSize + o) * W + col);
+    }
+    __device__ inline uint4 v(int64_t row, int64_t col, int64_t) const {
+        const int64_t b = row / BlockSize;
+        const int64_t o = row % BlockSize;
+        const int64_t pb = block_table[b];
+        return *reinterpret_cast<const uint4 *>(pool_v + (pb * BlockSize + o) * W + col);
+    }
+};
+
 }  // namespace strix::kernels::kv8_math

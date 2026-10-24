@@ -30,6 +30,7 @@
 #include "runtime/device_buffer.hpp"
 #include "runtime/ngram_rows.hpp"
 #include "runtime/ngram_table.hpp"
+#include "runtime/page_pool.hpp"
 #include "runtime/ple_hash.hpp"
 #include "runtime/q4_device.hpp"
 #include "runtime/qweight.hpp"
@@ -299,22 +300,26 @@ struct ImageInput {
     int64_t grid_t = 0, grid_h = 0, grid_w = 0;
 };
 
-// The full-attention layers' K/V cache: in the activation dtype, or 8 bits (kernels/kv8.hpp). Q8 keeps ~56% of the
-// bytes; the rows of the newest incomplete 32-token group stay in a small tail in the activation dtype.
-enum class KvFormat { Act, Q8 };
-const char *kv_format_name(KvFormat f);  // "bf16" / "q8" (Act is named by the config as bf16)
-KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8; anything else throws
+// The full-attention layers' K/V cache: in the activation dtype, 8 bits (kernels/kv8.hpp), or paged blocks
+// (runtime/page_pool.hpp). Q8 keeps ~56% of the bytes; Paged dynamically allocates 32-token blocks from PagePool.
+enum class KvFormat { Act, Q8, Paged };
+const char *kv_format_name(KvFormat f);  // "bf16" / "q8" / "paged"
+KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8, "paged" -> Paged; anything else throws
 
 class Qwen4ExpSession {
 public:
     // mtp: keep the MTP draft head's state (its KV cache, filled for every position a forward runs) so
     // forward_mtp can draft; needs a model with the head. Off, forward_mtp throws and forwards skip that work.
-    // kv: the full-attention layers' K/V cache format (KvFormat; the MTP head's own K/V stays in the activation
-    // dtype either way).
+    // kv: the full-attention layers' K/V cache format (KvFormat).
+    // page_pool: optional shared page pool when kv == KvFormat::Paged (or auto-allocated if null).
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act);
+                    PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act,
+                    std::shared_ptr<PagePool> page_pool = nullptr);
     PrefillMath prefill_math() const { return prefill_math_; }
     KvFormat kv_format() const { return kv_format_; }
+    std::shared_ptr<PagePool> page_pool() const { return page_pool_; }
+    const std::vector<int32_t> &block_table() const { return block_table_host_; }
+    const DeviceBuffer<int32_t> &block_table_dev() const { return block_table_dev_; }
     // The kernel-step precision choices for every forward from now on (default: all exact).
     void set_precision(const PrecisionOptions &p);
     const PrecisionOptions &precision() const { return precision_; }
@@ -548,6 +553,11 @@ private:
     // or more.
     DeviceBuffer<uint8_t> kv8_stage_;
     DeviceBuffer<uint32_t> kv8_err_;
+    // KvFormat::Paged: dynamic 32-token blocks from PagePool
+    std::shared_ptr<PagePool> page_pool_;
+    std::vector<int32_t> block_table_host_;
+    DeviceBuffer<int32_t> block_table_dev_;
+    void ensure_paged_capacity(int64_t needed_pos);
     // Rewinds for can_restore: epoch e started when the session rewound to rewind_to_[e] (reset() = 0).
     std::vector<int64_t> rewind_to_{0};
     DeviceBuffer<uint8_t> ple_state_;

@@ -9,8 +9,9 @@
 namespace strix {
 
 Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp,
-                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv)
-    : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv),
+                                 int64_t mtp_vocab, const PrecisionOptions &precision, KvFormat kv,
+                                 std::shared_ptr<PagePool> page_pool)
+    : model_(model), session_(model, capacity, chunk, PrefillMath::WmmaBf16, use_mtp && model.has_mtp(), kv, std::move(page_pool)),
       snapshots_{session_.make_snapshot(), session_.make_snapshot(), session_.make_snapshot(),
                  session_.make_snapshot()} {
     STRIX_CHECK(mtp_vocab >= 0, "Qwen4ExpBackend: mtp_vocab ", mtp_vocab, ", expected >= 0 (0 = the whole vocabulary)");

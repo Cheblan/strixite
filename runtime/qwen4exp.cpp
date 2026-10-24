@@ -298,21 +298,33 @@ void Qwen4ExpSession::set_precision(const PrecisionOptions &p) {
 }
 
 const char *kv_format_name(KvFormat f) {
-    STRIX_CHECK(f == KvFormat::Act || f == KvFormat::Q8, "kv_format_name: unknown KvFormat ", (int)f);
-    return f == KvFormat::Q8 ? "q8" : "bf16";
+    STRIX_CHECK(f == KvFormat::Act || f == KvFormat::Q8 || f == KvFormat::Paged, "kv_format_name: unknown KvFormat ", (int)f);
+    if (f == KvFormat::Q8) return "q8";
+    if (f == KvFormat::Paged) return "paged";
+    return "bf16";
 }
 
 KvFormat parse_kv_format(const std::string &v) {
     if (v == "bf16") return KvFormat::Act;
     if (v == "q8") return KvFormat::Q8;
-    STRIX_FAIL("parse_kv_format: '", v, "', expected bf16 or q8");
+    if (v == "paged") return KvFormat::Paged;
+    STRIX_FAIL("parse_kv_format: '", v, "', expected bf16, q8, or paged");
 }
 
 Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
-                                 PrefillMath prefill_math, bool mtp, KvFormat kv)
+                                 PrefillMath prefill_math, bool mtp, KvFormat kv,
+                                 std::shared_ptr<PagePool> page_pool)
     : m_(model), capacity_(capacity), max_tokens_(max_tokens), prefill_math_(prefill_math), kv_format_(kv),
-      mtp_(mtp) {
-    STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8, "Qwen4ExpSession: unknown KV format ", (int)kv);
+      page_pool_(std::move(page_pool)), mtp_(mtp) {
+    if (page_pool_ != nullptr) {
+        kv_format_ = KvFormat::Paged;
+    } else if (kv_format_ == KvFormat::Paged) {
+        const Qwen4ExpDims &D = m_.dims();
+        page_pool_ = std::make_shared<PagePool>(capacity, D.hkv * D.hd, D.is_attention, m_.act(), mtp);
+    }
+    const bool paged = kv_format_ == KvFormat::Paged;
+    STRIX_CHECK(kv_format_ == KvFormat::Act || kv_format_ == KvFormat::Q8 || paged,
+                "Qwen4ExpSession: unknown KV format ", (int)kv_format_);
     STRIX_CHECK(prefill_math == PrefillMath::F32 || prefill_math == PrefillMath::WmmaBf16,
                 "Qwen4ExpSession: unknown prefill math ", (int)prefill_math);
     STRIX_CHECK(!mtp || model.has_mtp(), "Qwen4ExpSession: MTP asked for, but the loaded weights have no MTP head "
@@ -328,16 +340,16 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     const size_t e = es(m_.act());
     const int64_t M = max_tokens, n4 = D.H * D.d, A = D.top_k + 1;
     cap_blocks_ = capacity / kernels::kQsaBlock + 1;
-    const bool q8 = kv == KvFormat::Q8;
+    const bool q8 = kv_format_ == KvFormat::Q8;
     kv8_cap_ = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
     const int64_t W = D.hkv * D.hd;
     for (int64_t i = 0; i < D.layers; ++i) {
         const std::string tag = "layer " + std::to_string(i);
         const bool attn = D.is_attention[(size_t)i];
-        k_cache_.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "K cache " + tag)
-                                          : DeviceBuffer<uint8_t>());
-        v_cache_.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "V cache " + tag)
-                                          : DeviceBuffer<uint8_t>());
+        k_cache_.emplace_back(attn && !q8 && !paged ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "K cache " + tag)
+                                                    : DeviceBuffer<uint8_t>());
+        v_cache_.emplace_back(attn && !q8 && !paged ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "V cache " + tag)
+                                                    : DeviceBuffer<uint8_t>());
         kv8_store_.emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_bytes(kv8_cap_, W), "8-bit K/V " + tag)
                                            : DeviceBuffer<uint8_t>());
         for (int k = 0; k < 2; ++k)
@@ -428,8 +440,10 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "zero attention error");
     if (q8 && prefill_math_ == PrefillMath::WmmaBf16 && m_.act() == Act::BF16 && max_tokens >= kKv8StageMinTokens)
         kv8_stage_ = DeviceBuffer<uint8_t>((size_t)(2 * kv8_cap_ * W) * 2, "staged K | V (8-bit prefill)");
-    if (q8) {
+    if (q8 || paged) {
         kv_new_ = act_buf(2 * W, "new K | V rows");
+    }
+    if (q8) {
         kv8_err_ = DeviceBuffer<uint32_t>(3, "8-bit K/V error");
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "zero 8-bit K/V error");
     }
@@ -457,8 +471,10 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         mtp_proj_emb_ = act_buf(D.d, "MTP fc_embedding output");
         mtp_x_ = act_buf(n4, "MTP streams");
         mtp_prev_ = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP previous streams");
-        k_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP K cache");
-        v_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP V cache");
+        k_cache_mtp_ = !paged ? DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP K cache")
+                              : DeviceBuffer<uint8_t>();
+        v_cache_mtp_ = !paged ? DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP V cache")
+                              : DeviceBuffer<uint8_t>();
         block_keys_mtp_ = DeviceBuffer<uint8_t>((size_t)(cap_blocks_ * D.idx_d) * e, "MTP block keys");
         for (int k = 0; k < 2; ++k)
             tail_mtp_[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
@@ -480,6 +496,29 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamDestroy(stream_);
     }
     if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
+    if (kv_format_ == KvFormat::Paged && page_pool_ && !block_table_host_.empty()) {
+        page_pool_->block_mgr().free_blocks(block_table_host_.data(), block_table_host_.size());
+        block_table_host_.clear();
+    }
+}
+
+void Qwen4ExpSession::ensure_paged_capacity(int64_t needed_pos) {
+    if (kv_format_ != KvFormat::Paged) return;
+    const int64_t needed_blocks = (needed_pos + kPageBlockSize - 1) / kPageBlockSize;
+    if (needed_blocks <= static_cast<int64_t>(block_table_host_.size())) return;
+    const int64_t to_alloc = needed_blocks - static_cast<int64_t>(block_table_host_.size());
+    bool ok = page_pool_->block_mgr().allocate_blocks(to_alloc, block_table_host_);
+    STRIX_CHECK(ok, "Qwen4ExpSession: out of page pool blocks (requested ", to_alloc,
+                " blocks, free blocks: ", page_pool_->block_mgr().free_blocks(), ")");
+
+    if (block_table_dev_.size() < block_table_host_.size()) {
+        const size_t new_cap = std::max((size_t)cap_blocks_, block_table_host_.size());
+        block_table_dev_ = DeviceBuffer<int32_t>(new_cap, "block_table_dev");
+    }
+    STRIX_HIP_CHECK(hipMemcpyAsync(block_table_dev_.get(), block_table_host_.data(),
+                                   block_table_host_.size() * sizeof(int32_t),
+                                   hipMemcpyHostToDevice, stream_),
+                    "upload block_table_dev");
 }
 
 Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
@@ -873,6 +912,10 @@ void Qwen4ExpSession::reset() {
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero attention error");
     if (kv_format_ == KvFormat::Q8)
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero 8-bit K/V error");
+    if (kv_format_ == KvFormat::Paged && page_pool_ && !block_table_host_.empty()) {
+        page_pool_->block_mgr().free_blocks(block_table_host_.data(), block_table_host_.size());
+        block_table_host_.clear();
+    }
     pos_ = 0, tail_cur_ = 0, mtp_tail_cur_ = 0, broken_ = false, mtp_chain_step_ = -1, verify_pending_ = false;  // GDN states reset on the first call (reset_state); KV overwritten
     rope_delta_ = 0, history_ever_interleaved_ = false, verify_delta_before_ = 0, verify_ever_before_ = false,
         verify_hist_start_before_ = 0;
@@ -1464,6 +1507,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::forward: ", T, " tokens, expected 1..", max_tokens_);
     STRIX_CHECK(pos_ + T <= capacity_, "Qwen4ExpSession::forward: positions [", pos_, ", ", pos_ + T,
                 ") exceed the capacity ", capacity_);
+    ensure_paged_capacity(pos_ + T);
     STRIX_CHECK(n_logits >= 0 && n_logits <= std::min(T, kMaxLogits), "Qwen4ExpSession::forward: n_logits = ",
                 n_logits, ", expected 0..", std::min(T, kMaxLogits));
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
@@ -1694,23 +1738,45 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "gdn_core", gnorm_.get(), D.gz, pt);
             lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
         } else {
-            // Plain K/V caches (empty with KvFormat::Q8).
+            // Plain K/V caches (empty with KvFormat::Q8 and KvFormat::Paged).
             uint8_t *kc = k_cache_[(size_t)i].size() ? k_cache_[(size_t)i].get() : nullptr,
                     *vc = v_cache_[(size_t)i].size() ? v_cache_[(size_t)i].get() : nullptr;
-            // 8-bit K/V: the new rows go to a staging area first ([T][K | V], a verify's into its saved rows for
-            // keep_verify_prefix), then kv8_commit quantizes the groups they complete and writes the new tail.
             const bool q8 = kv_format_ == KvFormat::Q8;
+            const bool paged = kv_format_ == KvFormat::Paged;
             const int64_t W = D.hkv * hd;
-            uint8_t *kv_rows = !q8 ? nullptr
-                               : gdn_to_spare_ ? verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
-                                               : kv_new_.get();
-            uint8_t *k_out = q8 ? kv_rows : kc + (size_t)(pos_ * W) * e, *v_out = q8 ? kv_rows + (size_t)W * e
-                                                                                       : vc + (size_t)(pos_ * W) * e;
-            const int64_t kv_ts = q8 ? 2 * W : W;
+            uint8_t *kv_rows = nullptr;
+            if (paged) {
+                if (T > 1) kv_rows = kv_new_.get();
+            } else if (q8) {
+                kv_rows = gdn_to_spare_ ? verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
+                                        : kv_new_.get();
+            }
+            uint8_t *k_out = nullptr, *v_out = nullptr;
+            int64_t kv_ts = W;
+            if (paged) {
+                if (T == 1) {
+                    const int64_t b = pos_ / kPageBlockSize;
+                    const int64_t o = pos_ % kPageBlockSize;
+                    const int32_t pb = block_table_host_[(size_t)b];
+                    const int64_t phys_row = pb * kPageBlockSize + o;
+                    k_out = page_pool_->k_pool(i) + (size_t)(phys_row * W) * e;
+                    v_out = page_pool_->v_pool(i) + (size_t)(phys_row * W) * e;
+                    kv_ts = W;
+                } else {
+                    k_out = kv_rows;
+                    v_out = kv_rows + (size_t)W * e;
+                    kv_ts = 2 * W;
+                }
+            } else if (q8) {
+                k_out = kv_rows;
+                v_out = kv_rows + (size_t)W * e;
+                kv_ts = 2 * W;
+            } else {
+                k_out = kc + (size_t)(pos_ * W) * e;
+                v_out = vc + (size_t)(pos_ * W) * e;
+                kv_ts = W;
+            }
             lin(u_.get(), l.qkv, proj_.get(), T, act);
-            // One launch: q normed + roped in place, k into the K cache, v copied into the V cache, past the dense
-            // limit the indexer queries (normed + roped in place), and in a verify the raw indexer keys copied into
-            // the layer's verify_in_ (keep_verify_prefix may replay them) - kernels/attention.hpp qk_norm_rope_jobs.
             const bool qsa_layer = pos_ + T > D.dense_key_limit();
             kernels::NormRopeJob nr[5] = {
                 {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
@@ -1726,10 +1792,10 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
             kernels::qk_norm_rope_jobs(nr, njobs, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream_, m_.rope_scale(),
                                        mk_jobs_);
-            // Indexer block keys (every completed block, this call's included) - kept current for when selection
-            // starts to bite; the queries and scores are only needed past the dense limit. pos0 stays the
-            // sequence index (the kernel derives block / tail array indices from it); with a rope_delta the
-            // window's triples carry the shifted angles (a shifted pos0 would shift the block partition too).
+            if (paged && T > 1) {
+                kernels::paged_kv_scatter(k_out, v_out, kv_ts, page_pool_->k_pool(i), page_pool_->v_pool(i),
+                                          block_table_dev_.get(), T, pos_, kPageBlockSize, W, act, stream_);
+            }
             kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos_,
                                     pos_ % kernels::kQsaBlock ? tail_[tail_cur_][(size_t)i].get() : nullptr,
                                     tail_[1 - tail_cur_][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
@@ -1738,6 +1804,10 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             const kernels::AttentionShape as{T, pos_, D.hq, D.hkv, hd, D.astride, 2 * hd};
             const float scale = 1.0f / std::sqrt((float)hd);
             kernels::Kv8View kv8;
+            kernels::PagedKvView pkv;
+            if (paged) {
+                pkv = {page_pool_->k_pool(i), page_pool_->v_pool(i), block_table_dev_.get(), capacity_, W, kPageBlockSize};
+            }
             if (q8) {
                 const size_t li = (size_t)i;
                 kernels::kv8_commit(k_out, v_out, kv_ts, T, pos_,
@@ -1747,10 +1817,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                 kv8 = {kv8_store_[li].get(), kv8_cap_, W,
                        pos_ % kernels::kKv8Group ? kv8_tail_[tail_cur_][li].get() : nullptr, k_out, v_out, kv_ts, pos_};
             }
-            // Prefill-sized forwards with BF16 activations: the attention on the matrix units (kernels/attention.hpp).
             const bool wmma_attn = wmma && act == Act::BF16 && T >= kWmmaMinTokens;
-            // Dequantize the rows below the last query's exact_from once, then plain loads (Kv8View staged_k), when
-            // that is cheaper than unpacking in the loop (kv8_stage_pays).
             const auto stage_kv8 = [&](int64_t keys_per_query) {
                 const int64_t rows = kernels::kv8_exact_from(pos_ + T - 1);
                 if (!(wmma_attn && q8 && rows > 0 && kv8_stage_pays(T, keys_per_query, rows))) return;
@@ -1762,7 +1829,14 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             };
             if (!qsa_layer) {
                 stage_kv8(pos_ + T);  // a dense query reads every row up to its own
-                if (wmma_attn && q8)
+                if (paged) {
+                    if (wmma_attn)
+                        kernels::attention_wmma(proj_.get(), at(proj_, hd), pkv, as, scale, core_.get(), attn_ws_.get(),
+                                                attn_ws_bytes_, act, stream_, precision_.attention);
+                    else
+                        kernels::attention(proj_.get(), at(proj_, hd), pkv, as, scale, core_.get(), attn_ws_.get(),
+                                           attn_ws_bytes_, act, stream_);
+                } else if (wmma_attn && q8)
                     kernels::attention_wmma(proj_.get(), at(proj_, hd), kv8, as, scale, core_.get(), attn_ws_.get(),
                                             attn_ws_bytes_, act, stream_, precision_.attention);
                 else if (wmma_attn)
@@ -1775,10 +1849,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                     kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(),
                                        attn_ws_.get(), attn_ws_bytes_, act, stream_);
             } else {
-                // QSA: indexer queries (normed + roped in place), block scores, the top budget / 4 blocks, gathered
-                // attention. Queries that still see every key keep all their blocks - the dense set.
                 const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-                void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
+                void *iq = at(proj_, D.idx_col);
                 kernels::qsa_scores(iq, D.astride, D.idx_d, T, pos_, D.idx_h, D.idx_d, block_keys_[(size_t)i].get(),
                                     cap_blocks_, qsa_scores_.get(), cap_blocks_, act, stream_);
                 kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, pos_, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
@@ -1786,7 +1858,16 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                 show(L + "qsa_sel", qsa_sel_.get(), qsa_k, ProbeType::I32);
                 show(L + "qsa_nsel", qsa_nsel_.get(), 1, ProbeType::I32);
                 stage_kv8(std::min<int64_t>(D.qsa_budget, pos_ + T));
-                if (wmma_attn && q8)
+                if (paged) {
+                    if (wmma_attn)
+                        kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), pkv, as, qsa_sel_.get(),
+                                                         qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
+                                                         attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+                    else
+                        kernels::attention_gathered(proj_.get(), at(proj_, hd), pkv, as, qsa_sel_.get(), qsa_nsel_.get(),
+                                                    qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_,
+                                                    attn_err_.get(), act, stream_);
+                } else if (wmma_attn && q8)
                     kernels::attention_gathered_wmma(proj_.get(), at(proj_, hd), kv8, as, qsa_sel_.get(),
                                                      qsa_nsel_.get(), qsa_k, scale, core_.get(), attn_ws_.get(),
                                                      attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
@@ -1951,6 +2032,9 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
         Qwen4ExpSession &sk = *batch[k].session;
         const int64_t Tk = offsets[k + 1] - offsets[k];
         sk.prepare_positions(sk.pos_, Tk);
+        if (sk.kv_format_ == KvFormat::Paged) {
+            sk.ensure_paged_capacity(Tk);
+        }
         if (Tk > 1) {
             sk.ensure_verify_buffers();
             copy_state(sk.ple_state_, sk.ple_state_kept_, stream, "PLE conv state");
@@ -2091,14 +2175,37 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                 uint8_t *proj_k = s0.proj_.get() + (size_t)(offsets[k] * D.astride) * e;
 
                 const bool q8 = sk.kv_format_ == KvFormat::Q8;
+                const bool paged = sk.kv_format_ == KvFormat::Paged;
                 uint8_t *kc = sk.k_cache_[(size_t)i].size() ? sk.k_cache_[(size_t)i].get() : nullptr;
                 uint8_t *vc = sk.v_cache_[(size_t)i].size() ? sk.v_cache_[(size_t)i].get() : nullptr;
-                uint8_t *kv_rows = !q8 ? nullptr
-                                   : sk.gdn_to_spare_ ? sk.verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
-                                                      : sk.kv_new_.get();
-                uint8_t *k_out = q8 ? kv_rows : kc + (size_t)(pos_k * W) * e;
-                uint8_t *v_out = q8 ? kv_rows + (size_t)W * e : vc + (size_t)(pos_k * W) * e;
-                const int64_t kv_ts = q8 ? 2 * W : W;
+                uint8_t *k_out = nullptr, *v_out = nullptr;
+                int64_t kv_ts = W;
+                if (paged) {
+                    if (Tk == 1) {
+                        const int64_t b = pos_k / kPageBlockSize;
+                        const int64_t o = pos_k % kPageBlockSize;
+                        const int32_t pb = sk.block_table_host_[(size_t)b];
+                        const int64_t phys_row = pb * kPageBlockSize + o;
+                        k_out = sk.page_pool_->k_pool((size_t)i) + (size_t)(phys_row * W) * e;
+                        v_out = sk.page_pool_->v_pool((size_t)i) + (size_t)(phys_row * W) * e;
+                        kv_ts = W;
+                    } else {
+                        uint8_t *kv_rows = sk.kv_new_.get();
+                        k_out = kv_rows;
+                        v_out = kv_rows + (size_t)W * e;
+                        kv_ts = 2 * W;
+                    }
+                } else if (q8) {
+                    uint8_t *kv_rows = sk.gdn_to_spare_ ? sk.verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
+                                                        : sk.kv_new_.get();
+                    k_out = kv_rows;
+                    v_out = kv_rows + (size_t)W * e;
+                    kv_ts = 2 * W;
+                } else {
+                    k_out = kc + (size_t)(pos_k * W) * e;
+                    v_out = vc + (size_t)(pos_k * W) * e;
+                    kv_ts = W;
+                }
 
                 const int64_t rope0 = sk.mk_jobs_.pos3 == nullptr ? sk.rope_pos(pos_k) : pos_k;
 
@@ -2117,6 +2224,11 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                 }
                 kernels::qk_norm_rope_jobs(nr, njobs, Tk, D.eps, D.rot, rope0,
                                            m.inv_freq(), act, stream, m.rope_scale(), sk.mk_jobs_);
+
+                if (paged && Tk > 1) {
+                    kernels::paged_kv_scatter(k_out, v_out, kv_ts, sk.page_pool_->k_pool((size_t)i), sk.page_pool_->v_pool((size_t)i),
+                                              sk.block_table_dev_.get(), Tk, pos_k, kPageBlockSize, W, act, stream);
+                }
 
                 kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, Tk, pos_k,
                                         pos_k % kernels::kQsaBlock ? sk.tail_[sk.tail_cur_][(size_t)i].get() : nullptr,
@@ -2139,9 +2251,24 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                            pos_k % kernels::kKv8Group ? sk.kv8_tail_[sk.tail_cur_][li].get() : nullptr, k_out, v_out, kv_ts, pos_k};
                 }
 
+                kernels::PagedKvView paged_view;
+                if (paged) {
+                    paged_view = {
+                        sk.page_pool_->k_pool((size_t)i),
+                        sk.page_pool_->v_pool((size_t)i),
+                        sk.block_table_dev_.get(),
+                        sk.capacity_,
+                        W,
+                        kPageBlockSize
+                    };
+                }
+
                 if (!qsa_layer) {
                     if (q8) {
                         kernels::attention(proj_k, proj_k + (size_t)hd * e, kv8, as, scale,
+                                           core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+                    } else if (paged) {
+                        kernels::attention(proj_k, proj_k + (size_t)hd * e, paged_view, as, scale,
                                            core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
                     } else {
                         kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
@@ -2158,6 +2285,11 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                                       s0.qsa_topk_ws_bytes_, stream);
                     if (q8) {
                         kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kv8, as,
+                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
+                                                    s0.attn_err_.get(), act, stream);
+                    } else if (paged) {
+                        kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, paged_view, as,
                                                     s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
                                                     core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
                                                     s0.attn_err_.get(), act, stream);
@@ -2802,13 +2934,38 @@ void Qwen4ExpSession::step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream
     hc_mix(ml.hc_attn, true, false, mtp_x_.get());
     lin(u_.get(), ml.qkv, proj_.get(), T);
     const int64_t rope0 = pos0 + rope_delta_;
+    const bool paged = kv_format_ == KvFormat::Paged;
+    uint8_t *k_mtp_out = nullptr, *v_mtp_out = nullptr;
+    int64_t kv_mtp_ts = D.hkv * hd;
+    if (paged) {
+        if (T == 1) {
+            const int64_t b = pos0 / kPageBlockSize;
+            const int64_t o = pos0 % kPageBlockSize;
+            const int32_t pb = block_table_host_[(size_t)b];
+            const int64_t phys_row = pb * kPageBlockSize + o;
+            k_mtp_out = page_pool_->k_mtp_pool() + (size_t)(phys_row * D.hkv * hd) * e;
+            v_mtp_out = page_pool_->v_mtp_pool() + (size_t)(phys_row * D.hkv * hd) * e;
+            kv_mtp_ts = D.hkv * hd;
+        } else {
+            uint8_t *kv_rows = kv_new_.get();
+            k_mtp_out = kv_rows;
+            v_mtp_out = kv_rows + (size_t)(D.hkv * hd) * e;
+            kv_mtp_ts = 2 * D.hkv * hd;
+        }
+    } else {
+        k_mtp_out = k_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e;
+        v_mtp_out = v_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e;
+        kv_mtp_ts = D.hkv * hd;
+    }
     const kernels::NormRopeJob nr[2] = {
-        {at(proj_, D.hq * 2 * hd), D.astride, hd, k_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e, D.hkv * hd, hd,
-         D.hkv, hd, ml.k_norm},
-        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e,
-         D.hkv * hd, hd, D.hkv, hd, nullptr}};
+        {at(proj_, D.hq * 2 * hd), D.astride, hd, k_mtp_out, kv_mtp_ts, hd, D.hkv, hd, ml.k_norm},
+        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_mtp_out, kv_mtp_ts, hd, D.hkv, hd, nullptr}};
     kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream, m_.rope_scale(),
                                mk_jobs_);  // k, v into the MTP cache
+    if (paged && T > 1) {
+        kernels::paged_kv_scatter(k_mtp_out, v_mtp_out, kv_mtp_ts, page_pool_->k_mtp_pool(), page_pool_->v_mtp_pool(),
+                                  block_table_dev_.get(), T, pos0, kPageBlockSize, D.hkv * hd, act, stream);
+    }
     kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos0,
                             pos0 % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
                             tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
@@ -2915,15 +3072,27 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // The layer, as a trunk full-attention layer at position p. Step 0's KV row and block keys are the ones the next
     // forward's catch-up writes again from the same inputs; a chain step's, until the position runs, its guess.
     hc_mix(l.hc_attn, true);
-    uint8_t *kc = k_cache_mtp_.get(), *vc = v_cache_mtp_.get();
+    const bool paged = kv_format_ == KvFormat::Paged;
+    ensure_paged_capacity(p + 1);
+    uint8_t *kc = nullptr, *vc = nullptr;
+    if (paged) {
+        const int64_t b = p / kPageBlockSize;
+        const int64_t o = p % kPageBlockSize;
+        const int32_t pb = block_table_host_[(size_t)b];
+        const int64_t phys_row = pb * kPageBlockSize + o;
+        kc = page_pool_->k_mtp_pool() + (size_t)(phys_row * D.hkv * hd) * e;
+        vc = page_pool_->v_mtp_pool() + (size_t)(phys_row * D.hkv * hd) * e;
+    } else {
+        kc = k_cache_mtp_.get() + (size_t)(p * D.hkv * hd) * e;
+        vc = v_cache_mtp_.get() + (size_t)(p * D.hkv * hd) * e;
+    }
     kernels::linear_qw(u_.get(), l.qkv, proj_.get(), T, act, act, stream_);
     // q, k, v and (past the dense limit) the indexer queries in one launch, as in the trunk's layers.
     const bool qsa_layer = p + T > D.dense_key_limit();
     const kernels::NormRopeJob nr[4] = {
         {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
-        {at(proj_, D.hq * 2 * hd), D.astride, hd, kc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, l.k_norm},
-        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, vc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv,
-         hd, nullptr},
+        {at(proj_, D.hq * 2 * hd), D.astride, hd, kc, D.hkv * hd, hd, D.hkv, hd, l.k_norm},
+        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, vc, D.hkv * hd, hd, D.hkv, hd, nullptr},
         {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
          l.idx_q_norm}};
     kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, T, D.eps, D.rot, rope_p, m_.inv_freq(), act, stream_,
@@ -2933,9 +3102,17 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
                             D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
     const kernels::AttentionShape as{T, p, D.hq, D.hkv, hd, D.astride, 2 * hd};
     const float scale = 1.0f / std::sqrt((float)hd);
+    kernels::PagedKvView pkv_mtp;
+    if (paged) {
+        pkv_mtp = {page_pool_->k_mtp_pool(), page_pool_->v_mtp_pool(), block_table_dev_.get(), capacity_, D.hkv * hd, kPageBlockSize};
+    }
     if (!qsa_layer) {
-        kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
-                           attn_ws_bytes_, act, stream_);
+        if (paged)
+            kernels::attention(proj_.get(), at(proj_, hd), pkv_mtp, as, scale, core_.get(), attn_ws_.get(),
+                               attn_ws_bytes_, act, stream_);
+        else
+            kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
+                               attn_ws_bytes_, act, stream_);
     } else {
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
         void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
@@ -2943,9 +3120,14 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
                             qsa_scores_.get(), cap_blocks_, act, stream_);
         kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, p, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
                           qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
-        kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(), qsa_nsel_.get(),
-                                    qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_, attn_err_.get(), act,
-                                    stream_);
+        if (paged)
+            kernels::attention_gathered(proj_.get(), at(proj_, hd), pkv_mtp, as, qsa_sel_.get(), qsa_nsel_.get(),
+                                        qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_, attn_err_.get(), act,
+                                        stream_);
+        else
+            kernels::attention_gathered(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, qsa_sel_.get(), qsa_nsel_.get(),
+                                        qsa_k, scale, core_.get(), attn_ws_.get(), attn_ws_bytes_, attn_err_.get(), act,
+                                        stream_);
     }
     kernels::linear_qw(core_.get(), l.o_proj, y_.get(), T, act, act, stream_);
     kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);

@@ -98,7 +98,15 @@ int run(int argc, char **argv) {
     cfg.host = settings.text("host");
     cfg.port = (int)settings.integer("port");
     cfg.model_id = settings.text("model-id");
-    const int64_t capacity = settings.integer("capacity"), chunk = settings.integer("chunk");
+    int64_t slot_limit = settings.integer("slot-limit");
+    if (settings.integer("capacity") > 0) {
+        slot_limit = settings.integer("capacity");
+    }
+    int64_t total_capacity = settings.integer("total-capacity");
+    if (total_capacity <= 0) {
+        total_capacity = slot_limit;
+    }
+    const int64_t capacity = slot_limit, chunk = settings.integer("chunk");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
     const std::string cache_dir = settings.text("prompt-cache-dir");
     const int64_t cache_gib = settings.integer("prompt-cache-gib");
@@ -203,13 +211,20 @@ int run(int argc, char **argv) {
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
     }
+    std::shared_ptr<PagePool> shared_pool;
+    if (kv_format == KvFormat::Paged) {
+        const Qwen4ExpDims &D = model.dims();
+        shared_pool = std::make_shared<PagePool>(total_capacity, D.hkv * D.hd, D.is_attention, model.act(), use_mtp && model.has_mtp());
+        slog(LogLevel::Info, "startup: unified PagePool initialized - %lld tokens (%lld blocks of 32), slot-limit %lld tokens",
+             (long long)shared_pool->total_tokens(), (long long)shared_pool->total_blocks(), (long long)slot_limit);
+    }
     const int64_t num_slots = settings.integer("slots");
     slog(LogLevel::Info, "startup: serving slots = %lld", (long long)num_slots);
     std::vector<std::unique_ptr<Qwen4ExpBackend>> backends;
     backends.reserve(num_slots);
     for (int64_t i = 0; i < num_slots; ++i) {
         backends.push_back(std::make_unique<Qwen4ExpBackend>(
-            model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format));
+            model, capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, shared_pool));
     }
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");

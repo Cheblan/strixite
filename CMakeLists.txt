@@ -129,8 +129,8 @@ endfunction()
 
 # --- host flags ----------------------------------------------------------------
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=znver3 -flto -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=znver3 -flto -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=znver5 -mtune=znver5 -flto -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -march=znver5 -mtune=znver5 -flto -g -DNDEBUG")
 add_link_options(-fuse-ld=lld)
 if(CMAKE_BUILD_TYPE MATCHES "Rel")
     add_link_options(-flto)
@@ -183,7 +183,7 @@ strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/l
 target_include_directories(strix_kernels PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 
-add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/vision_tower.cpp
+add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/page_pool.cpp runtime/vision_tower.cpp
     runtime/strixw_loader.cpp runtime/ngram_rows.cpp runtime/ngram_table.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.
@@ -256,6 +256,12 @@ target_link_libraries(strix_server PRIVATE strix_serve_model)
 
 add_executable(bench_batch_decode tools/bench_batch_decode.cpp)
 target_link_libraries(bench_batch_decode PRIVATE strix_serve_model)
+
+add_executable(test_paged_attention tools/test_paged_attention.cpp)
+target_link_libraries(test_paged_attention PRIVATE strix_model)
+
+add_executable(bench_prefill tools/bench_prefill.cpp)
+target_link_libraries(bench_prefill PRIVATE strix_model)
 
 
 

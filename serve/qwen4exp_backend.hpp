@@ -13,8 +13,10 @@ public:
     // mtp_vocab: the draft's vocabulary (Qwen4ExpSession::set_mtp_vocab), 0 = the whole one.
     // precision: the kernel-step choices (runtime/qwen4exp.hpp PrecisionOptions; all exact by default).
     // kv: the attention layers' K/V cache format (runtime/qwen4exp.hpp KvFormat).
+    // page_pool: optional shared page pool when kv == KvFormat::Paged (or null to auto-allocate).
     Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp = true,
-                    int64_t mtp_vocab = 0, const PrecisionOptions &precision = {}, KvFormat kv = KvFormat::Act);
+                    int64_t mtp_vocab = 0, const PrecisionOptions &precision = {}, KvFormat kv = KvFormat::Act,
+                    std::shared_ptr<PagePool> page_pool = nullptr);
     int64_t capacity() const override { return session_.capacity(); }
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
