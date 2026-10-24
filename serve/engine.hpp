@@ -414,6 +414,7 @@ private:
             bool verify = false;
             const LogitMasks *masks = nullptr;
             LogitRows result;
+            std::exception_ptr error;
             bool done = false;
         };
         std::vector<Request *> reqs;
