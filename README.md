@@ -81,6 +81,9 @@ reference derived from the model's spec.
 - **Thinking that ends** - a request can cap its reasoning with its own budget, and a nudge steps in when the
   model's thinking goes in circles ([thinking](docs/server.md#thinking))
 - **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
+- **Conversations at once** - two by default, more for shallower contexts; their decode steps share one forward,
+  and a slot's memory grows with its conversation
+  ([memory](docs/memory.md#slots-conversations-at-once))
 - **512k context** with YaRN, an 8-bit KV cache (about half the memory of 16-bit), and attention that stays fast at
   depth
 
@@ -109,8 +112,9 @@ amdgpu.gttsize=126976 ttm.pages_limit=32505856 amd_iommu=off
 Add them to your bootloader's kernel command line (on Fedora: `sudo grubby --update-kernel=ALL --args="..."`) and
 reboot. `cat /sys/class/drm/card*/device/mem_info_gtt_total` should then report ~124 GiB.
 
-**2. Install the toolchain.** strixite builds with AMD's TheRock ROCm nightly for gfx1151, tested with
-`therock-dist-linux-gfx1151-10.1.0a20260822` (HIP 7.16). Extract it anywhere; the build looks in
+**2. Install the toolchain.** strixite builds with AMD's TheRock ROCm for gfx1151, tested with the 10.1.0 GA tarball,
+`therock-dist-linux-gfx1151-10.1.0` (HIP 7.16) - AMD publishes it at
+https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-10.1.0.tar.gz. Extract it anywhere; the build looks in
 `~/tools/therock-tarball/install` unless you say otherwise (step 3). You also need CMake 3.28+, Ninja and a GCC C++
 standard library - your distribution's `g++` / `gcc-c++` package (GCC 13 to 16 work; I use Linuxbrew's gcc-15 on
 Fedora 43, which the build finds on its own).

@@ -32,34 +32,38 @@ power-cycle it. I've had all three. Everything on this page is about never getti
 
 ## Where the 128 GB goes
 
-With the shipped settings (`capacity = 524288`, `chunk = 16384`) on my machine:
+With the shipped settings (`capacity = 524288`, `total-slots = 2`, `chunk = 16384`) on my machine:
 
 | what | size | fixed or growing |
 |---|---|---|
-| **GPU buffers**: the weights (~66 GiB), the context's KV cache (8-bit) and state for 512k tokens, and the work buffers | 91.9 GiB | fixed at startup - nothing on the GPU grows afterwards |
+| **GPU buffers**: the weights (~66 GiB) and, per slot, the state and work buffers | 84.7 GiB | fixed at startup - nothing on the GPU grows afterwards |
+| **one slot's K/V for a full 512k conversation** | 8.2 GiB | held back at startup but not used yet - the slots map K/V pages as conversations fill them ([below](#slots-conversations-at-once)) |
 | **n-gram row cache** (`ngram-cache-rows = 8388608`) | 3.0 GiB | fixed at startup |
 | **prompt cache, RAM tier** | 0 at startup, grows with use | saved conversations, a few GB each |
 | **the margin** (`prompt-cache-ram-margin-gib = 4`) | 4 GiB | kept free for the kernel and everything else |
 | the operating system, services | a few GiB | |
 
-That leaves **about 22 GiB of MemAvailable** right after the server loads, with nothing else running. The prompt cache
-lives in what's left above the margin.
+That leaves **about 23 GiB of MemAvailable** right after the server loads with two slots, of which the 8.2 GiB K/V
+hold above is the one thing earmarked - the prompt cache lives in what's left above the margin.
 
 ```mermaid
 flowchart LR
-    total["128 GB"] --> gpu["GPU buffers<br/>91.9 GiB<br/>(weights, 512k context)"]
+    total["128 GB"] --> gpu["GPU buffers<br/>84.7 GiB<br/>(weights, two slots' state)"]
     total --> rows["n-gram row cache<br/>3.0 GiB"]
     total --> os["OS + services"]
-    total --> avail["MemAvailable after loading<br/>~22 GiB"]
+    total --> avail["MemAvailable after loading<br/>~23 GiB"]
+    avail --> kv["one slot's full K/V<br/>8.2 GiB, held, mapped as used"]
     avail --> tier["prompt cache RAM tier<br/>grows with use, gives memory back"]
     avail --> margin["the margin<br/>4 GiB, never used by the cache"]
 ```
 
 What each one is for:
 
-- **The context** (`capacity`): the KV cache and state for the longest conversation the server will hold. It's
-  allocated in full at startup, so a 512k context costs its memory even when your conversations are short. Halving
-  it to 256k frees about 8.6 GiB (GPU buffers 83.3 GiB instead of 91.9).
+- **The context** (`capacity`): the longest conversation the server will hold. Its K/V memory no longer costs
+  anything from the first token - a slot maps K/V pages as a conversation fills them, and startup holds back only
+  one slot's worth at full depth (a deeper conversation is served by that slot, not by more reservations). What
+  every slot costs from the start is its fixed state and work buffers, about a GiB each. A 256k context lightens
+  both - the [slot recipes](#more-conversations-at-once) show measured configs.
 - **The n-gram row cache**: the model has a 51B-parameter n-gram table that stays on the SSD; the rows it actually
   uses are cached in RAM so a prompt reads less from disk. 8M rows (3 GiB) is enough for several long agent
   sessions to share. Shrinking it to 262,144 rows frees 2.9 GiB and only costs some extra SSD reads while reading a
@@ -109,17 +113,23 @@ can be bigger than 4 GiB at once. 8 GiB gives those bursts room without the cach
 ## The startup check
 
 After the weights are loaded, the server measures MemAvailable and checks that it covers **the margin plus one
-saved conversation at full capacity** - the biggest save it might ever have to make. With the shipped settings that's
-4 + 8.3 = 12.3 GiB, and my dedicated machine has about 22. The startup log says so in one line:
+saved conversation at full capacity** - the biggest save it might ever have to make. The one slot's full K/V held
+back for depth is subtracted from the measurement first: the server must be able to lose it to a conversation at
+any time and still meet the rule. With the shipped settings the check needs 4 + 8.3 = 12.3 GiB, and my dedicated
+machine has 23.9 after loading, 15.7 once the 8.2 GiB hold is set aside. The startup log says so in one line:
 
 ```
-startup: memory: MemAvailable 22.0 GiB after loading (GPU buffers 91.9 GiB, n-gram row cache 3.0 GiB); needs the
-prompt cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB
+startup: memory: MemAvailable 23.9 GiB after loading (GPU buffers 84.7 GiB for 2 slots, n-gram row cache 3.0 GiB)
+less 8.2 GiB held for one slot's K/V at full capacity (paged: mapped as conversations fill it); needs the prompt
+cache's RAM margin 4.0 GiB + one state at full capacity (524,288 tokens) 8.3 GiB = 12.3 GiB
 ```
 
-That's about 10 GiB of slack (v0.3, with a 16-bit KV cache, had 1.6), so a few GB held by something else no longer
-stops a restart. "Nothing else running" still matters for the prompt cache: everything other processes hold comes out
-of its RAM tier.
+(The numbers below and in the examples are from my machine at these settings; your line has yours.)
+
+That's about 3 GiB of slack above the rule. The bigger change is what it costs to have two slots at all: v0.4.0,
+with every slot's K/V committed up front, needed 91.9 GiB of GPU buffers for a *single* 512k slot; two slots now
+take 84.7, because a slot no longer pays for depth it isn't using. "Nothing else running" still matters for the
+prompt cache: everything other processes hold comes out of its RAM tier.
 
 `low-memory` decides what happens when it doesn't fit:
 
@@ -151,6 +161,27 @@ of its RAM tier.
   While anything is turned down, every request's block in the log carries a "performance degraded" row and
   `/health` reports `degraded`, so it doesn't go unnoticed.
 
+## Slots: conversations at once
+
+`total-slots` (2 by default, up to 8) is how many conversations the server runs at the same time. A slot is one
+conversation's home: its state at the full context, its K/V, its MTP chain. Slots mean an agent and its subagents,
+or you and the agent, without switching - each decode step of all slots runs as one batched forward, so the weights
+are read once for all of them and two conversations generate nearly twice what one does. Deep conversations pair best
+(two 512k slots are the shipped default); shallow ones run in crowds - [the recipe table](#more-conversations-at-once)
+shows how many fit.
+
+What a slot costs: about a GiB fixed (state and work buffers) at startup, and K/V memory only as its conversation
+grows - the slot's full K/V is reserved as address space and backed page by page. Startup commits RAM for **one**
+slot's K/V at full depth (the 8.2 GiB above) and lets the rest be filled in on demand, on the rule that not every
+slot runs a deepest-possible conversation at once. When a slot's K/V must grow, the server frees what it can in
+order - spare buffers, then the prompt cache's least recently used RAM entries (to disk, not dropped) - and only
+if that isn't enough does the request fail cleanly, naming what it needed and what was free. A page a conversation
+once reached stays with its slot: pages are not handed back at runtime, so the RAM a deep conversation used is not
+lent to the cache again until the server restarts.
+
+The trade to know: two slots at 512k leave the prompt cache's RAM tier a few GiB smaller than one slot did - in
+exchange for conversations no longer re-reading each other's prompts.
+
 ## Recipes
 
 Change settings in `deploy/strix-server.conf` (or add the flag, e.g. `--capacity 262144`, to the command line or the
@@ -163,10 +194,11 @@ capacity = 262144
 prompt-cache-ram-margin-gib = 8
 ```
 
-256k tokens is still a very long context - most agent sessions never get there. Halving it frees ~8.6 GiB of GPU
-memory and shrinks the biggest possible save from 8.3 to 4.2 GiB, so the startup check needs 8 + 4.2 = 12.2 GiB
-where ~29 GiB is available after loading: about 17 GiB left for the desktop, and the cache backs off from the 8 GiB
-margin whenever the desktop needs more.
+256k tokens is still a very long context - most agent sessions never get there. Halving the context takes GPU
+buffers 84.7 down to 80.2 GiB and shrinks the biggest possible save from 8.3 to 4.2 GiB, so the startup check needs
+8 + 4.2 = 12.2 GiB; my machine has 31.4 free after loading (4.1 of it held for one deep 256k slot), so about
+15 GiB of room for the desktop and the prompt cache, and the cache backs off from the 8 GiB margin whenever the
+desktop needs more.
 
 ### Another model next to strixite
 
@@ -175,15 +207,36 @@ machine. At the defaults that leaves almost nothing - which is how it crashed. W
 
 | settings | MemAvailable after loading, minus 23 GiB | the check needs |
 |---|---|---|
-| defaults (512k) | 22.0 - 23 = below zero | 4 + 8.3 = 12.3 - no |
-| `capacity = 262144` | 29.3 - 23 = 6.3 | 4 + 4.2 = 8.2 - no |
-| `capacity = 131072` | ~33 - 23 = ~10 | 4 + 2.1 = 6.1 - **yes**, ~4 GiB to spare |
-| `capacity = 131072`, `ngram-cache-rows = 262144` | ~36 - 23 = ~13 | 6.1 - **yes**, ~7 GiB to spare |
+| defaults (2 x 512k) | 23.9 - 8.2 - 23 = below zero | 4 + 8.3 = 12.3 - no |
+| `capacity = 262144` | 31.4 - 4.1 - 23 = 4.3 | 4 + 4.2 = 8.2 - no |
+| `capacity = 131072` | 36.3 - 2.1 - 23 = 11.2 | 4 + 2.1 = 6.1 - **yes**, ~5 GiB to spare |
+| `capacity = 131072`, `ngram-cache-rows = 262144` | +2.9 - 23 = ~14 | 6.1 - **yes**, ~8 GiB to spare |
+
+These assume the default two slots; if your agent doesn't need them, `total-slots = 1` frees a little more again.
 
 So: a 128k context, and keep the margin at 4 GiB. With the 8-bit KV cache (v0.4.0) the default row cache fits too;
 the small one buys more room for the prompt cache. Start the
 other model first, so strixite's startup check measures the memory that's really left. If the other model grows
 while it runs, the background check moves strixite's saved conversations to disk to make room.
+
+### More conversations at once
+
+Every slot at the full 512k fits up to four on 128 GB; shorter contexts fit more. What my machine showed at startup
+(8-bit K/V, 8M-row cache):
+
+| `total-slots` x `capacity` | GPU buffers | MemAvailable after load |
+|---|---|---|
+| 1 x 524288 | 83.8 GiB | 24.1 |
+| **2 x 524288 (default)** | **84.7** | **23.9** |
+| 3 x 524288 | 85.6 | 22.0 |
+| 4 x 524288 | 86.4 | 20.9 |
+| 6 x 262144 | 83.6 | 27.2 |
+
+All start cleanly on my machine; raise `total-slots` in the conf and startup names the largest count that fits if
+one doesn't. Six conversations share one forward per step too, but a step with more conversations reads more expert
+weights, so beyond two or three each conversation slows - two deep ones is the honest sweet spot. Six x 256k is the
+setup for many *shallow* conversations (a few agents, lots of one-shots): the free memory above also feeds the
+prompt cache.
 
 ### Not sure? Let it adapt
 
@@ -197,7 +250,7 @@ reaches it, while a smaller cache costs a little on every switch.
 
 ## Checking your own machine
 
-- **Before starting:** `free -g` - the "available" column is what's left for strixite. The defaults want ~117 GiB
+- **Before starting:** `free -g` - the "available" column is what's left for strixite. The defaults want ~111 GiB
   available before loading.
 - **At startup:** the `startup: memory:` line above - what was measured, what's needed. `journalctl --user -u
   strix-server.service` for the systemd unit, `podman logs` for the container.

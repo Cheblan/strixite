@@ -1,8 +1,8 @@
 # What the server accepts
 
 strixite's server speaks the OpenAI API on port 5300. This page covers the parts where it does something you might
-not expect: how thinking is switched and limited, the thinking nudge, prefill progress in a stream, and exactly what
-structured output enforces - and what it refuses.
+not expect: how thinking is switched and limited, the thinking nudge, prefill progress in a stream, conversations
+served together, and exactly what structured output enforces - and what it refuses.
 
 | endpoint | what it is |
 |---|---|
@@ -78,6 +78,18 @@ the ones in the model's state so far (cached ones included; it reaches `total` w
 the time since the prefill began. llama.cpp's server streams the same field with the same keys for the same flag,
 so a harness that asks llama.cpp for it (llama.cpp's own web UI does, when it streams) can ask strixite too.
 `/v1/completions` takes the flag as well (its chunks carry empty `text`); without streaming it does nothing.
+
+## Conversations at once
+
+The server holds `total-slots` conversations at the same time (2 by default, up to 8; [how many fit a given
+memory](memory.md#more-conversations-at-once)). Each slot is one conversation's
+state at the full context, so a coding agent and its subagents, or two clients, don't evict one another - and their
+decode steps share one forward through the model, so the weights are read once for all of them. Two conversations
+cost nearly nothing extra; more of them share the step but read more expert weights each, so deep conversations
+stay best in pairs and shallow ones run in crowds. Requests past the slots wait
+in arrival order; `strix_busy` out of `strix_slots` in `/metrics` shows how many are taken, and while one slot reads
+a long prompt the others keep decoding, because the prefill runs in small chunks when a second slot is busy. A slot's
+memory grows with its conversation: [memory and the slot recipes](memory.md#slots-conversations-at-once).
 
 ## Structured output
 

@@ -20,16 +20,17 @@ real use cases are what move items up.
 - **Less wasted thinking.** On agent benchmarks, most of the generated tokens are thinking, and much of it goes in
   circles. I'm measuring where it adds nothing to the answer, then tuning the thinking nudge and the think-block guard
   to cut it - the biggest speed lever left for agent work.
-- **Faster prefill at long context and on short prompts.** v0.4.0 is ~3% faster at 32k-120k and reads cold n-gram
-  rows ~1.25x faster; still to do: the sparse-attention scoring pass at depth, and the first chunk of a prompt waiting
-  on n-gram table reads from the SSD.
+- **Faster prefill at long context and on short prompts.** v0.5.0 rewrote the grouped-expert kernels and moved whole
+  passes onto the matrix units; still to do: the sparse-attention scoring pass at depth, and the first chunk of a
+  prompt waiting on n-gram table reads from the SSD.
+- **Sharing more work when conversations run together.** Each conversation's expert routing picks its own experts, so
+  a step with more than one conversation reads more of the weights; making bigger batches share more of that is the
+  next step for agents that run several at once.
 
 ## Next
 
-- **A KV cache that grows with the conversation**: today the full context is reserved at startup, though most
-  conversations use a fraction of it. Reserving the address space and backing it as the conversation grows would
-  hand the unused part to the prompt cache, without slowing attention down. First a proof of concept that the GPU's
-  virtual memory works for this on Strix Halo.
+- **Hand an idle slot's memory back**: a slot keeps the K/V memory its deepest conversation used; giving it to the
+  prompt cache while the slot waits would lend it back.
 - **Say why a conversation was read again**: when a client changes the start of the prompt (a tool switched on, a
   date in the system prompt), the log and the response will name the cause, so it's clear the server didn't lose it
   ([why it happens](memory.md#when-the-client-changes-the-start-of-the-prompt)).
@@ -39,10 +40,8 @@ real use cases are what move items up.
 
 Ideas I want, but that wait for evidence that they're worth their cost, or for the items above.
 
-- **Two conversations at once.** I built it and measured ~1.5x combined throughput with two conversations, but with
-  several agents sharing the GPU each one got slower, so it's not in v0.4.0. What it needs first: drafting for all
-  conversations in one pass instead of one after another, and the growing KV cache (Next) so a second conversation
-  doesn't reserve memory it isn't using.
+- **More conversations at once**: v0.5.0 ships two slots by default (and other counts fit: 6 shorter ones measured
+  fine). Raising the default is my call, not a limit - say in an issue what you'd run.
 - **Changing settings without a restart**: an endpoint to change the server's settings while it runs - no 30-second
   reload of the weights, no emptied prompt cache.
 - **Sleep mode**: after a configurable idle time, free the GPU memory and reload on the next request - for machines
