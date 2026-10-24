@@ -1904,25 +1904,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     // after the position before - what a later draft attends to. The rest of the
     // layer only matters for a draft's own row, so it's skipped here.
     if (mtp_) {
-        const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        mtp_input(T, mtp_prev_.get());
-        hc_mix(ml.hc_attn, true, false, mtp_x_.get());
-        lin(u_.get(), ml.qkv, proj_.get(), T, act);
-        const kernels::NormRopeJob nr[2] = {
-            {at(proj_, D.hq * 2 * hd), D.astride, hd, k_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e, D.hkv * hd, hd,
-             D.hkv, hd, ml.k_norm},
-            {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e,
-             D.hkv * hd, hd, D.hkv, hd, nullptr}};
-        kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream_, m_.rope_scale(),
-                                   mk_jobs_);  // k, v into the MTP cache
-        kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos_,
-                                pos_ % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
-                                tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_);
-        mtp_tail_cur_ = 1 - mtp_tail_cur_;
-        STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), at(x_, (T - 1) * n4), (size_t)n4 * e, hipMemcpyDeviceToDevice,
-                                       stream_),
-                        "MTP previous streams");
+        step_mtp_state(T, pos_, stream_);
     }
     std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.vocab), "");
     pos_ += T;
@@ -2222,7 +2204,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     for (int64_t k = 0; k < B; ++k) {
         Qwen4ExpSession &sk = *batch[k].session;
         const int64_t Tk = offsets[k + 1] - offsets[k];
-        if (Tk > 1 && &sk != &s0) {
+        if (&sk != &s0) {
             STRIX_HIP_CHECK(hipMemcpyAsync(sk.x_.get(), s0.x_.get() + (size_t)(offsets[k] * n4) * e,
                                            (size_t)(Tk * n4) * e, hipMemcpyDeviceToDevice, stream),
                             "forward_batch_decode: copy session x_");
@@ -2237,6 +2219,20 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     STRIX_HIP_CHECK(hipMemcpyAsync(host + kReadbackLogitsAt, s0.logits_.get(), n_floats * 4,
                                    hipMemcpyDeviceToHost, stream),
                     "forward_batch_decode: read logits");
+
+    // MTP trunk state step:
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *batch[k].session;
+        if (sk.mtp_) {
+            const std::vector<int32_t> &toks = !batch[k].tokens.empty() ? batch[k].tokens : std::vector<int32_t>{batch[k].token_id};
+            const int64_t Tk = (int64_t)toks.size();
+            STRIX_HIP_CHECK(hipMemcpyAsync(sk.ids_.get(), toks.data(), (size_t)Tk * sizeof(int32_t),
+                                           hipMemcpyHostToDevice, stream),
+                            "forward_batch_decode: upload token ids for MTP");
+            sk.step_mtp_state(Tk, sk.pos_, stream);
+        }
+    }
+
     STRIX_HIP_CHECK(hipStreamSynchronize(stream), "forward_batch_decode: sync stream");
 
     for (int64_t k = 0; k < B; ++k) {
@@ -2246,11 +2242,11 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
             sk.verify_pending_ = true;
             sk.gdn_to_spare_ = false;
         } else {
-            sk.tail_cur_ = 1 - sk.tail_cur_;
-            sk.pos_ += 1;
             sk.broken_ = false;
             sk.mtp_chain_step_ = -1;
         }
+        sk.tail_cur_ = 1 - sk.tail_cur_;
+        sk.pos_ += Tk;
     }
 
     const float *l = reinterpret_cast<const float *>(host + kReadbackLogitsAt);
@@ -2800,6 +2796,53 @@ void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
     lin(mtp_norm_emb_.get(), mtp.fc_embedding, mtp_proj_emb_.get(), T);
     lin(mtp_norm_hid_.get(), mtp.fc_hidden, mtp_x_.get(), T * D.H);
     kernels::hc_inject(mtp_x_.get(), mtp_ones_.get(), mtp_proj_emb_.get(), T, D.H, D.d, act, stream_);
+}
+
+void Qwen4ExpSession::step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream) {
+    if (!mtp_) return;
+    const Qwen4ExpDims &D = m_.dims();
+    const Act act = m_.act();
+    const size_t e = es(act);
+    const int64_t n4 = D.H * D.d, hd = D.hd;
+    const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
+    auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M) {
+        if (prefill_math_ == PrefillMath::WmmaBf16 && M >= kWmmaMinTokens)
+            kernels::linear_qw_wmma(x, w, y, M, act, act, stream);
+        else
+            kernels::linear_qw(x, w, y, M, act, act, stream);
+    };
+    auto hc_mix = [&](const Qwen4ExpModel::Hc &hc, bool inject, bool inv_ready, void *in_out) {
+        (void)inv_ready;
+        float *w_in = inject ? w_in_.get() : nullptr;
+        uint8_t *X = static_cast<uint8_t *>(in_out);
+        if (hc.down.bits == 8)
+            kernels::hc_mix_down(X, hc.down.q8, T, D.H, D.d, D.r, inject, D.eps, h_.get(), w_in, inv_.get(), act, stream);
+        else
+            kernels::hc_mix_down(X, hc.down.q4, T, D.H, D.d, D.r, inject, D.eps, h_.get(), w_in, inv_.get(), act, stream);
+        if (hc.up.bits == 8)
+            kernels::hc_mix_up(h_.get(), hc.up.q8, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream);
+        else
+            kernels::hc_mix_up(h_.get(), hc.up.q4, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream);
+    };
+    mtp_input(T, mtp_prev_.get());
+    hc_mix(ml.hc_attn, true, false, mtp_x_.get());
+    lin(u_.get(), ml.qkv, proj_.get(), T);
+    const int64_t rope0 = pos0 + rope_delta_;
+    const kernels::NormRopeJob nr[2] = {
+        {at(proj_, D.hq * 2 * hd), D.astride, hd, k_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e, D.hkv * hd, hd,
+         D.hkv, hd, ml.k_norm},
+        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_cache_mtp_.get() + (size_t)(pos0 * D.hkv * hd) * e,
+         D.hkv * hd, hd, D.hkv, hd, nullptr}};
+    kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, rope0, m_.inv_freq(), act, stream, m_.rope_scale(),
+                               mk_jobs_);  // k, v into the MTP cache
+    kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos0,
+                            pos0 % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
+                            tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
+                            D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream, m_.rope_scale(), mk_block_);
+    mtp_tail_cur_ = 1 - mtp_tail_cur_;
+    STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), at(x_, (T - 1) * n4), (size_t)n4 * e, hipMemcpyDeviceToDevice,
+                                   stream),
+                    "MTP previous streams");
 }
 
 std::vector<float> Qwen4ExpSession::forward_mtp(int32_t token_id, int64_t step) {

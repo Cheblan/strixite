@@ -377,7 +377,7 @@ public:
 
     // Runs ids at positions pos()..pos()+T-1, advances pos(), returns the last n_logits tokens' logits
     // [n_logits, vocab] FP32. If it throws, the session refuses further calls until reset().
-    static constexpr int64_t kMaxLogits = 16;
+    static constexpr int64_t kMaxLogits = 128;
     // Forwards of at least this many tokens run the MoE experts grouped by expert (each expert's weights read
     // once per tile, kernels/moe_grouped); shorter ones (decode, MTP verify) the per-slot kernels (grouped measured
     // slower there: +5 ms a 2-token verify). Swept on the served layout (prefill): T = 16 124 vs 99 t/s, 32 136 vs 131, 64 142 vs 154, 128 141 vs 166
@@ -589,6 +589,7 @@ private:
     // The MTP layer's input for T rows at positions pos_..pos_+T-1 into mtp_x_: token ids_[t] with the streams
     // after position pos_ + t - 1 (prev0 for t = 0, x_ row t - 1 after it).
     void mtp_input(int64_t T, const void *prev0);
+    void step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream);
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
     // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(step)).
     void run_mtp(int32_t token_id, int64_t step);

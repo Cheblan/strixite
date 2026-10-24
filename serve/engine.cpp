@@ -362,6 +362,7 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
     my_req.masks = masks;
 
     std::vector<DecodeBatcher::Request *> batch_reqs;
+    bool is_leader = false;
 
     {
         std::unique_lock<std::mutex> lk(batcher_.mu);
@@ -374,10 +375,8 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
         batcher_.reqs.push_back(&my_req);
 
         const int target = std::max(1, batcher_.active_decoders);
-        if ((int)batcher_.reqs.size() >= target) {
-            batcher_.executing = true;
-        } else {
-            auto timeout = std::chrono::microseconds(1500);
+        if ((int)batcher_.reqs.size() < target) {
+            auto timeout = std::chrono::microseconds(1000);
             batcher_.cv.wait_for(lk, timeout, [&] {
                 return (int)batcher_.reqs.size() >= batcher_.active_decoders || batcher_.executing || stop_;
             });
@@ -385,12 +384,11 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
                 return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
                               : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
             }
-            if (!batcher_.executing) {
-                batcher_.executing = true;
-            }
         }
 
-        if (batcher_.executing && !my_req.done) {
+        if (!batcher_.executing) {
+            batcher_.executing = true;
+            is_leader = true;
             batch_reqs = std::move(batcher_.reqs);
             batcher_.reqs.clear();
         } else {
@@ -398,25 +396,34 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
         }
     }
 
-    if (!batch_reqs.empty()) {
-        std::vector<LmBackend::BatchStep> steps(batch_reqs.size());
-        for (size_t i = 0; i < batch_reqs.size(); ++i) {
-            steps[i].backend = batch_reqs[i]->backend;
-            steps[i].ids = batch_reqs[i]->tokens;
-            steps[i].verify = batch_reqs[i]->verify;
-            steps[i].masks = batch_reqs[i]->masks;
-        }
-        std::vector<LogitRows> out_rows;
-        batch_reqs[0]->backend->forward_batch(steps, out_rows);
+    if (is_leader) {
+        if (!batch_reqs.empty()) {
+            std::vector<LmBackend::BatchStep> steps(batch_reqs.size());
+            for (size_t i = 0; i < batch_reqs.size(); ++i) {
+                steps[i].backend = batch_reqs[i]->backend;
+                steps[i].ids = batch_reqs[i]->tokens;
+                steps[i].verify = batch_reqs[i]->verify;
+                steps[i].masks = batch_reqs[i]->masks;
+            }
+            std::vector<LogitRows> out_rows;
+            try {
+                batch_reqs[0]->backend->forward_batch(steps, out_rows);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(batcher_.mu);
+                batcher_.executing = false;
+                batcher_.cv.notify_all();
+                throw;
+            }
 
-        std::lock_guard<std::mutex> lk(batcher_.mu);
-        for (size_t i = 0; i < batch_reqs.size(); ++i) {
-            batch_reqs[i]->result = std::move(out_rows[i]);
-            batch_reqs[i]->done = true;
+            std::lock_guard<std::mutex> lk(batcher_.mu);
+            for (size_t i = 0; i < batch_reqs.size(); ++i) {
+                batch_reqs[i]->result = std::move(out_rows[i]);
+                batch_reqs[i]->done = true;
+            }
+            batcher_.executing = false;
+            batcher_.gen++;
+            batcher_.cv.notify_all();
         }
-        batcher_.executing = false;
-        batcher_.gen++;
-        batcher_.cv.notify_all();
     }
 
     return std::move(my_req.result);
