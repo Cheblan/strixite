@@ -306,15 +306,42 @@ enum class KvFormat { Act, Q8, Paged };
 const char *kv_format_name(KvFormat f);  // "bf16" / "q8" / "paged"
 KvFormat parse_kv_format(const std::string &v);  // "bf16" -> Act, "q8" -> Q8, "paged" -> Paged; anything else throws
 
+// Shared workspace for QSA scoring across concurrent sessions/slots.
+// Prefill workspace is sized for max_tokens (chunk) and shared across slots with a mutex.
+// Decode workspace is sized for kMaxDecodeTokens (T <= 64) and used by forward_batch_decode.
+struct QsaSharedWorkspace {
+    std::mutex mu;
+
+    static constexpr int64_t kMaxDecodeTokens = 64;
+
+    // Prefill workspace (shared across slots during forward_impl)
+    DeviceBuffer<float> prefill_scores;
+    DeviceBuffer<int32_t> prefill_sel;
+    DeviceBuffer<int32_t> prefill_nsel;
+    DeviceBuffer<uint8_t> prefill_topk_ws;
+    size_t prefill_topk_ws_bytes = 0;
+
+    // Decode workspace (used during forward_batch_decode)
+    DeviceBuffer<float> decode_scores;
+    DeviceBuffer<int32_t> decode_sel;
+    DeviceBuffer<int32_t> decode_nsel;
+    DeviceBuffer<uint8_t> decode_topk_ws;
+    size_t decode_topk_ws_bytes = 0;
+
+    void allocate(int64_t capacity, int64_t max_tokens, int64_t qsa_budget);
+};
+
 class Qwen4ExpSession {
 public:
     // mtp: keep the MTP draft head's state (its KV cache, filled for every position a forward runs) so
     // forward_mtp can draft; needs a model with the head. Off, forward_mtp throws and forwards skip that work.
     // kv: the full-attention layers' K/V cache format (KvFormat).
     // page_pool: optional shared page pool when kv == KvFormat::Paged (or auto-allocated if null).
+    // shared_qsa: optional shared QSA workspace across concurrent slots (reduces device memory footprint).
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
                     PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false, KvFormat kv = KvFormat::Act,
-                    std::shared_ptr<PagePool> page_pool = nullptr);
+                    std::shared_ptr<PagePool> page_pool = nullptr,
+                    std::shared_ptr<QsaSharedWorkspace> shared_qsa = nullptr);
     PrefillMath prefill_math() const { return prefill_math_; }
     KvFormat kv_format() const { return kv_format_; }
     std::shared_ptr<PagePool> page_pool() const { return page_pool_; }
@@ -606,14 +633,9 @@ private:
     DeviceBuffer<uint8_t> mtp_pick_;  // kernels::MtpPick on the device (allocated on the first forward_mtp_top2)
     // Grouped experts for multi-token forwards (kernels/moe_grouped): the route grouping and combine's FP32
     // per-slot dots. Allocated when max_tokens reaches kGroupedMinTokens.
-    // QSA selection past dense_key_limit(): scores [max_tokens, cap_blocks] F32, the kept blocks [max_tokens,
-    // budget / 4] and their counts, qsa_topk's workspace, gathered attention's error word. Allocated when the
-    // capacity reaches past the limit.
-    DeviceBuffer<float> qsa_scores_;
-    DeviceBuffer<int32_t> qsa_sel_, qsa_nsel_;
-    DeviceBuffer<uint8_t> qsa_topk_ws_;
+    // QSA selection past dense_key_limit(): shared workspace (prefill + decode), gathered attention's error word.
+    std::shared_ptr<QsaSharedWorkspace> qsa_ws_;
     DeviceBuffer<uint32_t> attn_err_;
-    size_t qsa_topk_ws_bytes_ = 0;
     DeviceBuffer<float> hc_ws_;  // hc_mix_down_wmma's partials (WMMA prefill)
     size_t hc_ws_bytes_ = 0;
     DeviceBuffer<int32_t> group_ws_;

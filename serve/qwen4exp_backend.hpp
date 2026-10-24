@@ -14,9 +14,11 @@ public:
     // precision: the kernel-step choices (runtime/qwen4exp.hpp PrecisionOptions; all exact by default).
     // kv: the attention layers' K/V cache format (runtime/qwen4exp.hpp KvFormat).
     // page_pool: optional shared page pool when kv == KvFormat::Paged (or null to auto-allocate).
+    // shared_qsa: optional shared QSA workspace across concurrent slots.
     Qwen4ExpBackend(const Qwen4ExpModel &model, int64_t capacity, int64_t chunk, bool use_mtp = true,
                     int64_t mtp_vocab = 0, const PrecisionOptions &precision = {}, KvFormat kv = KvFormat::Act,
-                    std::shared_ptr<PagePool> page_pool = nullptr);
+                    std::shared_ptr<PagePool> page_pool = nullptr,
+                    std::shared_ptr<QsaSharedWorkspace> shared_qsa = nullptr);
     int64_t capacity() const override { return session_.capacity(); }
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
