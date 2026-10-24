@@ -1932,7 +1932,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
 }
 
 void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &batch,
-                                           std::vector<std::vector<float>> &out_logits) {
+                                           std::vector<std::vector<float>> &out_logits,
+                                           bool use_grouped_moe) {
     const int64_t B = (int64_t)batch.size();
     STRIX_CHECK(B >= 1 && B <= 8, "forward_batch_decode: batch size ", B, ", expected 1..8");
     out_logits.resize(B);
@@ -2029,8 +2030,8 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     }
 
     // Embedding:
-    const bool use_grouped_moe = (T >= 4);
-    if (use_grouped_moe) {
+    const bool enable_grouped_moe = use_grouped_moe && (T >= 4);
+    if (enable_grouped_moe) {
         const size_t needed_group_ws = kernels::moe_route_workspace_bytes(T, A, Estack);
         if (s0.group_ws_bytes_ < needed_group_ws) {
             s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(T, (int64_t)64), A, Estack);
@@ -2177,7 +2178,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                             sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                             s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
 
-        if (use_grouped_moe) {
+        if (enable_grouped_moe) {
             const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
                                             ? kernels::MoeMath::WmmaF16
                                             : kernels::MoeMath::WmmaBf16;

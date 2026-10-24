@@ -409,7 +409,8 @@ public:
         std::vector<int32_t> tokens;  // optional: if non-empty, verifies multi-token sequence for this slot
     };
     static void forward_batch_decode(const std::vector<BatchSlotStep> &batch,
-                                     std::vector<std::vector<float>> &out_logits);
+                                     std::vector<std::vector<float>> &out_logits,
+                                     bool use_grouped_moe = true);
     struct MtpTop2 {
         int32_t best = 0;
         float best_v = 0, second_v = 0;
