@@ -2283,13 +2283,16 @@ void Qwen4ExpSession::forward_batch_mtp_top2(
     const Qwen4ExpModel::MtpHead &mtp = m.mtp();
     const Qwen4ExpModel::Layer &l = mtp.layer;
     const int64_t mtp_vocab = s0.mtp_vocab_;
+    auto alloc_act = [&](int64_t elem_count, const std::string &name) {
+        return DeviceBuffer<uint8_t>((size_t)elem_count * e, name);
+    };
 
     // Ensure session buffers are big enough for B tokens:
-    if (s0.mtp_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_emb_ = s0.act_buf(B * D.d, "MTP embedding");
-    if (s0.mtp_norm_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_norm_emb_ = s0.act_buf(B * D.d, "MTP normed embedding");
-    if (s0.mtp_proj_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_proj_emb_ = s0.act_buf(B * D.d, "MTP fc_embedding output");
-    if (s0.mtp_norm_hid_.size() < (size_t)(B * n4) * e) s0.mtp_norm_hid_ = s0.act_buf(B * n4, "MTP normed streams");
-    if (s0.mtp_x_.size() < (size_t)(B * n4) * e) s0.mtp_x_ = s0.act_buf(B * n4, "MTP streams");
+    if (s0.mtp_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_emb_ = alloc_act(B * D.d, "MTP embedding");
+    if (s0.mtp_norm_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_norm_emb_ = alloc_act(B * D.d, "MTP normed embedding");
+    if (s0.mtp_proj_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_proj_emb_ = alloc_act(B * D.d, "MTP fc_embedding output");
+    if (s0.mtp_norm_hid_.size() < (size_t)(B * n4) * e) s0.mtp_norm_hid_ = alloc_act(B * n4, "MTP normed streams");
+    if (s0.mtp_x_.size() < (size_t)(B * n4) * e) s0.mtp_x_ = alloc_act(B * n4, "MTP streams");
 
     if (s0.mtp_pick_.size() < (size_t)B * sizeof(kernels::MtpPick)) {
         s0.mtp_pick_ = DeviceBuffer<uint8_t>((size_t)B * sizeof(kernels::MtpPick), "MTP pick batch");
@@ -2463,7 +2466,7 @@ void Qwen4ExpSession::forward_batch_mtp_top2(
     for (int64_t k = 0; k < B; ++k) {
         Qwen4ExpSession &sk = *sessions[k];
         if (sk.mtp_chain_prev_.size() != (size_t)n4 * e) {
-            sk.mtp_chain_prev_ = sk.act_buf(n4, "MTP chain previous streams");
+            sk.mtp_chain_prev_ = alloc_act(n4, "MTP chain previous streams");
         }
         STRIX_HIP_CHECK(hipMemcpyAsync(sk.mtp_chain_prev_.get(), s0.mtp_x_.get() + (size_t)(k * n4) * e,
                                        (size_t)n4 * e, hipMemcpyDeviceToDevice, stream),

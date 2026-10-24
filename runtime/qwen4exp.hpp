@@ -410,6 +410,11 @@ public:
     };
     static void forward_batch_decode(const std::vector<BatchSlotStep> &batch,
                                      std::vector<std::vector<float>> &out_logits);
+    struct MtpTop2 {
+        int32_t best = 0;
+        float best_v = 0, second_v = 0;
+        bool nan = false;
+    };
     static void forward_batch_mtp_top2(
         const std::vector<Qwen4ExpSession *> &sessions,
         const std::vector<int32_t> &token_ids,
