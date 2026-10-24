@@ -74,15 +74,15 @@ int main(int argc, char **argv) {
     };
     std::vector<std::vector<float>> batch4_exact_logits;
 
-    // 1. Bit-Exact Decode (use_grouped_moe = false):
+    // Batched Decode:
     s0.reset(); s1.reset(); s2.reset(); s3.reset();
     s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
     auto tb_exact0 = std::chrono::steady_clock::now();
-    Qwen4ExpSession::forward_batch_decode(batch4, batch4_exact_logits, false);
+    Qwen4ExpSession::forward_batch_decode(batch4, batch4_exact_logits);
     auto tb_exact1 = std::chrono::steady_clock::now();
     double ms_batch_exact = std::chrono::duration<double, std::milli>(tb_exact1 - tb_exact0).count();
 
-    printf("\n--- Mode 1: Bit-Exact Batched Decode (4 slots, scalar MoE) ---\n");
+    printf("\n--- Batched Decode (4 slots, scalar MoE) ---\n");
     printf("Batched 4 slots step: %.2f ms (%.2f tok/s aggregate)\n", ms_batch_exact, 4000.0 / ms_batch_exact);
     printf("Speedup over unbatched: %.2fx\n", ms_sum / ms_batch_exact);
 
@@ -95,37 +95,6 @@ int main(int argc, char **argv) {
         }
         printf("Slot %d max logit difference: %g (exact: %s)\n", k, max_diffs_exact[k],
                max_diffs_exact[k] == 0.0f ? "TRUE (100% BIT-IDENTICAL)" : "FALSE");
-    }
-
-    // 2. Grouped WMMA Decode (use_grouped_moe = true):
-    s0.reset(); s1.reset(); s2.reset(); s3.reset();
-    s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
-    std::vector<std::vector<float>> batch4_wmma_logits;
-    auto tb_wmma0 = std::chrono::steady_clock::now();
-    Qwen4ExpSession::forward_batch_decode(batch4, batch4_wmma_logits, true);
-    auto tb_wmma1 = std::chrono::steady_clock::now();
-    double ms_batch_wmma = std::chrono::duration<double, std::milli>(tb_wmma1 - tb_wmma0).count();
-
-    printf("\n--- Mode 2: Grouped WMMA Batched Decode (4 slots, matrix cores) ---\n");
-    printf("Batched 4 slots step: %.2f ms (%.2f tok/s aggregate)\n", ms_batch_wmma, 4000.0 / ms_batch_wmma);
-    printf("Speedup over unbatched: %.2fx\n", ms_sum / ms_batch_wmma);
-
-    auto argmax_vec = [&](const std::vector<float> &v) -> int32_t {
-        int32_t b = 0; float bv = v[0];
-        for (int32_t i = 1; i < (int32_t)v.size(); ++i) { if (v[i] > bv) { bv = v[i]; b = i; } }
-        return b;
-    };
-
-    float max_diffs_wmma[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int k = 0; k < 4; ++k) {
-        for (size_t i = 0; i < singles[k]->size(); ++i) {
-            float d = std::abs((*singles[k])[i] - batch4_wmma_logits[k][i]);
-            if (d > max_diffs_wmma[k]) max_diffs_wmma[k] = d;
-        }
-        int32_t single_top = argmax_vec(*singles[k]);
-        int32_t wmma_top = argmax_vec(batch4_wmma_logits[k]);
-        printf("Slot %d max logit diff: %g | Single top token: %d, WMMA top token: %d (match: %s)\n",
-               k, max_diffs_wmma[k], single_top, wmma_top, single_top == wmma_top ? "YES" : "NO");
     }
 
     // --- Batched MTP Speculative Decode Benchmark ---

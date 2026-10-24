@@ -1914,8 +1914,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
 }
 
 void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &batch,
-                                           std::vector<std::vector<float>> &out_logits,
-                                           bool use_grouped_moe) {
+                                           std::vector<std::vector<float>> &out_logits) {
     const int64_t B = (int64_t)batch.size();
     STRIX_CHECK(B >= 1 && B <= 8, "forward_batch_decode: batch size ", B, ", expected 1..8");
     out_logits.resize(B);
@@ -2012,17 +2011,6 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     }
 
     // Embedding:
-    const bool enable_grouped_moe = use_grouped_moe && (T >= 4);
-    if (enable_grouped_moe) {
-        const size_t needed_group_ws = kernels::moe_route_workspace_bytes(T, A, Estack);
-        if (s0.group_ws_bytes_ < needed_group_ws) {
-            s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(T, (int64_t)64), A, Estack);
-            s0.group_ws_ = DeviceBuffer<int32_t>(s0.group_ws_bytes_ / 4, "expert grouping");
-        }
-        if (s0.group_partial_.size() < (size_t)(T * A * D.d)) {
-            s0.group_partial_ = DeviceBuffer<float>((size_t)(std::max(T, (int64_t)64) * A * D.d), "experts combine partials");
-        }
-    }
 
     STRIX_HIP_CHECK(hipMemcpyAsync(s0.ids_.get(), all_ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream),
                     "forward_batch_decode: upload ids");
@@ -2160,29 +2148,10 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                             sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                             s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
 
-        if (enable_grouped_moe) {
-            const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
-                                            ? kernels::MoeMath::WmmaF16
-                                            : kernels::MoeMath::WmmaBf16;
-            kernels::moe_group_routes(s0.route_ids_.get(), T, A, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
-                                      s0.expert_err_.get(), stream);
-            if (em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4) {
-                kernels::linear_q4_experts_gather_grouped_swiglu(s0.u_.get(), l.gate_up.q4, Estack, s0.group_ws_.get(),
-                                                                 s0.group_ws_bytes_, T, A, s0.hh_.get(), act, em, stream);
-            } else {
-                kernels::linear_qw_experts_gather_grouped(s0.u_.get(), l.gate_up, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
-                                                          T, A, s0.gu_.get(), act, em, stream);
-                kernels::swiglu(s0.gu_.get(), s0.hh_.get(), T * A, D.inter, act, stream);
-            }
-            kernels::linear_qw_experts_combine_grouped(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                                       s0.group_ws_.get(), s0.group_ws_bytes_, s0.group_partial_.get(), T, A,
-                                                       s0.y_.get(), act, em, stream);
-        } else {
-            kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), T, A,
-                                                     s0.hh_.get(), act, s0.expert_err_.get(), stream);
-            kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                               T, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
-        }
+        kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), T, A,
+                                                 s0.hh_.get(), act, s0.expert_err_.get(), stream);
+        kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
+                                           T, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
 
         if (sep) {
             lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), T, act);
@@ -2401,38 +2370,10 @@ void Qwen4ExpSession::forward_batch_mtp_top2(
                         sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                         s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
 
-    const bool use_grouped_moe = (B >= 4);
-    if (use_grouped_moe) {
-        const size_t needed_group_ws = kernels::moe_route_workspace_bytes(B, A, Estack);
-        if (s0.group_ws_bytes_ < needed_group_ws) {
-            s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(B, (int64_t)64), A, Estack);
-            s0.group_ws_ = DeviceBuffer<int32_t>(s0.group_ws_bytes_ / 4, "expert grouping");
-        }
-        if (s0.group_partial_.size() < (size_t)(B * A * D.d)) {
-            s0.group_partial_ = DeviceBuffer<float>((size_t)(std::max(B, (int64_t)64) * A * D.d), "experts combine partials");
-        }
-        const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
-                                        ? kernels::MoeMath::WmmaF16
-                                        : kernels::MoeMath::WmmaBf16;
-        kernels::moe_group_routes(s0.route_ids_.get(), B, A, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
-                                  s0.expert_err_.get(), stream);
-        if (em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4) {
-            kernels::linear_q4_experts_gather_grouped_swiglu(s0.u_.get(), l.gate_up.q4, Estack, s0.group_ws_.get(),
-                                                             s0.group_ws_bytes_, B, A, s0.hh_.get(), act, em, stream);
-        } else {
-            kernels::linear_qw_experts_gather_grouped(s0.u_.get(), l.gate_up, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
-                                                      B, A, s0.gu_.get(), act, em, stream);
-            kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B * A, D.inter, act, stream);
-        }
-        kernels::linear_qw_experts_combine_grouped(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                                   s0.group_ws_.get(), s0.group_ws_bytes_, s0.group_partial_.get(), B, A,
-                                                   s0.y_.get(), act, em, stream);
-    } else {
-        kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), B, A,
-                                                 s0.hh_.get(), act, s0.expert_err_.get(), stream);
-        kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                           B, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
-    }
+    kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), B, A,
+                                             s0.hh_.get(), act, s0.expert_err_.get(), stream);
+    kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
+                                       B, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
 
     if (sep) {
         lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), B);

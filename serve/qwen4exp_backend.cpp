@@ -168,7 +168,7 @@ void Qwen4ExpBackend::forward_batch(const std::vector<BatchStep> &steps, std::ve
         batch[(size_t)i].tokens = steps[(size_t)i].ids;
     }
     std::vector<std::vector<float>> batch_logits;
-    Qwen4ExpSession::forward_batch_decode(batch, batch_logits, false);
+    Qwen4ExpSession::forward_batch_decode(batch, batch_logits);
     for (int64_t i = 0; i < B; ++i) {
         out[(size_t)i] = LogitRows::from_full(std::move(batch_logits[(size_t)i]), logits_row());
         if (steps[(size_t)i].masks != nullptr) {
