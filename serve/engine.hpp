@@ -38,8 +38,6 @@
 
 namespace strix {
 
-class Qwen4ExpSession;
-
 // Counters a backend keeps for /metrics and the request log - cumulative, readable from any thread. PLE n-gram rows:
 // requested by forwards, distinct per gather, served from the row cache, read from the table file (SSD / page cache);
 // gathers and their seconds; forwards that waited for their rows at the PLE layer (the GPU idles meanwhile);
@@ -178,7 +176,20 @@ public:
     // The bytes export_snapshot(slot, out, from) will size out to (the prompt cache makes room for them first).
     virtual uint64_t snapshot_bytes(int slot, int64_t from = 0) const = 0;
     virtual void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) = 0;
-    virtual Qwen4ExpSession *session() { return nullptr; }
+    struct BatchStep {
+        LmBackend *backend = nullptr;
+        std::vector<int32_t> ids;
+        bool verify = false;
+        const LogitMasks *masks = nullptr;
+    };
+    virtual void forward_batch(const std::vector<BatchStep> &steps, std::vector<LogitRows> &out) {
+        out.resize(steps.size());
+        for (size_t i = 0; i < steps.size(); ++i) {
+            out[i] = steps[i].verify
+                ? steps[i].backend->forward_verify_rows(steps[i].ids, (int64_t)steps[i].ids.size(), false, steps[i].backend->logits_row(), steps[i].masks)
+                : steps[i].backend->forward_rows(steps[i].ids, 1, false, steps[i].backend->logits_row(), steps[i].masks);
+        }
+    }
     // What a saved state fits: model, weights, layout, activation dtype (PromptCache refuses others).
     virtual std::string state_fingerprint() const = 0;
     virtual std::string describe() const = 0;  // for /health and logs
@@ -398,9 +409,11 @@ private:
 
         struct Request {
             int slot_id = -1;
-            Qwen4ExpSession *session = nullptr;
+            LmBackend *backend = nullptr;
             std::vector<int32_t> tokens;
-            std::vector<float> logits;
+            bool verify = false;
+            const LogitMasks *masks = nullptr;
+            LogitRows result;
             bool done = false;
         };
         std::vector<Request *> reqs;

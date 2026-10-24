@@ -51,6 +51,7 @@ public:
                                   const LogitMasks *masks = nullptr) override {
         return rows_of(ids, n_logits, cands, n_valid, masks, true);
     }
+    void forward_batch(const std::vector<BatchStep> &steps, std::vector<LogitRows> &out) override;
     // Vision (Phase D): the model carries the tower when it was built with a vision.strixw; the image
     // forward mirrors rows_of, with the block's triples set first (the session checks the continuation).
     bool has_vision() const override { return model_.has_vision(); }

@@ -1,5 +1,4 @@
 #include "serve/engine.hpp"
-#include "runtime/qwen4exp.hpp"
 #include "serve/think_nudge.hpp"
 
 #include "serve/capture.hpp"
@@ -350,16 +349,17 @@ int64_t Engine::resume_point(Slot &slot, const std::vector<int32_t> &prompt, int
 
 LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids, bool verify,
                                      const LogitMasks *masks) {
-    Qwen4ExpSession *s = slot.be ? slot.be->session() : nullptr;
-    if (!s || slots_.size() <= 1) {
+    if (slots_.size() <= 1) {
         return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
                       : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
     }
 
     DecodeBatcher::Request my_req;
     my_req.slot_id = slot.id;
-    my_req.session = s;
+    my_req.backend = slot.be;
     my_req.tokens = ids;
+    my_req.verify = verify;
+    my_req.masks = masks;
 
     std::vector<DecodeBatcher::Request *> batch_reqs;
 
@@ -399,17 +399,19 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
     }
 
     if (!batch_reqs.empty()) {
-        std::vector<Qwen4ExpSession::BatchSlotStep> batch(batch_reqs.size());
+        std::vector<LmBackend::BatchStep> steps(batch_reqs.size());
         for (size_t i = 0; i < batch_reqs.size(); ++i) {
-            batch[i].session = batch_reqs[i]->session;
-            batch[i].tokens = batch_reqs[i]->tokens;
+            steps[i].backend = batch_reqs[i]->backend;
+            steps[i].ids = batch_reqs[i]->tokens;
+            steps[i].verify = batch_reqs[i]->verify;
+            steps[i].masks = batch_reqs[i]->masks;
         }
-        std::vector<std::vector<float>> batch_logits;
-        Qwen4ExpSession::forward_batch_decode(batch, batch_logits, true);
+        std::vector<LogitRows> out_rows;
+        batch_reqs[0]->backend->forward_batch(steps, out_rows);
 
         std::lock_guard<std::mutex> lk(batcher_.mu);
         for (size_t i = 0; i < batch_reqs.size(); ++i) {
-            batch_reqs[i]->logits = std::move(batch_logits[i]);
+            batch_reqs[i]->result = std::move(out_rows[i]);
             batch_reqs[i]->done = true;
         }
         batcher_.executing = false;
@@ -417,9 +419,7 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
         batcher_.cv.notify_all();
     }
 
-    LogitRows l = LogitRows::from_full(std::move(my_req.logits), slot.be->logits_row());
-    if (masks != nullptr) apply_masks(l, *masks);
-    return l;
+    return std::move(my_req.result);
 }
 
 void Engine::capture(const Slot &slot, const GenerationRequest &req, const std::vector<CaptureStep> &steps, const std::string &reason) {

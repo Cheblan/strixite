@@ -157,4 +157,24 @@ LogitRows Qwen4ExpBackend::candidate_rows(int64_t rows) const {
     return l;
 }
 
+void Qwen4ExpBackend::forward_batch(const std::vector<BatchStep> &steps, std::vector<LogitRows> &out) {
+    const int64_t B = (int64_t)steps.size();
+    out.resize((size_t)B);
+    std::vector<Qwen4ExpSession::BatchSlotStep> batch(B);
+    for (int64_t i = 0; i < B; ++i) {
+        auto *qb = dynamic_cast<Qwen4ExpBackend *>(steps[(size_t)i].backend);
+        STRIX_CHECK(qb != nullptr, "Qwen4ExpBackend::forward_batch: backend is not Qwen4ExpBackend");
+        batch[(size_t)i].session = &qb->session_;
+        batch[(size_t)i].tokens = steps[(size_t)i].ids;
+    }
+    std::vector<std::vector<float>> batch_logits;
+    Qwen4ExpSession::forward_batch_decode(batch, batch_logits, true);
+    for (int64_t i = 0; i < B; ++i) {
+        out[(size_t)i] = LogitRows::from_full(std::move(batch_logits[(size_t)i]), logits_row());
+        if (steps[(size_t)i].masks != nullptr) {
+            apply_masks(out[(size_t)i], *steps[(size_t)i].masks);
+        }
+    }
+}
+
 }  // namespace strix
