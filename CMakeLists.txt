@@ -254,6 +254,9 @@ target_link_libraries(check_stream_calls PRIVATE strix_serve)
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
+add_executable(test_paged_attention tools/test_paged_attention.cpp)
+target_link_libraries(test_paged_attention PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.

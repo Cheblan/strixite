@@ -69,6 +69,18 @@ struct AttentionShape {
     int64_t q_ts = 0, q_hs = 0;  // q and gate strides: (t, h, d) at q[t*q_ts + h*q_hs + d]
 };
 
+// Paged K/V view: reads keys and values from physical page blocks mapped via block_table.
+// pool_k / pool_v: physical block pool buffer [num_physical_blocks * block_size, Hk, D].
+// block_table: [ceil(capacity / block_size)] device int32 physical block IDs for this sequence.
+struct PagedKvView {
+    const void *pool_k = nullptr;
+    const void *pool_v = nullptr;
+    const int32_t *block_table = nullptr;
+    int64_t capacity = 0;
+    int64_t W = 0;
+    int64_t block_size = 16;
+};
+
 // Bytes of FP32 workspace attention() needs for this shape.
 size_t attention_workspace_bytes(const AttentionShape &s);
 
@@ -85,6 +97,8 @@ void attention(const void *q, const void *gate, const void *k_cache, const void 
 // Likewise for the three below.
 void attention(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale, void *out,
                float *workspace, size_t workspace_bytes, Act act, hipStream_t stream);
+void attention(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s, float scale, void *out,
+               float *workspace, size_t workspace_bytes, Act act, hipStream_t stream);
 
 // QSA sparse attention (full attention with the QSA indexer): as attention(), but query t
 // attends only to the tokens of its selected blocks - sel [T, sel_ld] int32 block indices, nsel [T] their counts
@@ -98,6 +112,9 @@ void attention_gathered(const void *q, const void *gate, const void *k_cache, co
                         void *out, float *workspace, size_t workspace_bytes, uint32_t *err, Act act,
                         hipStream_t stream);
 void attention_gathered(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                        const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                        float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream);
+void attention_gathered(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s,
                         const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
                         float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream);
 void check_attention_error(const uint32_t *err, const char *what);
@@ -118,6 +135,9 @@ void attention_wmma(const void *q, const void *gate, const void *k_cache, const 
 void attention_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s, float scale,
                     void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
                     AttnPrecision precision = AttnPrecision::Exact);
+void attention_wmma(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s, float scale,
+                    void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
+                    AttnPrecision precision = AttnPrecision::Exact);
 size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t sel_ld);
 void attention_gathered_wmma(const void *q, const void *gate, const void *k_cache, const void *v_cache,
                              int64_t capacity, const AttentionShape &s, const int32_t *sel, const int32_t *nsel,
@@ -125,6 +145,10 @@ void attention_gathered_wmma(const void *q, const void *gate, const void *k_cach
                              uint32_t *err, Act act, hipStream_t stream,
                              AttnPrecision precision = AttnPrecision::Exact);
 void attention_gathered_wmma(const void *q, const void *gate, const Kv8View &kv, const AttentionShape &s,
+                             const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                             float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream,
+                             AttnPrecision precision = AttnPrecision::Exact);
+void attention_gathered_wmma(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s,
                              const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
                              float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream,
                              AttnPrecision precision = AttnPrecision::Exact);

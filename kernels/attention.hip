@@ -667,15 +667,28 @@ size_t attention_workspace_bytes(const AttentionShape &s) {
 
 namespace {
 
-// The K/V a call reads: the BF16 / FP32 cache (k, v: [capacity, Hk, D]) or the 8-bit one (q8).
+// The K/V a call reads: the BF16 / FP32 cache (k, v: [capacity, Hk, D]), 8-bit (q8), or paged (paged).
 struct KvArg {
     const void *k = nullptr, *v = nullptr;
     const Kv8View *q8 = nullptr;
+    const PagedKvView *paged = nullptr;
 };
 
 // Pointers, alignment and - for the 8-bit view - that it holds every row [0, pos0 + T): storage below g0, the tail
 // from g0 on (at most kKv8Group rows).
 void check_kv(const char *fn, const KvArg &kv, int64_t capacity, const AttentionShape &s) {
+    if (kv.paged != nullptr) {
+        const PagedKvView &x = *kv.paged;
+        STRIX_CHECK(x.pool_k != nullptr && x.pool_v != nullptr && x.block_table != nullptr, fn,
+                    ": paged K/V view with a null pointer (pool_k=", x.pool_k, ", pool_v=", x.pool_v,
+                    ", block_table=", (const void *)x.block_table, ")");
+        STRIX_CHECK(reinterpret_cast<uintptr_t>(x.pool_k) % 16 == 0 && reinterpret_cast<uintptr_t>(x.pool_v) % 16 == 0,
+                    fn, ": paged K/V pools must be 16-byte aligned");
+        STRIX_CHECK(x.block_size == 16 || x.block_size == 32, fn, ": unsupported paged block_size ", x.block_size,
+                    ", expected 16 or 32");
+        STRIX_CHECK(capacity >= s.pos0 + s.T, fn, ": paged capacity ", capacity, " < pos0 + T = ", s.pos0 + s.T);
+        return;
+    }
     if (kv.q8 == nullptr) {
         STRIX_CHECK(kv.k != nullptr && kv.v != nullptr, fn, ": null K/V cache (k=", kv.k, ", v=", kv.v, ")");
         STRIX_CHECK(reinterpret_cast<uintptr_t>(kv.k) % 16 == 0 && reinterpret_cast<uintptr_t>(kv.v) % 16 == 0, fn,
@@ -714,6 +727,10 @@ template <typename T, typename F>
 void with_reader(const KvArg &kv, int64_t W, F &&f) {
     if (kv.q8 && kv.q8->staged_k) f(kv8_math::StagedReader<T>(*kv.q8));
     else if (kv.q8) f(kv8_math::Kv8Reader<T>(*kv.q8));
+    else if (kv.paged && kv.paged->block_size == 32)
+        f(kv8_math::PagedReader<T, 32>(kv.paged->pool_k, kv.paged->pool_v, kv.paged->block_table, W));
+    else if (kv.paged)
+        f(kv8_math::PagedReader<T, 16>(kv.paged->pool_k, kv.paged->pool_v, kv.paged->block_table, W));
     else f(kv8_math::PlainReader<T>{static_cast<const T *>(kv.k), static_cast<const T *>(kv.v), W});
 }
 
@@ -779,6 +796,12 @@ void attention(const void *q, const void *gate, const Kv8View &kv, const Attenti
                float *workspace, size_t workspace_bytes, Act act, hipStream_t stream) {
     attention_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, scale, out, workspace, workspace_bytes, act,
                    stream);
+}
+
+void attention(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s, float scale, void *out,
+               float *workspace, size_t workspace_bytes, Act act, hipStream_t stream) {
+    attention_impl(q, gate, KvArg{nullptr, nullptr, nullptr, &kv}, kv.capacity, s, scale, out, workspace,
+                   workspace_bytes, act, stream);
 }
 
 namespace {
@@ -852,6 +875,13 @@ void attention_gathered(const void *q, const void *gate, const Kv8View &kv, cons
                         const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
                         float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream) {
     attention_gathered_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld, scale, out,
+                            workspace, workspace_bytes, err, act, stream);
+}
+
+void attention_gathered(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s,
+                        const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                        float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream) {
+    attention_gathered_impl(q, gate, KvArg{nullptr, nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld, scale, out,
                             workspace, workspace_bytes, err, act, stream);
 }
 
@@ -964,6 +994,13 @@ void attention_wmma(const void *q, const void *gate, const Kv8View &kv, const At
                         act, stream, precision);
 }
 
+void attention_wmma(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s, float scale,
+                    void *out, float *workspace, size_t workspace_bytes, Act act, hipStream_t stream,
+                    AttnPrecision precision) {
+    attention_wmma_impl(q, gate, KvArg{nullptr, nullptr, nullptr, &kv}, kv.capacity, s, scale, out, workspace,
+                        workspace_bytes, act, stream, precision);
+}
+
 size_t attention_gathered_wmma_workspace_bytes(const AttentionShape &s, int64_t sel_ld) {
     check_shape(s);
     STRIX_CHECK(sel_ld >= 1 && sel_ld <= 65536, "attention_gathered_wmma_workspace_bytes: sel_ld = ", sel_ld,
@@ -985,6 +1022,14 @@ void attention_gathered_wmma(const void *q, const void *gate, const Kv8View &kv,
                              AttnPrecision precision) {
     attention_gathered_wmma_impl(q, gate, KvArg{nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld, scale, out,
                                  workspace, workspace_bytes, err, act, stream, precision);
+}
+
+void attention_gathered_wmma(const void *q, const void *gate, const PagedKvView &kv, const AttentionShape &s,
+                             const int32_t *sel, const int32_t *nsel, int64_t sel_ld, float scale, void *out,
+                             float *workspace, size_t workspace_bytes, uint32_t *err, Act act, hipStream_t stream,
+                             AttnPrecision precision) {
+    attention_gathered_wmma_impl(q, gate, KvArg{nullptr, nullptr, nullptr, &kv}, kv.capacity, s, sel, nsel, sel_ld,
+                                 scale, out, workspace, workspace_bytes, err, act, stream, precision);
 }
 
 }  // namespace strix::kernels
