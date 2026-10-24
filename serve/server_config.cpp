@@ -239,7 +239,12 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "generation_config.json: the sampling defaults (temperature, top_k, top_p)"},
         {"host", K::Text, 0, 0, server.host, "address to listen on"},
         {"port", K::Int, 1, 65535, std::to_string(server.port), "port to listen on"},
-        {"capacity", K::Int, 4096, 1 << 20, "524288", "positions per session (at most 262144 x rope-yarn-factor)"},
+        {"slot-limit", K::Int, 4096, 1 << 20, "262144",
+         "maximum positions per slot/session (at most 262144 x rope-yarn-factor)"},
+        {"total-capacity", K::Int, 0, 1 << 24, "0",
+         "total unified K/V page pool capacity across all slots in tokens (0 = slot-limit)"},
+        {"capacity", K::Int, 0, 1 << 20, "0",
+         "alias for slot-limit (compatibility with legacy configs)"},
         {"rope-yarn-factor", K::Number, 1, 8, "2",
          "YaRN context extension: positions as trained (262144) x this; 1 = off (RoPE as trained). A change makes "
          "the prompt cache's entries from the other setting unusable (dropped at startup)"},
