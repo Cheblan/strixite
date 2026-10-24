@@ -509,11 +509,6 @@ public:
     // runner-up's (the multiset second; -inf for one logit) and whether any logit was NaN - serve/sampler.hpp top2()
     // on forward_mtp's logits, bit for bit on non-NaN rows - with one small copy back instead of all mtp_vocab()
     // logits. The same state effects as forward_mtp.
-    struct MtpTop2 {
-        int32_t best = 0;
-        float best_v = 0, second_v = 0;
-        bool nan = false;
-    };
     MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step = 0);
     // The draft's vocabulary: forward_mtp scores only ids [0, n) (the LM head's first n rows - BPE ids run roughly
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.

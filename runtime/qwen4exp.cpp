@@ -2298,7 +2298,6 @@ void Qwen4ExpSession::forward_batch_mtp_top2(
         s0.mtp_pick_ = DeviceBuffer<uint8_t>((size_t)B * sizeof(kernels::MtpPick), "MTP pick batch");
     }
 
-    auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M) {
         kernels::linear_qw(x, w, y, M, act, act, stream);
     };
