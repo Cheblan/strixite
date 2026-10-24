@@ -440,8 +440,8 @@ public:
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         bool mtp_gating = false;  // adaptive step gating to reject low-confidence drafts early
-        float mtp_gating_step0_boost = 0.3f;  // additional margin required for initial draft step 0
-        float mtp_gating_decay = 0.15f;       // margin decay per subsequent draft step
+        float mtp_gating_step0_boost = 0.05f;  // additional margin required for initial draft step 0
+        float mtp_gating_decay = 0.02f;        // margin decay per subsequent draft step
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
