@@ -2261,6 +2261,235 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     }
 }
 
+void Qwen4ExpSession::forward_batch_mtp_top2(
+    const std::vector<Qwen4ExpSession *> &sessions,
+    const std::vector<int32_t> &token_ids,
+    int64_t step,
+    std::vector<MtpTop2> &out_picks) {
+    const int64_t B = (int64_t)sessions.size();
+    STRIX_CHECK(B >= 1 && B <= 8, "forward_batch_mtp_top2: batch size ", B, ", expected 1..8");
+    STRIX_CHECK(B == (int64_t)token_ids.size(), "forward_batch_mtp_top2: size mismatch");
+    out_picks.resize(B);
+
+    Qwen4ExpSession &s0 = *sessions[0];
+    const Qwen4ExpModel &m = s0.m_;
+    const Qwen4ExpDims &D = m.dims();
+    const Act act = m.act();
+    const size_t e = es(act);
+    const bool sep = m.shared_separate();
+    const hipStream_t stream = s0.stream_;
+    const int64_t n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
+    const int64_t Estack = D.experts + (sep ? 0 : 1);
+    const Qwen4ExpModel::MtpHead &mtp = m.mtp();
+    const Qwen4ExpModel::Layer &l = mtp.layer;
+    const int64_t mtp_vocab = s0.mtp_vocab_;
+
+    // Ensure session buffers are big enough for B tokens:
+    if (s0.mtp_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_emb_ = s0.act_buf(B * D.d, "MTP embedding");
+    if (s0.mtp_norm_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_norm_emb_ = s0.act_buf(B * D.d, "MTP normed embedding");
+    if (s0.mtp_proj_emb_.size() < (size_t)(B * D.d) * e) s0.mtp_proj_emb_ = s0.act_buf(B * D.d, "MTP fc_embedding output");
+    if (s0.mtp_norm_hid_.size() < (size_t)(B * n4) * e) s0.mtp_norm_hid_ = s0.act_buf(B * n4, "MTP normed streams");
+    if (s0.mtp_x_.size() < (size_t)(B * n4) * e) s0.mtp_x_ = s0.act_buf(B * n4, "MTP streams");
+
+    if (s0.mtp_pick_.size() < (size_t)B * sizeof(kernels::MtpPick)) {
+        s0.mtp_pick_ = DeviceBuffer<uint8_t>((size_t)B * sizeof(kernels::MtpPick), "MTP pick batch");
+    }
+
+    auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
+    auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M) {
+        kernels::linear_qw(x, w, y, M, act, act, stream);
+    };
+
+    auto hc_mix = [&](const Qwen4ExpModel::Hc &hc, bool inject) {
+        float *w_in = inject ? s0.w_in_.get() : nullptr;
+        if (hc.down.bits == 8)
+            kernels::hc_mix_down(s0.mtp_x_.get(), hc.down.q8, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+        else
+            kernels::hc_mix_down(s0.mtp_x_.get(), hc.down.q4, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+        if (hc.up.bits == 8)
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q8, s0.mtp_x_.get(), hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+        else
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q4, s0.mtp_x_.get(), hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+    };
+
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *sessions[k];
+        sk.broken_ = true;
+        sk.mtp_chain_step_ = -1;
+    }
+
+    // 1. Upload tokens:
+    STRIX_HIP_CHECK(hipMemcpyAsync(s0.ids_.get(), token_ids.data(), (size_t)B * 4, hipMemcpyHostToDevice, stream),
+                    "uploading MTP token ids");
+    kernels::reset_embedding_error(s0.emb_err_.get(), stream);
+
+    // 2. MTP input:
+    if (m.is_embed_q8())
+        kernels::embedding_lookup(s0.ids_.get(), B, m.embed_q8(), s0.mtp_emb_.get(), act, s0.emb_err_.get(), stream);
+    else
+        kernels::embedding_lookup(s0.ids_.get(), B, m.embed(), D.vocab, D.d, s0.mtp_emb_.get(), act, s0.emb_err_.get(), stream);
+    kernels::rmsnorm_zc(s0.mtp_emb_.get(), mtp.pre_fc_norm_embedding, s0.mtp_norm_emb_.get(), B, D.d, D.eps, act, stream);
+
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *sessions[k];
+        const void *prev_k = step == 0 ? sk.mtp_prev_.get() : sk.mtp_chain_prev_.get();
+        kernels::group_rmsnorm_zc(prev_k, mtp.pre_fc_norm_hidden, s0.mtp_norm_hid_.get() + (size_t)(k * n4) * e,
+                                  1, D.H, D.d, D.eps, act, stream);
+    }
+
+    lin(s0.mtp_norm_emb_.get(), mtp.fc_embedding, s0.mtp_proj_emb_.get(), B);
+    lin(s0.mtp_norm_hid_.get(), mtp.fc_hidden, s0.mtp_x_.get(), B * D.H);
+    kernels::hc_inject(s0.mtp_x_.get(), s0.mtp_ones_.get(), s0.mtp_proj_emb_.get(), B, D.H, D.d, act, stream);
+
+    // 3. Attention block:
+    hc_mix(l.hc_attn, true);
+    kernels::linear_qw(s0.u_.get(), l.qkv, s0.proj_.get(), B, act, act, stream);
+
+    const int64_t W = D.hkv * hd;
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *sessions[k];
+        const int64_t p_k = sk.pos_ + step;
+        sk.prepare_positions(p_k, 1);
+        const int64_t rope_p = sk.mk_jobs_.pos3 == nullptr ? sk.rope_pos(p_k) : p_k;
+        uint8_t *kc = sk.k_cache_mtp_.get(), *vc = sk.v_cache_mtp_.get();
+        const void *tail_in = step == 0 ? sk.tail_mtp_[sk.mtp_tail_cur_].get()
+                              : step == 1 ? sk.tail_mtp_[1 - sk.mtp_tail_cur_].get()
+                                          : sk.mtp_chain_tail_[step % 2].get();
+        void *tail_out = step == 0 ? sk.tail_mtp_[1 - sk.mtp_tail_cur_].get()
+                                   : sk.mtp_chain_tail_[(step + 1) % 2].get();
+
+        uint8_t *proj_k = s0.proj_.get() + (size_t)(k * D.astride) * e;
+        const bool qsa_layer = p_k + 1 > D.dense_key_limit();
+        const kernels::NormRopeJob nr[4] = {
+            {proj_k, D.astride, 2 * hd, proj_k, D.astride, 2 * hd, D.hq, hd, l.q_norm},
+            {proj_k + (size_t)(D.hq * 2 * hd) * e, D.astride, hd, kc + (size_t)(p_k * W) * e, W, hd, D.hkv, hd, l.k_norm},
+            {proj_k + (size_t)(D.hq * 2 * hd + D.hkv * hd) * e, D.astride, hd, vc + (size_t)(p_k * W) * e, W, hd, D.hkv, hd, nullptr},
+            {proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, D.idx_h, D.idx_d, l.idx_q_norm}
+        };
+        kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, 1, D.eps, D.rot, rope_p, m.inv_freq(), act, stream,
+                                   m.rope_scale(), sk.mk_jobs_);
+        kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, 1, p_k,
+                                p_k % kernels::kQsaBlock ? tail_in : nullptr, tail_out, D.idx_d, l.idx_k_norm, D.eps,
+                                m.inv_freq(), D.rot, sk.block_keys_mtp_.get(), sk.cap_blocks_, act, stream,
+                                m.rope_scale(), sk.mk_block_);
+        const kernels::AttentionShape as{1, p_k, D.hq, D.hkv, hd, D.astride, 2 * hd};
+        const float scale = 1.0f / std::sqrt((float)hd);
+        uint8_t *core_k = s0.core_.get() + (size_t)(k * (D.hq * hd)) * e;
+        if (!qsa_layer) {
+            kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
+                               core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+        } else {
+            const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
+            void *iq = proj_k + (size_t)D.idx_col * e;
+            kernels::qsa_scores(iq, D.astride, D.idx_d, 1, p_k, D.idx_h, D.idx_d,
+                                sk.block_keys_mtp_.get(), sk.cap_blocks_,
+                                s0.qsa_scores_.get(), sk.cap_blocks_, act, stream);
+            kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, 1, p_k, qsa_k,
+                              s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
+                              s0.qsa_topk_ws_bytes_, stream);
+            kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
+                                        s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                        core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, s0.attn_err_.get(), act, stream);
+        }
+    }
+    kernels::linear_qw(s0.core_.get(), l.o_proj, s0.y_.get(), B, act, act, stream);
+    kernels::hc_inject(s0.mtp_x_.get(), s0.w_in_.get(), s0.y_.get(), B, D.H, D.d, act, stream);
+
+    // 4. MoE block:
+    hc_mix(l.hc_mlp, true);
+    kernels::linear_bf16w(s0.u_.get(), l.router, s0.router_logits_.get(), B, D.experts + 1, D.d, act, Act::F32, stream);
+    kernels::moe_router(s0.router_logits_.get(), D.experts + 1, B, D.experts, D.top_k,
+                        sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
+                        s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
+
+    const bool use_grouped_moe = (B >= 4);
+    if (use_grouped_moe) {
+        const size_t needed_group_ws = kernels::moe_route_workspace_bytes(B, A, Estack);
+        if (s0.group_ws_bytes_ < needed_group_ws) {
+            s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(B, (int64_t)64), A, Estack);
+            s0.group_ws_ = DeviceBuffer<int32_t>(s0.group_ws_bytes_ / 4, "expert grouping");
+        }
+        if (s0.group_partial_.size() < (size_t)(B * A * D.d)) {
+            s0.group_partial_ = DeviceBuffer<float>((size_t)(std::max(B, (int64_t)64) * A * D.d), "experts combine partials");
+        }
+        const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
+                                        ? kernels::MoeMath::WmmaF16
+                                        : kernels::MoeMath::WmmaBf16;
+        kernels::moe_group_routes(s0.route_ids_.get(), B, A, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
+                                  s0.expert_err_.get(), stream);
+        if (em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4) {
+            kernels::linear_q4_experts_gather_grouped_swiglu(s0.u_.get(), l.gate_up.q4, Estack, s0.group_ws_.get(),
+                                                             s0.group_ws_bytes_, B, A, s0.hh_.get(), act, em, stream);
+        } else {
+            kernels::linear_qw_experts_gather_grouped(s0.u_.get(), l.gate_up, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
+                                                      B, A, s0.gu_.get(), act, em, stream);
+            kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B * A, D.inter, act, stream);
+        }
+        kernels::linear_qw_experts_combine_grouped(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
+                                                   s0.group_ws_.get(), s0.group_ws_bytes_, s0.group_partial_.get(), B, A,
+                                                   s0.y_.get(), act, em, stream);
+    } else {
+        kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), B, A,
+                                                 s0.hh_.get(), act, s0.expert_err_.get(), stream);
+        kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
+                                           B, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
+    }
+
+    if (sep) {
+        lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), B);
+        kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B, D.inter, act, stream);
+        lin(s0.hh_.get(), l.shared_down, s0.sh_y_.get(), B);
+        kernels::moe_shared_add_inject(s0.y_.get(), s0.sh_y_.get(), s0.router_logits_.get() + D.experts, D.experts + 1,
+                                       B, D.d, (uint32_t)D.experts, s0.mtp_x_.get(), s0.w_in_.get(), D.H, act,
+                                       s0.router_err_.get(), stream);
+    } else {
+        kernels::hc_inject(s0.mtp_x_.get(), s0.w_in_.get(), s0.y_.get(), B, D.H, D.d, act, stream);
+    }
+
+    // 5. MTP mixer & LM Head:
+    hc_mix(mtp.hc_mixer, false);
+    const QWeightView &draft = m.draft_head_q4();
+    QWeightView head = draft.bits != 0 && mtp_vocab <= draft.N() ? draft : m.lm_head();
+    switch (head.bits) {
+        case 8: head.q8.N = mtp_vocab; break;
+        case 6: head.q6.N = mtp_vocab; break;
+        case 5: head.q5.N = mtp_vocab; break;
+        case 4: head.q4.N = mtp_vocab; break;
+        default: break;
+    }
+    kernels::linear_qw(s0.u_.get(), head, s0.logits_.get(), B, act, Act::F32, stream);
+
+    // Save chain prev streams for each slot:
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *sessions[k];
+        if (sk.mtp_chain_prev_.size() != (size_t)n4 * e) {
+            sk.mtp_chain_prev_ = sk.act_buf(n4, "MTP chain previous streams");
+        }
+        STRIX_HIP_CHECK(hipMemcpyAsync(sk.mtp_chain_prev_.get(), s0.mtp_x_.get() + (size_t)(k * n4) * e,
+                                       (size_t)n4 * e, hipMemcpyDeviceToDevice, stream),
+                        "saving MTP chain previous stream");
+    }
+
+    // 6. Batched pick:
+    auto *dev_pick = reinterpret_cast<kernels::MtpPick *>(s0.mtp_pick_.get());
+    kernels::mtp_pick_batch(s0.logits_.get(), mtp_vocab, B, s0.router_err_.get(), s0.expert_err_.get(),
+                            s0.attn_err_.get(), s0.emb_err_.get(), dev_pick, stream);
+
+    STRIX_CHECK(s0.readback_.size() >= kReadbackLogitsAt + (size_t)B * sizeof(kernels::MtpPick),
+                "pinned area too small");
+    auto *host_picks = reinterpret_cast<kernels::MtpPick *>(static_cast<uint8_t *>(s0.readback_.get()) + kReadbackLogitsAt);
+    STRIX_HIP_CHECK(hipMemcpyAsync(host_picks, dev_pick, (size_t)B * sizeof(kernels::MtpPick),
+                                   hipMemcpyDeviceToHost, stream),
+                    "reading MTP picks");
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "sync MTP batch draft");
+
+    for (int64_t k = 0; k < B; ++k) {
+        const kernels::MtpPick &p = host_picks[k];
+        out_picks[k] = {p.best, p.best_v, p.second_v, p.nan != 0};
+        sessions[k]->mtp_done(step);
+    }
+}
+
 std::vector<std::vector<int32_t>> Qwen4ExpSession::step_batch_mtp(
     const std::vector<Qwen4ExpSession *> &sessions,
     const std::vector<int32_t> &current_tokens,
@@ -2272,19 +2501,37 @@ std::vector<std::vector<int32_t>> Qwen4ExpSession::step_batch_mtp(
 
     std::vector<BatchSlotStep> batch(B);
     for (int64_t k = 0; k < B; ++k) {
-        Qwen4ExpSession *s = sessions[k];
-        batch[k].session = s;
+        batch[k].session = sessions[k];
         batch[k].token_id = current_tokens[k];
         batch[k].tokens = {current_tokens[k]};
-        if (s->has_mtp() && max_draft > 0) {
-            MtpTop2 t0 = s->forward_mtp_top2(current_tokens[k], 0);
-            if (!t0.nan && t0.best_v - t0.second_v >= mtp_margin) {
-                batch[k].tokens.push_back(t0.best);
+    }
+
+    if (sessions[0]->has_mtp() && max_draft > 0) {
+        std::vector<MtpTop2> picks0;
+        forward_batch_mtp_top2(sessions, current_tokens, 0, picks0);
+
+        std::vector<int64_t> drafted_step1_indices;
+        std::vector<Qwen4ExpSession *> step1_sessions;
+        std::vector<int32_t> step1_tokens;
+
+        for (int64_t k = 0; k < B; ++k) {
+            if (!picks0[k].nan && picks0[k].best_v - picks0[k].second_v >= mtp_margin) {
+                batch[k].tokens.push_back(picks0[k].best);
                 if (max_draft >= 2) {
-                    MtpTop2 t1 = s->forward_mtp_top2(t0.best, 1);
-                    if (!t1.nan && t1.best_v - t1.second_v >= mtp_margin) {
-                        batch[k].tokens.push_back(t1.best);
-                    }
+                    drafted_step1_indices.push_back(k);
+                    step1_sessions.push_back(sessions[k]);
+                    step1_tokens.push_back(picks0[k].best);
+                }
+            }
+        }
+
+        if (!step1_sessions.empty()) {
+            std::vector<MtpTop2> picks1;
+            forward_batch_mtp_top2(step1_sessions, step1_tokens, 1, picks1);
+            for (size_t i = 0; i < step1_sessions.size(); ++i) {
+                int64_t k = drafted_step1_indices[i];
+                if (!picks1[i].nan && picks1[i].best_v - picks1[i].second_v >= mtp_margin) {
+                    batch[k].tokens.push_back(picks1[i].best);
                 }
             }
         }

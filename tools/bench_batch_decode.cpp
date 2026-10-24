@@ -130,15 +130,30 @@ int main(int argc, char **argv) {
                 batch[k].session = sessions[k];
                 batch[k].token_id = cur_tokens[k];
                 batch[k].tokens = {cur_tokens[k]};
-                if (sessions[k]->has_mtp()) {
-                    auto t0 = sessions[k]->forward_mtp_top2(cur_tokens[k], 0);
-                    if (!t0.nan && t0.best_v - t0.second_v >= 0.15f) {
-                        batch[k].tokens.push_back(t0.best);
+            }
+            if (sessions[0]->has_mtp() && max_draft > 0) {
+                std::vector<Qwen4ExpSession::MtpTop2> picks0;
+                Qwen4ExpSession::forward_batch_mtp_top2(sessions, cur_tokens, 0, picks0);
+                std::vector<int64_t> drafted_step1_indices;
+                std::vector<Qwen4ExpSession *> step1_sessions;
+                std::vector<int32_t> step1_tokens;
+                for (int k = 0; k < 4; ++k) {
+                    if (!picks0[k].nan && picks0[k].best_v - picks0[k].second_v >= 0.15f) {
+                        batch[k].tokens.push_back(picks0[k].best);
                         if (max_draft >= 2) {
-                            auto t1 = sessions[k]->forward_mtp_top2(t0.best, 1);
-                            if (!t1.nan && t1.best_v - t1.second_v >= 0.15f) {
-                                batch[k].tokens.push_back(t1.best);
-                            }
+                            drafted_step1_indices.push_back(k);
+                            step1_sessions.push_back(sessions[k]);
+                            step1_tokens.push_back(picks0[k].best);
+                        }
+                    }
+                }
+                if (!step1_sessions.empty()) {
+                    std::vector<Qwen4ExpSession::MtpTop2> picks1;
+                    Qwen4ExpSession::forward_batch_mtp_top2(step1_sessions, step1_tokens, 1, picks1);
+                    for (size_t i = 0; i < step1_sessions.size(); ++i) {
+                        int64_t k = drafted_step1_indices[i];
+                        if (!picks1[i].nan && picks1[i].best_v - picks1[i].second_v >= 0.15f) {
+                            batch[k].tokens.push_back(picks1[i].best);
                         }
                     }
                 }
@@ -205,6 +220,29 @@ int main(int argc, char **argv) {
                total_ms_draft / kMtpSteps, total_ms_forward / kMtpSteps);
         printf("Speedup over unbatched serial: %.2fx\n",
                ((double)total_tokens_generated / (ms_mtp / 1000.0)) / (4000.0 / ms_sum));
+    }
+
+    {
+        printf("\n--- Qwen4ExpSession::step_batch_mtp direct benchmark (4 slots, max_draft=2) ---\n");
+        s0.reset(); s1.reset(); s2.reset(); s3.reset();
+        s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
+        cur_tokens = {tok0, tok1, tok2, tok3};
+        int64_t total_tokens_generated = 0;
+        const int kSteps = 10;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int step = 0; step < kSteps; ++step) {
+            auto accepted = Qwen4ExpSession::step_batch_mtp(sessions, cur_tokens, 2, 0.15f);
+            for (int k = 0; k < 4; ++k) {
+                total_tokens_generated += accepted[k].size();
+                cur_tokens[k] = accepted[k].back();
+            }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        printf("step_batch_mtp (%d steps): %ld tokens in %.2f ms (%.2f tok/s aggregate, %.2f tok/step)\n",
+               kSteps, (long)total_tokens_generated, ms,
+               (double)total_tokens_generated / (ms / 1000.0),
+               (double)total_tokens_generated / kSteps);
     }
 
     return 0;

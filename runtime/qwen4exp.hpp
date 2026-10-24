@@ -410,6 +410,11 @@ public:
     };
     static void forward_batch_decode(const std::vector<BatchSlotStep> &batch,
                                      std::vector<std::vector<float>> &out_logits);
+    static void forward_batch_mtp_top2(
+        const std::vector<Qwen4ExpSession *> &sessions,
+        const std::vector<int32_t> &token_ids,
+        int64_t step,
+        std::vector<MtpTop2> &out_picks);
     static std::vector<std::vector<int32_t>> step_batch_mtp(
         const std::vector<Qwen4ExpSession *> &sessions,
         const std::vector<int32_t> &current_tokens,
