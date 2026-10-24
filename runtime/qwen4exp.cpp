@@ -2054,6 +2054,8 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
         all_ids.insert(all_ids.end(), toks.begin(), toks.end());
     }
     const int64_t T = offsets[B];
+    STRIX_CHECK(T <= kMaxLogits, "forward_batch_decode: total tokens ", T,
+                " exceeds kMaxLogits (", kMaxLogits, ")");
 
     for (int64_t k = 0; k < B; ++k) {
         Qwen4ExpSession &sk = *batch[k].session;
@@ -2905,7 +2907,7 @@ void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
     mtp_vocab_ = n;
 }
 
-void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
+void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0, hipStream_t stream) {
     STRIX_CHECK(mtp_, "Qwen4ExpSession::mtp_input: MTP is off");
     STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::mtp_input: ", T, " rows, expected 1..", max_tokens_);
     const Qwen4ExpDims &D = m_.dims();
@@ -2915,25 +2917,25 @@ void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
     const Qwen4ExpModel::MtpHead &mtp = m_.mtp();
     const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M) {
-        if (wmma && M >= kWmmaMinTokens) kernels::linear_qw_wmma(x, w, y, M, act, act, stream_);
-        else kernels::linear_qw(x, w, y, M, act, act, stream_);
+        if (wmma && M >= kWmmaMinTokens) kernels::linear_qw_wmma(x, w, y, M, act, act, stream);
+        else kernels::linear_qw(x, w, y, M, act, act, stream);
     };
     // e = rmsnorm_zc(embed(token)) [T, d]; h = the previous streams, each stream normed [T, H, d].
     if (m_.is_embed_q8())
-        kernels::embedding_lookup(ids_.get(), T, m_.embed_q8(), mtp_emb_.get(), act, emb_err_.get(), stream_);
+        kernels::embedding_lookup(ids_.get(), T, m_.embed_q8(), mtp_emb_.get(), act, emb_err_.get(), stream);
     else
-        kernels::embedding_lookup(ids_.get(), T, m_.embed(), D.vocab, D.d, mtp_emb_.get(), act, emb_err_.get(), stream_);
-    kernels::rmsnorm_zc(mtp_emb_.get(), mtp.pre_fc_norm_embedding, mtp_norm_emb_.get(), T, D.d, D.eps, act, stream_);
+        kernels::embedding_lookup(ids_.get(), T, m_.embed(), D.vocab, D.d, mtp_emb_.get(), act, emb_err_.get(), stream);
+    kernels::rmsnorm_zc(mtp_emb_.get(), mtp.pre_fc_norm_embedding, mtp_norm_emb_.get(), T, D.d, D.eps, act, stream);
     STRIX_CHECK(prev0 != nullptr, "Qwen4ExpSession::mtp_input: null previous streams");
-    kernels::group_rmsnorm_zc(prev0, mtp.pre_fc_norm_hidden, mtp_norm_hid_.get(), 1, D.H, D.d, D.eps, act, stream_);
+    kernels::group_rmsnorm_zc(prev0, mtp.pre_fc_norm_hidden, mtp_norm_hid_.get(), 1, D.H, D.d, D.eps, act, stream);
     if (T > 1)
         kernels::group_rmsnorm_zc(x_.get(), mtp.pre_fc_norm_hidden, mtp_norm_hid_.get() + (size_t)n4 * e, T - 1, D.H,
-                                  D.d, D.eps, act, stream_);
+                                  D.d, D.eps, act, stream);
     // Per stream s: x_s = fc_embedding(e) + fc_hidden(h_s) - fc_hidden over the T * H stream rows ([T, H, d] is
     // [T * H, d]), then fc_embedding's row added to each of its token's streams (an injection with weight 1).
     lin(mtp_norm_emb_.get(), mtp.fc_embedding, mtp_proj_emb_.get(), T);
     lin(mtp_norm_hid_.get(), mtp.fc_hidden, mtp_x_.get(), T * D.H);
-    kernels::hc_inject(mtp_x_.get(), mtp_ones_.get(), mtp_proj_emb_.get(), T, D.H, D.d, act, stream_);
+    kernels::hc_inject(mtp_x_.get(), mtp_ones_.get(), mtp_proj_emb_.get(), T, D.H, D.d, act, stream);
 }
 
 void Qwen4ExpSession::step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream) {
@@ -2963,7 +2965,7 @@ void Qwen4ExpSession::step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream
         else
             kernels::hc_mix_up(h_.get(), hc.up.q4, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream);
     };
-    mtp_input(T, mtp_prev_.get());
+    mtp_input(T, mtp_prev_.get(), stream);
     hc_mix(ml.hc_attn, true, false, mtp_x_.get());
     lin(u_.get(), ml.qkv, proj_.get(), T);
     const int64_t rope0 = pos0 + rope_delta_;
@@ -3100,7 +3102,7 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     }
     STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), &token_id, 4, hipMemcpyHostToDevice, stream_), "uploading the MTP token id");
     kernels::reset_embedding_error(emb_err_.get(), stream_);
-    mtp_input(T, step == 0 ? mtp_prev_.get() : mtp_chain_prev_.get());
+    mtp_input(T, step == 0 ? mtp_prev_.get() : mtp_chain_prev_.get(), stream_);
 
     // The layer, as a trunk full-attention layer at position p. Step 0's KV row and block keys are the ones the next
     // forward's catch-up writes again from the same inputs; a chain step's, until the position runs, its guess.

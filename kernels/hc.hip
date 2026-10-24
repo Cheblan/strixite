@@ -255,12 +255,12 @@ __global__ void __launch_bounds__(kThreads)
 // Q4 G64; RW 1/2/4 x KS 1/2/4/8): T = 1 best at RW 1, KS 2
 // (13.2 us, 62% of read peak - the ~1.9 MB matrix is latency-bound like linear_q4's of that size); T = 4 at
 // RW 2, KS 1 (21.3 us), where sharing each X load across rows starts to pay. Sharing X didn't help at T = 1.
-int split_k(int64_t T) { (void)T; return 1; }
-int rows_per_wave(int64_t T) { (void)T; return 2; }
+int split_k(int64_t T) { return T == 1 ? 2 : 1; }
+int rows_per_wave(int64_t T) { return T == 1 ? 1 : 2; }
 
 // Tokens per block (MT) for hc_mix_up: every token of a block shares each weight load. The instantiated sizes; a
 // verify is T = drafts + 1 = 5; above 8 the tokens go in blocks of 8 (a partial last block).
-int tokens_per_block(int64_t T) { (void)T; return 1; }
+int tokens_per_block(int64_t T) { return T == 1 ? 1 : T == 2 ? 2 : T <= 4 ? 4 : T == 5 ? 5 : 8; }
 
 // A weight's arrays whichever format it's in (the kernels take raw pointers + BITS).
 struct QArrays {

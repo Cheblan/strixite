@@ -624,7 +624,7 @@ private:
     int64_t mtp_chain_step_ = -1, mtp_chain_pos_ = -1;
     // The MTP layer's input for T rows at positions pos_..pos_+T-1 into mtp_x_: token ids_[t] with the streams
     // after position pos_ + t - 1 (prev0 for t = 0, x_ row t - 1 after it).
-    void mtp_input(int64_t T, const void *prev0);
+    void mtp_input(int64_t T, const void *prev0, hipStream_t stream);
     void step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream);
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
     // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(step)).

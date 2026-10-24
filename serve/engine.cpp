@@ -146,6 +146,10 @@ Engine::~Engine() {
         stop_ = true;
     }
     cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(batcher_.mu);
+    }
+    batcher_.cv.notify_all();
     for (auto &t : workers_) {
         if (t.joinable()) t.join();
     }
@@ -381,6 +385,8 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
                 return (int)batcher_.reqs.size() >= batcher_.active_decoders || batcher_.executing || stop_;
             });
             if (stop_) {
+                auto it = std::find(batcher_.reqs.begin(), batcher_.reqs.end(), &my_req);
+                if (it != batcher_.reqs.end()) batcher_.reqs.erase(it);
                 return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
                               : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
             }
@@ -393,6 +399,12 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
             batcher_.reqs.clear();
         } else {
             batcher_.cv.wait(lk, [&] { return my_req.done || stop_; });
+            if (!my_req.done && stop_) {
+                auto it = std::find(batcher_.reqs.begin(), batcher_.reqs.end(), &my_req);
+                if (it != batcher_.reqs.end()) batcher_.reqs.erase(it);
+                return verify ? slot.be->forward_verify_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks)
+                              : slot.be->forward_rows(ids, (int64_t)ids.size(), false, tok_.size(), masks);
+            }
         }
     }
 
@@ -409,10 +421,15 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
             try {
                 batch_reqs[0]->backend->forward_batch(steps, out_rows);
             } catch (...) {
+                std::exception_ptr eptr = std::current_exception();
                 std::lock_guard<std::mutex> lk(batcher_.mu);
+                for (size_t i = 0; i < batch_reqs.size(); ++i) {
+                    batch_reqs[i]->error = eptr;
+                    batch_reqs[i]->done = true;
+                }
                 batcher_.executing = false;
                 batcher_.cv.notify_all();
-                throw;
+                std::rethrow_exception(eptr);
             }
 
             std::lock_guard<std::mutex> lk(batcher_.mu);
@@ -423,7 +440,15 @@ LogitRows Engine::batch_forward_rows(Slot &slot, const std::vector<int32_t> &ids
             batcher_.executing = false;
             batcher_.gen++;
             batcher_.cv.notify_all();
+        } else {
+            std::lock_guard<std::mutex> lk(batcher_.mu);
+            batcher_.executing = false;
+            batcher_.cv.notify_all();
         }
+    }
+
+    if (my_req.error) {
+        std::rethrow_exception(my_req.error);
     }
 
     return std::move(my_req.result);
