@@ -699,6 +699,7 @@ public:
     // logits. The same state effects as forward_mtp.
     struct MtpTop2 {
         int32_t best = 0;
+        int32_t second = 0;
         float best_v = 0, second_v = 0;
         bool nan = false;
     };

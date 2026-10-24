@@ -13,24 +13,26 @@ namespace {
 constexpr int kThreads = 1024;
 constexpr int kLanes = 32;  // shuffle width (gfx11 wave32)
 
-// A partial top-2: the best value and its index (INT_MAX = nothing seen yet), the runner-up value, NaN seen.
+// A partial top-2: the best value and its index (INT_MAX = nothing seen yet), the runner-up value and index, NaN seen.
 struct Part {
     float b1, b2;
-    int i1;
+    int i1, i2;
     uint32_t nan;
 };
 
 __device__ inline Part merge(const Part &a, const Part &b) {
-    if (b.i1 == INT_MAX) return {a.b1, a.b2, a.i1, a.nan | b.nan};
-    if (a.i1 == INT_MAX) return {b.b1, b.b2, b.i1, a.nan | b.nan};
+    if (b.i1 == INT_MAX) return a;
+    if (a.i1 == INT_MAX) return b;
     const bool a_wins = a.b1 > b.b1 || (a.b1 == b.b1 && a.i1 < b.i1);
     const Part &w = a_wins ? a : b, &l = a_wins ? b : a;
-    // The loser's best is at least its own runner-up, so it and the winner's runner-up are the candidates.
-    return {w.b1, fmaxf(w.b2, l.b1), w.i1, a.nan | b.nan};
+    // The runner-up candidate is either winner's runner-up or loser's best
+    const bool w2_wins = w.b2 > l.b1 || (w.b2 == l.b1 && w.i2 < l.i1);
+    return {w.b1, w2_wins ? w.b2 : l.b1, w.i1, w2_wins ? w.i2 : l.i1, a.nan | b.nan};
 }
 
 __device__ inline Part shfl_xor(const Part &p, int off) {
-    return {__shfl_xor(p.b1, off, kLanes), __shfl_xor(p.b2, off, kLanes), __shfl_xor(p.i1, off, kLanes),
+    return {__shfl_xor(p.b1, off, kLanes), __shfl_xor(p.b2, off, kLanes),
+            __shfl_xor(p.i1, off, kLanes), __shfl_xor(p.i2, off, kLanes),
             (uint32_t)__shfl_xor((int)p.nan, off, kLanes)};
 }
 
@@ -40,7 +42,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ Part wave_part[kThreads / kLanes];
     const int tid = threadIdx.x, lane = tid % kLanes, wave = tid / kLanes;
     // Each thread's indices ascend, so a strict > keeps the lower index of equal values (top2's order).
-    Part p{-INFINITY, -INFINITY, INT_MAX, 0u};
+    Part p{-INFINITY, -INFINITY, INT_MAX, INT_MAX, 0u};
     for (int64_t i = tid; i < n; i += kThreads) {
         const float v = x[i];
         if (v != v) {
@@ -49,21 +51,23 @@ __global__ void __launch_bounds__(kThreads)
         }
         if (p.i1 == INT_MAX || v > p.b1) {
             p.b2 = p.b1;  // -inf before the first logit
+            p.i2 = p.i1;
             p.b1 = v, p.i1 = (int)i;
         } else if (v > p.b2) {
             p.b2 = v;
+            p.i2 = (int)i;
         }
     }
     for (int off = kLanes / 2; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
     if (lane == 0) wave_part[wave] = p;
     __syncthreads();
     if (wave != 0) return;
-    p = lane < kThreads / kLanes ? wave_part[lane] : Part{-INFINITY, -INFINITY, INT_MAX, 0u};
+    p = lane < kThreads / kLanes ? wave_part[lane] : Part{-INFINITY, -INFINITY, INT_MAX, INT_MAX, 0u};
     for (int off = kLanes / 2; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
     if (lane == 0) {
         out->best = p.i1 == INT_MAX ? 0 : p.i1;  // every logit NaN: top2 would answer 0 (and flag it)
+        out->second = p.i2 == INT_MAX ? 0 : p.i2;
         out->best_v = p.b1, out->second_v = p.b2, out->nan = p.nan;
-        out->pad = 0;
         out->emb = *emb_err;
     }
     if (lane < 3) {

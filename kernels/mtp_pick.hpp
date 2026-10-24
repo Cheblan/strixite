@@ -19,10 +19,10 @@ namespace strix::kernels {
 // read_back lays them out) and the embedding error slot.
 struct MtpPick {
     int32_t best;
+    int32_t second;
     float best_v, second_v;
     uint32_t nan;  // 1 if any logit was NaN (best / values are then meaningless)
     uint32_t err[9];
-    uint32_t pad;
     EmbeddingError emb;
 };
 static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");

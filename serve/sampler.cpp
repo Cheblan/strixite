@@ -83,8 +83,12 @@ Top2 top2(const float *x, int64_t n) {
     auto consider = [&](int64_t i) {
         const float v = x[i];
         t.nan |= v != v;
-        if (v > t.best_v) t.second_v = t.best_v, t.best_v = v, t.best = (int32_t)i;
-        else if (v > t.second_v) t.second_v = v;
+        if (v > t.best_v) {
+            t.second_v = t.best_v, t.second = t.best;
+            t.best_v = v, t.best = (int32_t)i;
+        } else if (v > t.second_v) {
+            t.second_v = v, t.second = (int32_t)i;
+        }
     };
     constexpr int64_t kBlock = 64;
     int64_t i = 1;

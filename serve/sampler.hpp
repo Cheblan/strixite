@@ -19,10 +19,11 @@ struct SamplingParams {
     uint64_t seed = 0;
 };
 
-// The largest logit (lowest id on a tie) and the runner-up's value (-inf if n == 1; equal to the best on a tie) over
+// The largest logit (lowest id on a tie) and the runner-up over
 // x[0, n), and whether any of it is NaN. Skips 64-logit blocks with nothing above the runner-up, branch-free.
 struct Top2 {
     int32_t best = 0;
+    int32_t second = 0;
     float best_v = 0, second_v = 0;
     bool nan = false;
 };
