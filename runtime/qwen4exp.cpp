@@ -2805,6 +2805,7 @@ void Qwen4ExpSession::step_mtp_state(int64_t T, int64_t pos0, hipStream_t stream
     const size_t e = es(act);
     const int64_t n4 = D.H * D.d, hd = D.hd;
     const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
+    auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M) {
         if (prefill_math_ == PrefillMath::WmmaBf16 && M >= kWmmaMinTokens)
             kernels::linear_qw_wmma(x, w, y, M, act, act, stream);
