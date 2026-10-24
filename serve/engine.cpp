@@ -496,6 +496,9 @@ void log_detail(const GenerationResult &r) {
         slog_row(LogLevel::Debug, "", "%s rollbacks; drafts accepted before the reject 0/1/2/3+: %s/%s/%s/%s",
                  fmt_n(r.mtp_rollbacks).c_str(), fmt_n(r.mtp_reject_at[0]).c_str(), fmt_n(r.mtp_reject_at[1]).c_str(),
                  fmt_n(r.mtp_reject_at[2]).c_str(), fmt_n(r.mtp_reject_at[3]).c_str());
+        if (r.mtp_tree_rescues > 0)
+            slog_row(LogLevel::Debug, "", "tree speculation: %s runner-up rollbacks rescued",
+                     fmt_n(r.mtp_tree_rescues).c_str());
     }
     const BackendStats &b = r.backend;
     if (b.ple_gathers > 0) {
@@ -597,6 +600,7 @@ void Engine::run(Job &job, Slot &sl) {
             stats_.think_closed_for_call += res.think_closed_for_call;
             stats_.mtp_accepted_tokens += res.mtp_accepted_tokens;
             stats_.mtp_rollbacks += res.mtp_rollbacks;
+            stats_.mtp_tree_rescues += res.mtp_tree_rescues;
             for (int64_t i = 0; i < kMtpMaxDraft; ++i) stats_.mtp_reject_at[i] += res.mtp_reject_at[i];
             stats_.decode_seconds += res.decode_ms / 1e3;
             if (res.decode_ms > 0 && res.completion_tokens > 1)
@@ -1009,8 +1013,16 @@ void Engine::run(Job &job, Slot &sl) {
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 sl.be->prefetch_ple(ids, 0);
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
+                Top2 t0{};
                 for (int64_t step = 0; step < steps; ++step) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
+                    if (step == 0) {
+                        t0 = t;
+                        if (options_.tree_speculation && t.second >= 0 &&
+                            (t.best_v - t.second_v <= options_.tree_margin)) {
+                            sl.be->prefetch_ple({t.second}, 0);
+                        }
+                    }
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
                     float min_margin = options_.mtp_margin;
@@ -1091,6 +1103,9 @@ void Engine::run(Job &job, Slot &sl) {
                     // ids[j]" - what a step's drafting starts from - so v carries into the next step instead of a
                     // forward of its own (strixite PR #1): one forward less per rollback.
                     ++res.mtp_rollbacks, ++res.completion_tokens, ++res.mtp_reject_at[std::min<int64_t>(j, kMtpMaxDraft - 1)];
+                    if (options_.tree_speculation && j == 0 && v == t0.second) {
+                        ++res.mtp_tree_rescues;
+                    }
                     {  // v's PLE rows load while the prefix is kept (its forward - the next verify's row 0 - comes soon)
                         std::vector<int32_t> next(ids.begin(), ids.begin() + j + 1);
                         next.push_back(v);

@@ -136,6 +136,9 @@ int run(int argc, char **argv) {
     const bool mtp_gating = settings.on("mtp-gating");
     const float mtp_gating_step0_boost = (float)settings.number("mtp-gating-step0-boost");
     const float mtp_gating_decay = (float)settings.number("mtp-gating-decay");
+    const bool tree_speculation = settings.on("tree-speculation");
+    const float tree_margin = (float)settings.number("tree-margin");
+    const int64_t tree_draft_b = settings.integer("tree-draft-b");
     const int64_t ngram_cache_rows = settings.integer("ngram-cache-rows");
     const std::string capture_dir = settings.text("capture-dir");  // empty: no capture
     const bool think_nudge = settings.on("think-nudge");
@@ -335,6 +338,9 @@ int run(int argc, char **argv) {
     eng_opts.mtp_gating = mtp_gating;
     eng_opts.mtp_gating_step0_boost = mtp_gating_step0_boost;
     eng_opts.mtp_gating_decay = mtp_gating_decay;
+    eng_opts.tree_speculation = tree_speculation;
+    eng_opts.tree_margin = tree_margin;
+    eng_opts.tree_draft_b = tree_draft_b;
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;
     eng_opts.think_nudge_wording = nudge_wording;
@@ -348,6 +354,9 @@ int run(int argc, char **argv) {
     if (use_mtp && mtp_gating)
         slog(LogLevel::Info, "startup: MTP gating on (step0 boost %.2f, decay %.2f)",
              mtp_gating_step0_boost, mtp_gating_decay);
+    if (use_mtp && tree_speculation)
+        slog(LogLevel::Info, "startup: Tree speculation on (margin %.2f, draft_b %lld)",
+             tree_margin, (long long)tree_draft_b);
     if (think_nudge)
         slog(LogLevel::Info, "startup: thinking nudge on: %.0f%% self-copy over %lld tokens past %lld, wording %s",
              100.0 * nudge_policy.rate, (long long)nudge_policy.window, (long long)nudge_policy.min_tokens,

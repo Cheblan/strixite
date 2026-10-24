@@ -359,6 +359,7 @@ struct GenerationResult {
     // How this request verifies ran (its decode window in GpuArbiter): shared with another slot run, or ran
     // alone because the conversation carries mRoPE position state and cannot share a forward.
     int64_t verify_shared_runs = 0, verify_solo_mrope = 0;
+    int64_t mtp_tree_rescues = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};  // rollbacks by drafts j accepted before the rejected one (last: j >= 3)
     double queue_ms = 0, prompt_ms = 0, decode_ms = 0;
     // From the submit to the end of the prefill (the first token's logits are ready) / to the response's end.
@@ -403,6 +404,7 @@ struct EngineStats {
     int64_t requests_ok = 0, requests_error = 0, requests_cancelled = 0;
     int64_t prompt_tokens = 0, cached_tokens = 0, prefill_tokens = 0, generated_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t mtp_tree_rescues = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};
     int64_t think_nudges = 0;  // thinking nudges fed
     int64_t think_end_blocked = 0;  // GenerationResult::think_end_blocked, summed
@@ -442,6 +444,9 @@ public:
         bool mtp_gating = false;  // adaptive step gating to reject low-confidence drafts early
         float mtp_gating_step0_boost = 0.05f;  // additional margin required for initial draft step 0
         float mtp_gating_decay = 0.02f;        // margin decay per subsequent draft step
+        bool tree_speculation = false;         // runner-up tree speculation (Option 1)
+        float tree_margin = 1.5f;              // max margin between top1 and top2 to trigger tree branching
+        int64_t tree_draft_b = 2;              // depth of runner-up branch
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
