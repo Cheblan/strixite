@@ -90,5 +90,15 @@ int main(int argc, char **argv) {
     printf("Batched 4 slots step: %.2f ms (%.2f tok/s aggregate)\n", ms_batch4, 4000.0 / ms_batch4);
     printf("Speedup over unbatched: %.2fx\n", ms_sum / ms_batch4);
 
+    float max_diffs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const std::vector<float> *singles[4] = {&single0, &single1, &single2, &single3};
+    for (int k = 0; k < 4; ++k) {
+        for (size_t i = 0; i < singles[k]->size(); ++i) {
+            float d = std::abs((*singles[k])[i] - batch4_logits[k][i]);
+            if (d > max_diffs[k]) max_diffs[k] = d;
+        }
+        printf("Slot %d max logit difference (batch vs single): %g\n", k, max_diffs[k]);
+    }
+
     return 0;
 }
