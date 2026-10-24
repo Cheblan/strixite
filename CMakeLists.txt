@@ -183,7 +183,7 @@ strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/l
 target_include_directories(strix_kernels PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 
-add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/vision_tower.cpp
+add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/page_pool.cpp runtime/vision_tower.cpp
     runtime/strixw_loader.cpp runtime/ngram_rows.cpp runtime/ngram_table.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.

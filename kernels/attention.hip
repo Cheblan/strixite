@@ -1032,4 +1032,65 @@ void attention_gathered_wmma(const void *q, const void *gate, const PagedKvView 
                                  scale, out, workspace, workspace_bytes, err, act, stream, precision);
 }
 
+namespace {
+template <typename T>
+__global__ void paged_kv_scatter_kernel(const T *k_src, const T *v_src, int64_t src_ts,
+                                        T *pool_k, T *pool_v, const int32_t *block_table,
+                                        int64_t T_tokens, int64_t pos0, int64_t block_size, int64_t W) {
+    const int64_t t = blockIdx.x;
+    if (t >= T_tokens) return;
+    const int64_t row = pos0 + t;
+    const int64_t b = row / block_size;
+    const int64_t o = row % block_size;
+    const int64_t pb = block_table[b];
+    const int64_t phys_row = pb * block_size + o;
+
+    const T *ks = k_src ? k_src + t * src_ts : nullptr;
+    const T *vs = v_src ? v_src + t * src_ts : nullptr;
+    T *kd = pool_k ? pool_k + phys_row * W : nullptr;
+    T *vd = pool_v ? pool_v + phys_row * W : nullptr;
+
+    constexpr int kVec = sizeof(uint4) / sizeof(T);
+    const int64_t W_vec = W / kVec;
+    for (int64_t i = threadIdx.x; i < W_vec; i += blockDim.x) {
+        if (ks && kd) {
+            *reinterpret_cast<uint4 *>(kd + i * kVec) = *reinterpret_cast<const uint4 *>(ks + i * kVec);
+        }
+        if (vs && vd) {
+            *reinterpret_cast<uint4 *>(vd + i * kVec) = *reinterpret_cast<const uint4 *>(vs + i * kVec);
+        }
+    }
+    for (int64_t i = W_vec * kVec + threadIdx.x; i < W; i += blockDim.x) {
+        if (ks && kd) kd[i] = ks[i];
+        if (vs && vd) vd[i] = vs[i];
+    }
+}
+}  // namespace
+
+void paged_kv_scatter(const void *k_src, const void *v_src, int64_t src_ts,
+                      void *pool_k, void *pool_v, const int32_t *block_table,
+                      int64_t T, int64_t pos0, int64_t block_size, int64_t W,
+                      Act act, hipStream_t stream) {
+    if (T <= 0) return;
+    STRIX_CHECK(block_table != nullptr, "paged_kv_scatter: null block_table");
+    STRIX_CHECK(block_size == 16 || block_size == 32, "paged_kv_scatter: unsupported block_size ", block_size);
+    STRIX_CHECK(act == Act::F32 || act == Act::BF16, "paged_kv_scatter: unsupported act");
+
+    const int threads = 64;
+    const int blocks = static_cast<int>(T);
+
+    if (act == Act::F32) {
+        paged_kv_scatter_kernel<float><<<blocks, threads, 0, stream>>>(
+            static_cast<const float *>(k_src), static_cast<const float *>(v_src), src_ts,
+            static_cast<float *>(pool_k), static_cast<float *>(pool_v), block_table,
+            T, pos0, block_size, W);
+    } else {
+        paged_kv_scatter_kernel<uint16_t><<<blocks, threads, 0, stream>>>(
+            static_cast<const uint16_t *>(k_src), static_cast<const uint16_t *>(v_src), src_ts,
+            static_cast<uint16_t *>(pool_k), static_cast<uint16_t *>(pool_v), block_table,
+            T, pos0, block_size, W);
+    }
+    STRIX_HIP_CHECK(hipGetLastError(), "paged_kv_scatter launch");
+}
+
 }  // namespace strix::kernels

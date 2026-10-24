@@ -81,6 +81,15 @@ struct PagedKvView {
     int64_t block_size = 16;
 };
 
+// Copies T rows of K and V from linear staging buffers into physical page blocks.
+// k_src / v_src: [T, src_ts] (or nullptr)
+// pool_k / pool_v: physical block pools [num_physical_blocks * block_size, W]
+// block_table: [ceil(capacity / block_size)] device int32 physical block IDs
+void paged_kv_scatter(const void *k_src, const void *v_src, int64_t src_ts,
+                      void *pool_k, void *pool_v, const int32_t *block_table,
+                      int64_t T, int64_t pos0, int64_t block_size, int64_t W,
+                      Act act, hipStream_t stream);
+
 // Bytes of FP32 workspace attention() needs for this shape.
 size_t attention_workspace_bytes(const AttentionShape &s);
 

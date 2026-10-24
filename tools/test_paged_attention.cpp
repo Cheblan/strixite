@@ -6,12 +6,14 @@
 #include "kernels/norm.hpp"
 #include "kernels/qsa.hpp"
 #include "runtime/device_buffer.hpp"
+#include "runtime/page_pool.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace strix;
@@ -34,9 +36,78 @@ float bf16_to_f32(uint16_t b) {
     return f;
 }
 
+void test_block_manager_and_page_pool() {
+    printf("=== Testing BlockManager & PagePool ===\n");
+    // 1. Basic allocation & free
+    {
+        BlockManager bm(10);
+        STRIX_CHECK(bm.total_blocks() == 10, "bm total");
+        STRIX_CHECK(bm.free_blocks() == 10, "bm free 10");
+        STRIX_CHECK(bm.used_blocks() == 0, "bm used 0");
+
+        int32_t b0 = bm.allocate_block();
+        STRIX_CHECK(b0 == 0, "b0 == 0");
+        STRIX_CHECK(bm.free_blocks() == 9, "bm free 9");
+
+        std::vector<int32_t> blocks;
+        bool ok = bm.allocate_blocks(5, blocks);
+        STRIX_CHECK(ok && blocks.size() == 5, "alloc 5");
+        STRIX_CHECK(bm.free_blocks() == 4, "bm free 4");
+
+        // Reference count / CoW test:
+        bm.acquire_block(blocks[0]); // ref count = 2
+        bm.free_block(blocks[0]);    // ref count = 1 -> should NOT be added to free list
+        STRIX_CHECK(bm.free_blocks() == 4, "bm free still 4 after 1 release");
+        bm.free_block(blocks[0]);    // ref count = 0 -> freed!
+        STRIX_CHECK(bm.free_blocks() == 5, "bm free 5 after 2nd release");
+
+        // Free rest:
+        bm.free_block(b0);
+        bm.free_blocks(blocks.data() + 1, 4);
+        STRIX_CHECK(bm.free_blocks() == 10, "bm free all 10");
+    }
+
+    // 2. Multithreaded stress test
+    {
+        BlockManager bm(1000);
+        constexpr int kThreads = 8;
+        constexpr int kOpsPerThread = 500;
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&bm]() {
+                for (int i = 0; i < kOpsPerThread; ++i) {
+                    std::vector<int32_t> allocated;
+                    bool ok = bm.allocate_blocks(5, allocated);
+                    if (ok) {
+                        // simulate some work
+                        bm.free_blocks(allocated.data(), allocated.size());
+                    }
+                }
+            });
+        }
+        for (auto &t : threads) t.join();
+        STRIX_CHECK(bm.free_blocks() == 1000, "all blocks returned safely without race conditions");
+    }
+
+    // 3. PagePool allocation
+    {
+        std::vector<bool> is_attn = {true, false, true, false, true};
+        PagePool pool(3200, 512, is_attn, Act::BF16, true);
+        STRIX_CHECK(pool.total_tokens() == 3200, "pool total tokens");
+        STRIX_CHECK(pool.total_blocks() == 100, "pool total blocks");
+        STRIX_CHECK(pool.k_pool(0) != nullptr, "layer 0 k_pool not null");
+        STRIX_CHECK(pool.v_pool(0) != nullptr, "layer 0 v_pool not null");
+        STRIX_CHECK(pool.k_pool(1) == nullptr, "layer 1 (gdn) k_pool null");
+        STRIX_CHECK(pool.k_mtp_pool() != nullptr, "mtp k_pool not null");
+    }
+
+    printf(">> [SUCCESS] BlockManager & PagePool tests passed! <<\n\n");
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    test_block_manager_and_page_pool();
     printf("=== Testing PagedAttention (PagedReader vs PlainReader) ===\n");
 
     const int64_t T = 1;        // Decode query
@@ -286,6 +357,103 @@ int main(int argc, char **argv) {
         printf(">> [SUCCESS] PagedReader (BlockSize=32) is 100%% BIT-IDENTICAL! <<\n\n");
     } else {
         printf(">> [FAILURE] Mismatch in BlockSize=32! <<\n\n");
+        return 1;
+    }
+
+    // 4b. Test paged_kv_scatter
+    printf("=== Testing paged_kv_scatter ===\n");
+    const int64_t scatter_T = 128;
+    const int64_t scatter_pos0 = 37; // non-aligned starting position
+    std::vector<uint16_t> h_k_scatter(scatter_T * W), h_v_scatter(scatter_T * W);
+    for (size_t i = 0; i < h_k_scatter.size(); ++i) {
+        h_k_scatter[i] = static_cast<uint16_t>(0x3000 + (i & 0x0FFF));
+        h_v_scatter[i] = static_cast<uint16_t>(0x4000 + (i & 0x0FFF));
+    }
+    DeviceBuffer<uint16_t> d_k_scatter(h_k_scatter.size(), "k_scatter");
+    DeviceBuffer<uint16_t> d_v_scatter(h_v_scatter.size(), "v_scatter");
+    STRIX_HIP_CHECK(hipMemcpy(d_k_scatter.get(), h_k_scatter.data(), h_k_scatter.size() * 2, hipMemcpyHostToDevice), "up k_scat");
+    STRIX_HIP_CHECK(hipMemcpy(d_v_scatter.get(), h_v_scatter.data(), h_v_scatter.size() * 2, hipMemcpyHostToDevice), "up v_scat");
+
+    paged_kv_scatter(d_k_scatter.get(), d_v_scatter.get(), W,
+                     d_pool_k32.get(), d_pool_v32.get(), d_bt32.get(),
+                     scatter_T, scatter_pos0, bs32, W, Act::BF16, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "scatter sync");
+
+    std::vector<uint16_t> h_pool_k_check(num_physical_blocks32 * bs32 * W);
+    std::vector<uint16_t> h_pool_v_check(num_physical_blocks32 * bs32 * W);
+    STRIX_HIP_CHECK(hipMemcpy(h_pool_k_check.data(), d_pool_k32.get(), h_pool_k_check.size() * 2, hipMemcpyDeviceToHost), "down k_pool");
+    STRIX_HIP_CHECK(hipMemcpy(h_pool_v_check.data(), d_pool_v32.get(), h_pool_v_check.size() * 2, hipMemcpyDeviceToHost), "down v_pool");
+
+    int scatter_mismatches = 0;
+    for (int64_t t = 0; t < scatter_T; ++t) {
+        int64_t row = scatter_pos0 + t;
+        int64_t b = row / bs32;
+        int64_t o = row % bs32;
+        int64_t pb = bt32[b];
+        int64_t phys_row = pb * bs32 + o;
+        for (int64_t col = 0; col < W; ++col) {
+            uint16_t exp_k = h_k_scatter[t * W + col];
+            uint16_t exp_v = h_v_scatter[t * W + col];
+            uint16_t act_k = h_pool_k_check[phys_row * W + col];
+            uint16_t act_v = h_pool_v_check[phys_row * W + col];
+            if (exp_k != act_k || exp_v != act_v) scatter_mismatches++;
+        }
+    }
+    printf("paged_kv_scatter mismatched elements: %d / %lld\n", scatter_mismatches, (long long)(scatter_T * W * 2));
+    if (scatter_mismatches == 0) {
+        printf(">> [SUCCESS] paged_kv_scatter is 100%% BIT-IDENTICAL! <<\n\n");
+    } else {
+        printf(">> [FAILURE] paged_kv_scatter had mismatches! <<\n\n");
+        return 1;
+    }
+
+    // 4c. Test Multi-Token Prefill Attention (T = 16)
+    printf("=== Testing Multi-Token Prefill Attention (T = 16) ===\n");
+    // Restore d_pool_k32 and d_pool_v32 from h_pool_k32 (which was mapped from h_k_flat / h_v_flat)
+    STRIX_HIP_CHECK(hipMemcpy(d_pool_k32.get(), h_pool_k32.data(), h_pool_k32.size() * 2, hipMemcpyHostToDevice), "restore pool_k32");
+    STRIX_HIP_CHECK(hipMemcpy(d_pool_v32.get(), h_pool_v32.data(), h_pool_v32.size() * 2, hipMemcpyHostToDevice), "restore pool_v32");
+
+    const int64_t prefill_T = 16;
+    const int64_t prefill_pos0 = 256;
+    const int64_t prefill_N = prefill_pos0 + prefill_T;
+    const AttentionShape s_prefill{prefill_T, prefill_pos0, Hq, Hk, D, q_stride, 2 * D};
+    std::vector<uint16_t> h_q_prefill(prefill_T * q_stride);
+    for (auto &v : h_q_prefill) v = f32_to_bf16(dist(gen));
+    DeviceBuffer<uint16_t> d_q_prefill(h_q_prefill.size(), "q_prefill");
+    STRIX_HIP_CHECK(hipMemcpy(d_q_prefill.get(), h_q_prefill.data(), h_q_prefill.size() * 2, hipMemcpyHostToDevice), "upload q_prefill");
+
+    DeviceBuffer<uint16_t> d_out_prefill_plain(prefill_T * Hq * D, "out_prefill_plain");
+    DeviceBuffer<uint16_t> d_out_prefill_paged(prefill_T * Hq * D, "out_prefill_paged");
+
+    const size_t prefill_ws_bytes = attention_workspace_bytes(s_prefill);
+    DeviceBuffer<float> d_prefill_ws(prefill_ws_bytes / 4 + 1, "prefill_ws");
+
+    attention(d_q_prefill.get(), d_q_prefill.get() + D, d_k_flat.get(), d_v_flat.get(), prefill_N,
+              s_prefill, scale, d_out_prefill_plain.get(), d_prefill_ws.get(), prefill_ws_bytes, Act::BF16, stream);
+    attention(d_q_prefill.get(), d_q_prefill.get() + D, paged_view32,
+              s_prefill, scale, d_out_prefill_paged.get(), d_prefill_ws.get(), prefill_ws_bytes, Act::BF16, stream);
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "prefill sync");
+
+    std::vector<uint16_t> h_out_prefill_plain(prefill_T * Hq * D);
+    std::vector<uint16_t> h_out_prefill_paged(prefill_T * Hq * D);
+    STRIX_HIP_CHECK(hipMemcpy(h_out_prefill_plain.data(), d_out_prefill_plain.get(), h_out_prefill_plain.size() * 2, hipMemcpyDeviceToHost), "read prefill plain");
+    STRIX_HIP_CHECK(hipMemcpy(h_out_prefill_paged.data(), d_out_prefill_paged.get(), h_out_prefill_paged.size() * 2, hipMemcpyDeviceToHost), "read prefill paged");
+
+    float prefill_max_diff = 0.0f;
+    int prefill_mismatches = 0;
+    for (size_t i = 0; i < h_out_prefill_plain.size(); ++i) {
+        float p1 = bf16_to_f32(h_out_prefill_plain[i]);
+        float p2 = bf16_to_f32(h_out_prefill_paged[i]);
+        float diff = std::abs(p1 - p2);
+        if (diff > prefill_max_diff) prefill_max_diff = diff;
+        if (h_out_prefill_plain[i] != h_out_prefill_paged[i]) prefill_mismatches++;
+    }
+    printf("Prefill (T=16) max absolute difference: %f\n", prefill_max_diff);
+    printf("Prefill (T=16) mismatched elements: %d / %zu\n", prefill_mismatches, h_out_prefill_plain.size());
+    if (prefill_mismatches == 0 && prefill_max_diff == 0.0f) {
+        printf(">> [SUCCESS] Multi-Token Prefill Attention is 100%% BIT-IDENTICAL! <<\n\n");
+    } else {
+        printf(">> [FAILURE] Mismatch in Multi-Token Prefill Attention! <<\n\n");
         return 1;
     }
 
