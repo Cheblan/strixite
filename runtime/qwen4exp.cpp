@@ -1950,6 +1950,7 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     for (int64_t k = 0; k < B; ++k) {
         Qwen4ExpSession &sk = *batch[k].session;
         const int64_t Tk = offsets[k + 1] - offsets[k];
+        sk.prepare_positions(sk.pos_, Tk);
         if (Tk > 1) {
             sk.ensure_verify_buffers();
             copy_state(sk.ple_state_, sk.ple_state_kept_, stream, "PLE conv state");
@@ -2088,15 +2089,23 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                 const int64_t Tk = offsets[k + 1] - offsets[k];
                 const int64_t pos_k = sk.pos_;
                 uint8_t *proj_k = s0.proj_.get() + (size_t)(offsets[k] * D.astride) * e;
-                uint8_t *kc = sk.k_cache_[(size_t)i].get();
-                uint8_t *vc = sk.v_cache_[(size_t)i].get();
-                uint8_t *k_out = kc + (size_t)(pos_k * W) * e;
-                uint8_t *v_out = vc + (size_t)(pos_k * W) * e;
+
+                const bool q8 = sk.kv_format_ == KvFormat::Q8;
+                uint8_t *kc = sk.k_cache_[(size_t)i].size() ? sk.k_cache_[(size_t)i].get() : nullptr;
+                uint8_t *vc = sk.v_cache_[(size_t)i].size() ? sk.v_cache_[(size_t)i].get() : nullptr;
+                uint8_t *kv_rows = !q8 ? nullptr
+                                   : sk.gdn_to_spare_ ? sk.verify_in_[(size_t)i].get() + (size_t)(kMaxLogits * D.idx_d) * e
+                                                      : sk.kv_new_.get();
+                uint8_t *k_out = q8 ? kv_rows : kc + (size_t)(pos_k * W) * e;
+                uint8_t *v_out = q8 ? kv_rows + (size_t)W * e : vc + (size_t)(pos_k * W) * e;
+                const int64_t kv_ts = q8 ? 2 * W : W;
+
+                const int64_t rope0 = sk.mk_jobs_.pos3 == nullptr ? sk.rope_pos(pos_k) : pos_k;
 
                 kernels::NormRopeJob nr[5] = {
                     {proj_k, D.astride, 2 * hd, proj_k, D.astride, 2 * hd, D.hq, hd, l.q_norm},
-                    {proj_k + (size_t)(D.hq * 2 * hd) * e, D.astride, hd, k_out, W, hd, D.hkv, hd, l.k_norm},
-                    {proj_k + (size_t)(D.hq * 2 * hd + D.hkv * hd) * e, D.astride, hd, v_out, W, hd, D.hkv, hd, nullptr},
+                    {proj_k + (size_t)(D.hq * 2 * hd) * e, D.astride, hd, k_out, kv_ts, hd, D.hkv, hd, l.k_norm},
+                    {proj_k + (size_t)(D.hq * 2 * hd + D.hkv * hd) * e, D.astride, hd, v_out, kv_ts, hd, D.hkv, hd, nullptr},
                     {proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, D.idx_h, D.idx_d, l.idx_q_norm}
                 };
                 int njobs = 3;
@@ -2106,22 +2115,38 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                     nr[njobs++] = {proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, D.idx_d,
                                    sk.verify_in_[(size_t)i].get(), D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
                 }
-                kernels::qk_norm_rope_jobs(nr, njobs, Tk, D.eps, D.rot, sk.rope_pos(pos_k),
-                                           m.inv_freq(), act, stream, m.rope_scale());
+                kernels::qk_norm_rope_jobs(nr, njobs, Tk, D.eps, D.rot, rope0,
+                                           m.inv_freq(), act, stream, m.rope_scale(), sk.mk_jobs_);
 
                 kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, Tk, pos_k,
                                         pos_k % kernels::kQsaBlock ? sk.tail_[sk.tail_cur_][(size_t)i].get() : nullptr,
                                         sk.tail_[1 - sk.tail_cur_][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
                                         m.inv_freq(), D.rot, sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
-                                        act, stream, m.rope_scale());
+                                        act, stream, m.rope_scale(), sk.mk_block_);
 
                 const kernels::AttentionShape as{Tk, pos_k, D.hq, D.hkv, hd, D.astride, 2 * hd};
                 const float scale = 1.0f / std::sqrt((float)hd);
                 uint8_t *core_k = s0.core_.get() + (size_t)(offsets[k] * (D.hq * hd)) * e;
 
+                kernels::Kv8View kv8;
+                if (q8) {
+                    const size_t li = (size_t)i;
+                    kernels::kv8_commit(k_out, v_out, kv_ts, Tk, pos_k,
+                                        pos_k % kernels::kKv8Group ? sk.kv8_tail_[sk.tail_cur_][li].get() : nullptr,
+                                        sk.kv8_tail_[1 - sk.tail_cur_][li].get(), sk.kv8_store_[li].get(), sk.kv8_cap_, W, act,
+                                        sk.kv8_err_.get(), stream);
+                    kv8 = {sk.kv8_store_[li].get(), sk.kv8_cap_, W,
+                           pos_k % kernels::kKv8Group ? sk.kv8_tail_[sk.tail_cur_][li].get() : nullptr, k_out, v_out, kv_ts, pos_k};
+                }
+
                 if (!qsa_layer) {
-                    kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
-                                       core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+                    if (q8) {
+                        kernels::attention(proj_k, proj_k + (size_t)hd * e, kv8, as, scale,
+                                           core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+                    } else {
+                        kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
+                                           core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+                    }
                 } else {
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
                     void *iq = proj_k + (size_t)D.idx_col * e;
@@ -2131,10 +2156,17 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                     kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, Tk, pos_k, qsa_k,
                                       s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
                                       s0.qsa_topk_ws_bytes_, stream);
-                    kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
-                                                s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
-                                                core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
-                                                s0.attn_err_.get(), act, stream);
+                    if (q8) {
+                        kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kv8, as,
+                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
+                                                    s0.attn_err_.get(), act, stream);
+                    } else {
+                        kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
+                                                    s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                    core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
+                                                    s0.attn_err_.get(), act, stream);
+                    }
                 }
             }
             lin(s0.core_.get(), l.o_proj, s0.y_.get(), T, act);
