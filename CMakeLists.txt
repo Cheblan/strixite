@@ -257,6 +257,10 @@ target_link_libraries(strix_server PRIVATE strix_serve_model)
 add_executable(test_paged_attention tools/test_paged_attention.cpp)
 target_link_libraries(test_paged_attention PRIVATE strix_model)
 
+add_executable(bench_prefill tools/bench_prefill.cpp)
+strix_hip_sources(bench_prefill tools/bench_prefill.cpp)
+target_link_libraries(bench_prefill PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.

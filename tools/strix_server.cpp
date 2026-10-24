@@ -109,7 +109,7 @@ int run(int argc, char **argv) {
     const int64_t capacity = slot_limit, chunk = settings.integer("chunk");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
     const std::string cache_dir = settings.text("prompt-cache-dir");
-    const int64_t cache_gib = settings.integer("prompt-cache-gib");
+    int64_t cache_gib = settings.integer("prompt-cache-gib");
     PromptCache::Options cache_opts;
     cache_opts.ram_margin = (uint64_t)settings.integer("prompt-cache-ram-margin-gib") << 30;
     cache_opts.idle_seconds = settings.number("prompt-cache-idle-s");
@@ -121,6 +121,10 @@ int run(int argc, char **argv) {
     precision.gdn = parse_gdn_precision(settings.text("gdn-precision"));  // an unknown value fails startup
     precision.attention = parse_attention_precision(settings.text("attention-precision"));
     const KvFormat kv_format = parse_kv_format(settings.text("kv-cache"));  // an unknown value fails startup
+    if (kv_format == KvFormat::Paged && cache_gib > 0) {
+        slog(LogLevel::Warning, "startup: prompt cache is not supported with paged KV cache (requires linear export); disabling prompt cache");
+        cache_gib = 0;
+    }
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");

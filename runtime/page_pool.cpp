@@ -67,8 +67,8 @@ void BlockManager::free_blocks(const int32_t *blocks, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         int32_t b = blocks[i];
         if (b < 0 || b >= total_blocks_) continue;
-        if (--ref_counts_[(size_t)b] <= 0) {
-            ref_counts_[(size_t)b] = 0;
+        if (ref_counts_[(size_t)b] <= 0) continue;
+        if (--ref_counts_[(size_t)b] == 0) {
             free_list_.push_back(b);
         }
     }
@@ -83,8 +83,8 @@ void BlockManager::acquire_block(int32_t block_id) {
 void BlockManager::release_block(int32_t block_id) {
     if (block_id < 0 || block_id >= total_blocks_) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (--ref_counts_[(size_t)block_id] <= 0) {
-        ref_counts_[(size_t)block_id] = 0;
+    if (ref_counts_[(size_t)block_id] <= 0) return;
+    if (--ref_counts_[(size_t)block_id] == 0) {
         free_list_.push_back(block_id);
     }
 }
