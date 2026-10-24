@@ -1936,8 +1936,9 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     const int64_t B = (int64_t)batch.size();
     STRIX_CHECK(B >= 1 && B <= 8, "forward_batch_decode: batch size ", B, ", expected 1..8");
     out_logits.resize(B);
-    if (B == 1) {
-        out_logits[0] = batch[0].session->forward({batch[0].token_id}, 1);
+    if (B == 1 && (batch[0].tokens.empty() || batch[0].tokens.size() == 1)) {
+        int32_t tid = batch[0].tokens.empty() ? batch[0].token_id : batch[0].tokens[0];
+        out_logits[0] = batch[0].session->forward({tid}, 1);
         return;
     }
     Qwen4ExpSession &s0 = *batch[0].session;
@@ -1950,13 +1951,34 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     const int64_t n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
     const int64_t Estack = D.experts + (sep ? 0 : 1);
 
-    std::vector<int32_t> h_ids(B);
+    std::vector<int64_t> offsets(B + 1, 0);
+    std::vector<int32_t> all_ids;
     for (int64_t k = 0; k < B; ++k) {
         STRIX_CHECK(batch[k].session != nullptr, "forward_batch_decode: null session at ", k);
         STRIX_CHECK(!batch[k].session->broken_, "forward_batch_decode: session ", k, " is broken");
         STRIX_CHECK(!batch[k].session->verify_pending_, "forward_batch_decode: session ", k, " has verify pending");
-        STRIX_CHECK(batch[k].session->pos_ + 1 <= batch[k].session->capacity_, "forward_batch_decode: session ", k, " exceeds capacity");
-        h_ids[k] = batch[k].token_id;
+        const std::vector<int32_t> &toks = !batch[k].tokens.empty() ? batch[k].tokens : std::vector<int32_t>{batch[k].token_id};
+        const int64_t Tk = (int64_t)toks.size();
+        STRIX_CHECK(batch[k].session->pos_ + Tk <= batch[k].session->capacity_, "forward_batch_decode: session ", k, " exceeds capacity");
+        offsets[k + 1] = offsets[k] + Tk;
+        all_ids.insert(all_ids.end(), toks.begin(), toks.end());
+    }
+    const int64_t T = offsets[B];
+
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *batch[k].session;
+        const int64_t Tk = offsets[k + 1] - offsets[k];
+        if (Tk > 1) {
+            sk.ensure_verify_buffers();
+            copy_state(sk.ple_state_, sk.ple_state_kept_, stream, "PLE conv state");
+            copy_state(sk.mtp_prev_, sk.mtp_prev_kept_, stream, "MTP previous streams");
+            sk.verify_pos_ = sk.pos_;
+            sk.verify_tail_cur_ = sk.tail_cur_;
+            sk.verify_mtp_tail_cur_ = sk.mtp_tail_cur_;
+            sk.verify_hist_ = sk.ple_hist_;
+            sk.verify_ids_ = !batch[k].tokens.empty() ? batch[k].tokens : std::vector<int32_t>{batch[k].token_id};
+            sk.gdn_to_spare_ = true;
+        }
     }
 
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
@@ -1967,34 +1989,39 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
         float *w_in = inject ? s0.w_in_.get() : nullptr;
         uint8_t *X = s0.x_.get();
         if (hc.down.bits == 8)
-            kernels::hc_mix_down(X, hc.down.q8, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+            kernels::hc_mix_down(X, hc.down.q8, T, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
         else
-            kernels::hc_mix_down(X, hc.down.q4, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+            kernels::hc_mix_down(X, hc.down.q4, T, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
         if (hc.up.bits == 8)
-            kernels::hc_mix_up(s0.h_.get(), hc.up.q8, X, hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q8, X, hc.norm, s0.inv_.get(), T, D.H, D.d, s0.u_.get(), act, stream);
         else
-            kernels::hc_mix_up(s0.h_.get(), hc.up.q4, X, hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q4, X, hc.norm, s0.inv_.get(), T, D.H, D.d, s0.u_.get(), act, stream);
     };
 
     auto inject_y = [&] {
-        kernels::hc_inject(s0.x_.get(), s0.w_in_.get(), s0.y_.get(), B, D.H, D.d, act, stream);
+        kernels::hc_inject(s0.x_.get(), s0.w_in_.get(), s0.y_.get(), T, D.H, D.d, act, stream);
     };
 
     // PLE:
     std::vector<int64_t> all_ple_rows;
     if (D.ple_layer >= 0) {
-        all_ple_rows.resize((size_t)(B * 16));
+        all_ple_rows.resize((size_t)(T * 16));
         for (int64_t k = 0; k < B; ++k) {
-            int64_t tok = batch[k].token_id;
-            ple_ngram_ids(m.ngram_rows().hash_params(), &tok, 1, batch[k].session->ple_hist_,
-                          all_ple_rows.data() + (size_t)(k * 16));
+            Qwen4ExpSession &sk = *batch[k].session;
+            const std::vector<int32_t> &toks = !batch[k].tokens.empty() ? batch[k].tokens : std::vector<int32_t>{batch[k].token_id};
+            const int64_t Tk = (int64_t)toks.size();
+            std::vector<int64_t> tok_i64(toks.begin(), toks.end());
+            PleHistory h = sk.ple_hist_;
+            ple_ngram_ids(m.ngram_rows().hash_params(), tok_i64.data(), Tk, h,
+                          all_ple_rows.data() + (size_t)(offsets[k] * 16));
+            if (Tk == 1) sk.ple_hist_ = h;
         }
         const NgramRowSource &ng = m.ngram_rows();
         if (act == Act::BF16) {
             ng.gather(all_ple_rows.data(), (int64_t)all_ple_rows.size(),
                       static_cast<uint16_t *>(s0.ple_host_[0].get()));
         } else {
-            std::vector<uint16_t> bits((size_t)(B * D.ple_e));
+            std::vector<uint16_t> bits((size_t)(T * D.ple_e));
             ng.gather(all_ple_rows.data(), (int64_t)all_ple_rows.size(), bits.data());
             float *f = static_cast<float *>(s0.ple_host_[0].get());
             for (size_t j = 0; j < bits.size(); ++j) f[j] = bf16_bits_to_f32(bits[j]);
@@ -2002,25 +2029,25 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     }
 
     // Embedding:
-    const bool use_grouped_moe = (B >= 4);
+    const bool use_grouped_moe = (T >= 4);
     if (use_grouped_moe) {
-        const size_t needed_group_ws = kernels::moe_route_workspace_bytes(B, A, Estack);
+        const size_t needed_group_ws = kernels::moe_route_workspace_bytes(T, A, Estack);
         if (s0.group_ws_bytes_ < needed_group_ws) {
-            s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(B, (int64_t)64), A, Estack);
+            s0.group_ws_bytes_ = kernels::moe_route_workspace_bytes(std::max(T, (int64_t)64), A, Estack);
             s0.group_ws_ = DeviceBuffer<int32_t>(s0.group_ws_bytes_ / 4, "expert grouping");
         }
-        if (s0.group_partial_.size() < (size_t)(B * A * D.d)) {
-            s0.group_partial_ = DeviceBuffer<float>((size_t)(std::max(B, (int64_t)64) * A * D.d), "experts combine partials");
+        if (s0.group_partial_.size() < (size_t)(T * A * D.d)) {
+            s0.group_partial_ = DeviceBuffer<float>((size_t)(std::max(T, (int64_t)64) * A * D.d), "experts combine partials");
         }
     }
 
-    STRIX_HIP_CHECK(hipMemcpyAsync(s0.ids_.get(), h_ids.data(), (size_t)B * 4, hipMemcpyHostToDevice, stream),
+    STRIX_HIP_CHECK(hipMemcpyAsync(s0.ids_.get(), all_ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream),
                     "forward_batch_decode: upload ids");
     kernels::reset_embedding_error(s0.emb_err_.get(), stream);
     if (m.is_embed_q8()) {
-        kernels::embedding_lookup(s0.ids_.get(), B, m.embed_q8(), s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
+        kernels::embedding_lookup(s0.ids_.get(), T, m.embed_q8(), s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
     } else {
-        kernels::embedding_lookup(s0.ids_.get(), B, m.embed(), D.vocab, D.d, s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
+        kernels::embedding_lookup(s0.ids_.get(), T, m.embed(), D.vocab, D.d, s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
     }
 
     for (int64_t i = 0; i < D.layers; ++i) {
@@ -2028,18 +2055,20 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
 
         if (i == D.ple_layer) {
             STRIX_HIP_CHECK(hipMemcpyAsync(s0.ple_e_.get(), s0.ple_host_[0].get(),
-                                           (size_t)(B * D.ple_e) * e, hipMemcpyHostToDevice, stream),
+                                           (size_t)(T * D.ple_e) * e, hipMemcpyHostToDevice, stream),
                             "forward_batch_decode: upload PLE rows");
-            lin(s0.ple_e_.get(), l.ple_kv, s0.ple_kv_.get(), B, act);
-            const kernels::PleShape sh{1, D.H, D.d, D.ple_taps, D.ple_dil, D.ple_ld};
+            lin(s0.ple_e_.get(), l.ple_kv, s0.ple_kv_.get(), T, act);
             for (int64_t k = 0; k < B; ++k) {
                 Qwen4ExpSession &sk = *batch[k].session;
-                uint8_t *kv_k = s0.ple_kv_.get() + (size_t)(k * D.ple_ld) * e;
-                uint8_t *x_k = s0.x_.get() + (size_t)(k * n4) * e;
-                float *sigma_k = s0.ple_sigma_.get() + (size_t)(k * D.H);
+                const int64_t Tk = offsets[k + 1] - offsets[k];
+                const kernels::PleShape sh{Tk, D.H, D.d, D.ple_taps, D.ple_dil, D.ple_ld};
+                uint8_t *kv_k = s0.ple_kv_.get() + (size_t)(offsets[k] * D.ple_ld) * e;
+                uint8_t *x_k = s0.x_.get() + (size_t)(offsets[k] * n4) * e;
+                float *sigma_k = s0.ple_sigma_.get() + (size_t)(offsets[k] * D.H);
+                uint8_t *hist_buf = (Tk > 1) ? sk.ple_hist_buf_.get() : s0.ple_hist_buf_.get();
                 kernels::ple_gate(kv_k, x_k, l.ple_norm_key, l.ple_norm_query, l.ple_norm_conv,
-                                  sk.ple_state_.get(), sh, D.eps, sk.ple_hist_buf_.get(), sigma_k, act, stream);
-                kernels::ple_conv(sk.ple_hist_buf_.get(), sigma_k, kv_k, l.ple_conv, sh, x_k,
+                                  sk.ple_state_.get(), sh, D.eps, hist_buf, sigma_k, act, stream);
+                kernels::ple_conv(hist_buf, sigma_k, kv_k, l.ple_conv, sh, x_k,
                                   sk.ple_state_.get(), act, stream);
             }
         }
@@ -2047,60 +2076,77 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
         hc_mix(l.hc_attn, true);
 
         if (!D.is_attention[(size_t)i]) {
-            lin(s0.u_.get(), l.in_proj, s0.proj_.get(), B, act);
+            lin(s0.u_.get(), l.in_proj, s0.proj_.get(), T, act);
             for (int64_t k = 0; k < B; ++k) {
                 Qwen4ExpSession &sk = *batch[k].session;
-                uint8_t *gp_k = s0.proj_.get() + (size_t)(k * D.gstride) * e;
-                uint8_t *qkv_k = s0.qkv_.get() + (size_t)(k * D.conv_c) * e;
-                float *beta_k = s0.beta_.get() + (size_t)(k * D.gv);
-                float *g_k = s0.g_.get() + (size_t)(k * D.gv);
-                uint8_t *core_k = s0.core_.get() + (size_t)(k * (D.gv * kHD)) * e;
+                const int64_t Tk = offsets[k + 1] - offsets[k];
+                uint8_t *gp_k = s0.proj_.get() + (size_t)(offsets[k] * D.gstride) * e;
+                uint8_t *qkv_k = s0.qkv_.get() + (size_t)(offsets[k] * D.conv_c) * e;
+                float *beta_k = s0.beta_.get() + (size_t)(offsets[k] * D.gv);
+                float *g_k = s0.g_.get() + (size_t)(offsets[k] * D.gv);
+                uint8_t *core_k = s0.core_.get() + (size_t)(offsets[k] * (D.gv * kHD)) * e;
                 const bool fresh = sk.pos_ == 0;
+                const bool to_spare = sk.gdn_to_spare_;
 
-                kernels::gdn_front(gp_k, {1, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
-                                   l.conv_w, sk.conv_state_[(size_t)i].get(), sk.conv_state_[(size_t)i].get(),
+                if (to_spare) {
+                    STRIX_HIP_CHECK(hipMemcpyAsync(sk.verify_in_[(size_t)i].get(), gp_k,
+                                                   (size_t)(Tk * D.gstride) * e, hipMemcpyDeviceToDevice, stream),
+                                    "save verify in");
+                }
+
+                kernels::gdn_front(gp_k, {Tk, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
+                                   l.conv_w, sk.conv_state_[(size_t)i].get(),
+                                   (to_spare ? sk.conv_spare_ : sk.conv_state_)[(size_t)i].get(),
                                    fresh, l.A_log, l.dt_bias, qkv_k, beta_k, g_k, act, stream);
 
-                kernels::delta_rule(qkv_k, beta_k, g_k, {1, D.gk, D.gv, D.conv_c},
-                                   sk.rec_state_[(size_t)i].get(), sk.rec_state_[(size_t)i].get(),
+                kernels::delta_rule(qkv_k, beta_k, g_k, {Tk, D.gk, D.gv, D.conv_c},
+                                   sk.rec_state_[(size_t)i].get(),
+                                   (to_spare ? sk.rec_spare_ : sk.rec_state_)[(size_t)i].get(),
                                    fresh, core_k, act, stream, kernels::DeltaRulePath::Auto,
                                    s0.precision_.gdn);
             }
             kernels::rmsnorm_gated(s0.core_.get(), s0.proj_.get() + (size_t)D.conv_c * e, l.gdn_norm,
-                                   s0.gnorm_.get(), B * D.gv, kHD, D.eps, kernels::GateAct::Sigmoid,
+                                   s0.gnorm_.get(), T * D.gv, kHD, D.eps, kernels::GateAct::Sigmoid,
                                    act, stream, D.gv, D.gstride);
-            lin(s0.gnorm_.get(), l.out_proj, s0.y_.get(), B, act);
+            lin(s0.gnorm_.get(), l.out_proj, s0.y_.get(), T, act);
         } else {
-            lin(s0.u_.get(), l.qkv, s0.proj_.get(), B, act);
+            lin(s0.u_.get(), l.qkv, s0.proj_.get(), T, act);
             const int64_t W = D.hkv * hd;
             for (int64_t k = 0; k < B; ++k) {
                 Qwen4ExpSession &sk = *batch[k].session;
+                const int64_t Tk = offsets[k + 1] - offsets[k];
                 const int64_t pos_k = sk.pos_;
-                uint8_t *proj_k = s0.proj_.get() + (size_t)(k * D.astride) * e;
+                uint8_t *proj_k = s0.proj_.get() + (size_t)(offsets[k] * D.astride) * e;
                 uint8_t *kc = sk.k_cache_[(size_t)i].get();
                 uint8_t *vc = sk.v_cache_[(size_t)i].get();
                 uint8_t *k_out = kc + (size_t)(pos_k * W) * e;
                 uint8_t *v_out = vc + (size_t)(pos_k * W) * e;
 
-                kernels::NormRopeJob nr[4] = {
+                kernels::NormRopeJob nr[5] = {
                     {proj_k, D.astride, 2 * hd, proj_k, D.astride, 2 * hd, D.hq, hd, l.q_norm},
                     {proj_k + (size_t)(D.hq * 2 * hd) * e, D.astride, hd, k_out, W, hd, D.hkv, hd, l.k_norm},
                     {proj_k + (size_t)(D.hq * 2 * hd + D.hkv * hd) * e, D.astride, hd, v_out, W, hd, D.hkv, hd, nullptr},
                     {proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, D.idx_h, D.idx_d, l.idx_q_norm}
                 };
-                const bool qsa_layer = pos_k + 1 > D.dense_key_limit();
-                kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, 1, D.eps, D.rot, sk.rope_pos(pos_k),
+                int njobs = 3;
+                const bool qsa_layer = pos_k + Tk > D.dense_key_limit();
+                if (qsa_layer) ++njobs;
+                if (sk.gdn_to_spare_) {
+                    nr[njobs++] = {proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, D.idx_d,
+                                   sk.verify_in_[(size_t)i].get(), D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
+                }
+                kernels::qk_norm_rope_jobs(nr, njobs, Tk, D.eps, D.rot, sk.rope_pos(pos_k),
                                            m.inv_freq(), act, stream, m.rope_scale());
 
-                kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, 1, pos_k,
+                kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, Tk, pos_k,
                                         pos_k % kernels::kQsaBlock ? sk.tail_[sk.tail_cur_][(size_t)i].get() : nullptr,
                                         sk.tail_[1 - sk.tail_cur_][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
                                         m.inv_freq(), D.rot, sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
                                         act, stream, m.rope_scale());
 
-                const kernels::AttentionShape as{1, pos_k, D.hq, D.hkv, hd, D.astride, 2 * hd};
+                const kernels::AttentionShape as{Tk, pos_k, D.hq, D.hkv, hd, D.astride, 2 * hd};
                 const float scale = 1.0f / std::sqrt((float)hd);
-                uint8_t *core_k = s0.core_.get() + (size_t)(k * (D.hq * hd)) * e;
+                uint8_t *core_k = s0.core_.get() + (size_t)(offsets[k] * (D.hq * hd)) * e;
 
                 if (!qsa_layer) {
                     kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
@@ -2108,10 +2154,10 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                 } else {
                     const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
                     void *iq = proj_k + (size_t)D.idx_col * e;
-                    kernels::qsa_scores(iq, D.astride, D.idx_d, 1, pos_k, D.idx_h, D.idx_d,
+                    kernels::qsa_scores(iq, D.astride, D.idx_d, Tk, pos_k, D.idx_h, D.idx_d,
                                         sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
                                         s0.qsa_scores_.get(), sk.cap_blocks_, act, stream);
-                    kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, 1, pos_k, qsa_k,
+                    kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, Tk, pos_k, qsa_k,
                                       s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
                                       s0.qsa_topk_ws_bytes_, stream);
                     kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
@@ -2120,14 +2166,14 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
                                                 s0.attn_err_.get(), act, stream);
                 }
             }
-            lin(s0.core_.get(), l.o_proj, s0.y_.get(), B, act);
+            lin(s0.core_.get(), l.o_proj, s0.y_.get(), T, act);
         }
         inject_y();
 
         // MoE block:
         hc_mix(l.hc_mlp, true);
-        kernels::linear_bf16w(s0.u_.get(), l.router, s0.router_logits_.get(), B, D.experts + 1, D.d, act, Act::F32, stream);
-        kernels::moe_router(s0.router_logits_.get(), D.experts + 1, B, D.experts, D.top_k,
+        kernels::linear_bf16w(s0.u_.get(), l.router, s0.router_logits_.get(), T, D.experts + 1, D.d, act, Act::F32, stream);
+        kernels::moe_router(s0.router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
                             sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
                             s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
 
@@ -2135,32 +2181,32 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
             const kernels::MoeMath em = (l.gate_up.bits == 4 && l.down.bits == 4)
                                             ? kernels::MoeMath::WmmaF16
                                             : kernels::MoeMath::WmmaBf16;
-            kernels::moe_group_routes(s0.route_ids_.get(), B, A, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
+            kernels::moe_group_routes(s0.route_ids_.get(), T, A, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
                                       s0.expert_err_.get(), stream);
             if (em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4) {
                 kernels::linear_q4_experts_gather_grouped_swiglu(s0.u_.get(), l.gate_up.q4, Estack, s0.group_ws_.get(),
-                                                                 s0.group_ws_bytes_, B, A, s0.hh_.get(), act, em, stream);
+                                                                 s0.group_ws_bytes_, T, A, s0.hh_.get(), act, em, stream);
             } else {
                 kernels::linear_qw_experts_gather_grouped(s0.u_.get(), l.gate_up, Estack, s0.group_ws_.get(), s0.group_ws_bytes_,
-                                                          B, A, s0.gu_.get(), act, em, stream);
-                kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B * A, D.inter, act, stream);
+                                                          T, A, s0.gu_.get(), act, em, stream);
+                kernels::swiglu(s0.gu_.get(), s0.hh_.get(), T * A, D.inter, act, stream);
             }
             kernels::linear_qw_experts_combine_grouped(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                                       s0.group_ws_.get(), s0.group_ws_bytes_, s0.group_partial_.get(), B, A,
+                                                       s0.group_ws_.get(), s0.group_ws_bytes_, s0.group_partial_.get(), T, A,
                                                        s0.y_.get(), act, em, stream);
         } else {
-            kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), B, A,
+            kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), T, A,
                                                      s0.hh_.get(), act, s0.expert_err_.get(), stream);
             kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
-                                               B, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
+                                               T, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
         }
 
         if (sep) {
-            lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), B, act);
-            kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B, D.inter, act, stream);
-            lin(s0.hh_.get(), l.shared_down, s0.sh_y_.get(), B, act);
+            lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), T, act);
+            kernels::swiglu(s0.gu_.get(), s0.hh_.get(), T, D.inter, act, stream);
+            lin(s0.hh_.get(), l.shared_down, s0.sh_y_.get(), T, act);
             kernels::moe_shared_add_inject(s0.y_.get(), s0.sh_y_.get(), s0.router_logits_.get() + D.experts,
-                                           D.experts + 1, B, D.d, (uint32_t)D.experts, s0.x_.get(),
+                                           D.experts + 1, T, D.d, (uint32_t)D.experts, s0.x_.get(),
                                            s0.w_in_.get(), D.H, act, s0.router_err_.get(), stream);
         } else {
             inject_y();
@@ -2169,10 +2215,21 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
 
     // Final mixer & LM Head:
     hc_mix(m.final_mix(), false);
-    lin(s0.u_.get(), m.lm_head(), s0.logits_.get(), B, Act::F32);
+    lin(s0.u_.get(), m.lm_head(), s0.logits_.get(), T, Act::F32);
+
+    // Copy stream rows back to each session's x_ for verify prefix rollback if needed:
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession &sk = *batch[k].session;
+        const int64_t Tk = offsets[k + 1] - offsets[k];
+        if (Tk > 1 && &sk != &s0) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(sk.x_.get(), s0.x_.get() + (size_t)(offsets[k] * n4) * e,
+                                           (size_t)(Tk * n4) * e, hipMemcpyDeviceToDevice, stream),
+                            "forward_batch_decode: copy session x_");
+        }
+    }
 
     // Read back logits:
-    const size_t n_floats = (size_t)(B * D.vocab);
+    const size_t n_floats = (size_t)(T * D.vocab);
     STRIX_CHECK(s0.readback_.size() >= kReadbackLogitsAt + n_floats * 4,
                 "forward_batch_decode: readback buffer too small");
     uint8_t *host = static_cast<uint8_t *>(s0.readback_.get());
@@ -2182,16 +2239,126 @@ void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &bat
     STRIX_HIP_CHECK(hipStreamSynchronize(stream), "forward_batch_decode: sync stream");
 
     for (int64_t k = 0; k < B; ++k) {
-        batch[k].session->tail_cur_ = 1 - batch[k].session->tail_cur_;
-        batch[k].session->pos_ += 1;
-        batch[k].session->broken_ = false;
-        batch[k].session->mtp_chain_step_ = -1;
+        Qwen4ExpSession &sk = *batch[k].session;
+        const int64_t Tk = offsets[k + 1] - offsets[k];
+        if (Tk > 1) {
+            sk.verify_pending_ = true;
+            sk.gdn_to_spare_ = false;
+        } else {
+            sk.tail_cur_ = 1 - sk.tail_cur_;
+            sk.pos_ += 1;
+            sk.broken_ = false;
+            sk.mtp_chain_step_ = -1;
+        }
     }
 
     const float *l = reinterpret_cast<const float *>(host + kReadbackLogitsAt);
     for (int64_t k = 0; k < B; ++k) {
-        out_logits[k].assign(l + (size_t)(k * D.vocab), l + (size_t)((k + 1) * D.vocab));
+        const int64_t Tk = offsets[k + 1] - offsets[k];
+        const size_t num_k = (size_t)(Tk * D.vocab);
+        out_logits[k].assign(l + (size_t)(offsets[k] * D.vocab),
+                             l + (size_t)(offsets[k] * D.vocab) + num_k);
     }
+}
+
+std::vector<std::vector<int32_t>> Qwen4ExpSession::step_batch_mtp(
+    const std::vector<Qwen4ExpSession *> &sessions,
+    const std::vector<int32_t> &current_tokens,
+    int64_t max_draft,
+    float mtp_margin) {
+    const int64_t B = (int64_t)sessions.size();
+    STRIX_CHECK(B == (int64_t)current_tokens.size(), "step_batch_mtp: sessions and current_tokens size mismatch");
+    if (B == 0) return {};
+
+    std::vector<BatchSlotStep> batch(B);
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession *s = sessions[k];
+        batch[k].session = s;
+        batch[k].token_id = current_tokens[k];
+        batch[k].tokens = {current_tokens[k]};
+        if (s->has_mtp() && max_draft > 0) {
+            MtpTop2 t0 = s->forward_mtp_top2(current_tokens[k], 0);
+            if (!t0.nan && t0.best_v - t0.second_v >= mtp_margin) {
+                batch[k].tokens.push_back(t0.best);
+                if (max_draft >= 2) {
+                    MtpTop2 t1 = s->forward_mtp_top2(t0.best, 1);
+                    if (!t1.nan && t1.best_v - t1.second_v >= mtp_margin) {
+                        batch[k].tokens.push_back(t1.best);
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::vector<float>> batch_logits;
+    forward_batch_decode(batch, batch_logits);
+
+    const int64_t vocab = sessions[0]->m_.dims().vocab;
+    auto argmax_row = [&](const float *row) -> int32_t {
+        int32_t best = 0;
+        float best_v = row[0];
+        for (int32_t i = 1; i < vocab; ++i) {
+            if (row[i] > best_v) {
+                best_v = row[i];
+                best = i;
+            }
+        }
+        return best;
+    };
+
+    std::vector<std::vector<int32_t>> accepted(B);
+    for (int64_t k = 0; k < B; ++k) {
+        Qwen4ExpSession *s = sessions[k];
+        const int64_t Tk = (int64_t)batch[k].tokens.size();
+        if (Tk == 1) {
+            int32_t next_tok = argmax_row(batch_logits[k].data());
+            accepted[k] = {next_tok};
+        } else {
+            int64_t kept = 1;
+            int32_t final_tok = -1;
+            for (int64_t j = 0; j < Tk - 1; ++j) {
+                const float *row_j = batch_logits[k].data() + (size_t)(j * vocab);
+                int32_t sampled = argmax_row(row_j);
+                if (sampled == batch[k].tokens[(size_t)(j + 1)]) {
+                    accepted[k].push_back(sampled);
+                    kept++;
+                } else {
+                    final_tok = sampled;
+                    break;
+                }
+            }
+            if (kept == Tk) {
+                const float *row_last = batch_logits[k].data() + (size_t)((Tk - 1) * vocab);
+                int32_t sampled_last = argmax_row(row_last);
+                accepted[k].push_back(sampled_last);
+                s->keep_verify();
+            } else {
+                accepted[k].push_back(final_tok);
+                s->keep_verify_prefix(kept);
+            }
+        }
+    }
+    return accepted;
+}
+
+void Qwen4ExpSession::ensure_verify_buffers() {
+    if (!conv_spare_.empty()) return;
+    for (size_t l = 0; l < conv_state_.size(); ++l) {
+        const std::string tag = "spare layer " + std::to_string(l);
+        conv_spare_.emplace_back(conv_state_[l].size() ? DeviceBuffer<uint8_t>(conv_state_[l].size(), "conv state " + tag)
+                                                       : DeviceBuffer<uint8_t>());
+        rec_spare_.emplace_back(rec_state_[l].size() ? DeviceBuffer<float>(rec_state_[l].size(), "recurrent state " + tag)
+                                                     : DeviceBuffer<float>());
+    }
+    if (ple_state_.size()) ple_state_kept_ = DeviceBuffer<uint8_t>(ple_state_.size(), "kept PLE conv state");
+    if (mtp_) mtp_prev_kept_ = DeviceBuffer<uint8_t>(mtp_prev_.size(), "kept MTP previous streams");
+    const Qwen4ExpDims &D = m_.dims();
+    const size_t e = es(m_.act());
+    for (size_t l = 0; l < conv_state_.size(); ++l)
+        verify_in_.emplace_back(
+            (size_t)(kMaxLogits * (D.is_attention[l] ? D.idx_d + (kv_format_ == KvFormat::Q8 ? 2 * D.hkv * D.hd : 0)
+                                                     : D.gstride)) * e,
+            "verify rows, layer " + std::to_string(l));
 }
 
 std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
@@ -2211,24 +2378,7 @@ std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &i
     verify_hist_start_before_ = pos3_start_;
     verify_delta_before_ = rope_delta_;
     verify_ever_before_ = history_ever_interleaved_;
-    if (conv_spare_.empty()) {
-        for (size_t l = 0; l < conv_state_.size(); ++l) {
-            const std::string tag = "spare layer " + std::to_string(l);
-            conv_spare_.emplace_back(conv_state_[l].size() ? DeviceBuffer<uint8_t>(conv_state_[l].size(), "conv state " + tag)
-                                                           : DeviceBuffer<uint8_t>());
-            rec_spare_.emplace_back(rec_state_[l].size() ? DeviceBuffer<float>(rec_state_[l].size(), "recurrent state " + tag)
-                                                         : DeviceBuffer<float>());
-        }
-        if (ple_state_.size()) ple_state_kept_ = DeviceBuffer<uint8_t>(ple_state_.size(), "kept PLE conv state");
-        if (mtp_) mtp_prev_kept_ = DeviceBuffer<uint8_t>(mtp_prev_.size(), "kept MTP previous streams");
-        const Qwen4ExpDims &D = m_.dims();
-        const size_t e = es(m_.act());
-        for (size_t l = 0; l < conv_state_.size(); ++l)
-            verify_in_.emplace_back(
-                (size_t)(kMaxLogits * (D.is_attention[l] ? D.idx_d + (kv_format_ == KvFormat::Q8 ? 2 * D.hkv * D.hd : 0)
-                                                         : D.gstride)) * e,
-                "verify rows, layer " + std::to_string(l));
-    }
+    ensure_verify_buffers();
     // What the forward changes in place (small): kept for drop_verify. The GDN states go to the spare set.
     copy_state(ple_state_, ple_state_kept_, stream_, "PLE conv state");
     copy_state(mtp_prev_, mtp_prev_kept_, stream_, "MTP previous streams");

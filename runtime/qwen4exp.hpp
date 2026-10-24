@@ -406,9 +406,16 @@ public:
     struct BatchSlotStep {
         Qwen4ExpSession *session = nullptr;
         int32_t token_id = 0;
+        std::vector<int32_t> tokens;  // optional: if non-empty, verifies multi-token sequence for this slot
     };
     static void forward_batch_decode(const std::vector<BatchSlotStep> &batch,
                                      std::vector<std::vector<float>> &out_logits);
+    static std::vector<std::vector<int32_t>> step_batch_mtp(
+        const std::vector<Qwen4ExpSession *> &sessions,
+        const std::vector<int32_t> &current_tokens,
+        int64_t max_draft = 2,
+        float mtp_margin = 0.15f);
+    void ensure_verify_buffers();
     // The image forward (the vision build's forward extension): runs the tower over the image and
     // scatters its merged rows at the image_token_id positions of ids, then forwards exactly like the
     // overload above - which itself is this one with no image (the text path stays bit-identical and

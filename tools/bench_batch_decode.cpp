@@ -29,11 +29,11 @@ int main(int argc, char **argv) {
         printf("L%d: %s\n", i, model.dims().is_attention[i] ? "ATTN" : "GDN");
     }
 
-    printf("Creating Sessions 0..3...\n");
-    Qwen4ExpSession s0(model, capacity, chunk);
-    Qwen4ExpSession s1(model, capacity, chunk);
-    Qwen4ExpSession s2(model, capacity, chunk);
-    Qwen4ExpSession s3(model, capacity, chunk);
+    printf("Creating Sessions 0..3 (with MTP)...\n");
+    Qwen4ExpSession s0(model, capacity, chunk, PrefillMath::WmmaBf16, true);
+    Qwen4ExpSession s1(model, capacity, chunk, PrefillMath::WmmaBf16, true);
+    Qwen4ExpSession s2(model, capacity, chunk, PrefillMath::WmmaBf16, true);
+    Qwen4ExpSession s3(model, capacity, chunk, PrefillMath::WmmaBf16, true);
 
     std::vector<int32_t> prompt = {151644, 872, 198, 2610, 525, 264, 10925, 1782, 151645, 198, 151646, 198};
     s0.forward(prompt, 1);
@@ -99,6 +99,41 @@ int main(int argc, char **argv) {
         }
         printf("Slot %d max logit difference (batch vs single): %g\n", k, max_diffs[k]);
     }
+
+    // --- Batched MTP Speculative Decode Benchmark ---
+    printf("\n--- Batched MTP Speculative Decode (4 slots) ---\n");
+    s0.reset(); s1.reset(); s2.reset(); s3.reset();
+    s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
+
+    std::vector<Qwen4ExpSession *> sessions = {&s0, &s1, &s2, &s3};
+    std::vector<int32_t> cur_tokens = {tok0, tok1, tok2, tok3};
+
+    // Warmup:
+    Qwen4ExpSession::step_batch_mtp(sessions, cur_tokens, 2, 0.15f);
+
+    // Reset and measured benchmark:
+    s0.reset(); s1.reset(); s2.reset(); s3.reset();
+    s0.forward(prompt, 1); s1.forward(prompt, 1); s2.forward(prompt, 1); s3.forward(prompt, 1);
+    cur_tokens = {tok0, tok1, tok2, tok3};
+
+    int64_t total_tokens_generated = 0;
+    const int kMtpSteps = 10;
+    auto t_mtp0 = std::chrono::steady_clock::now();
+    for (int step = 0; step < kMtpSteps; ++step) {
+        auto acc = Qwen4ExpSession::step_batch_mtp(sessions, cur_tokens, 2, 0.15f);
+        for (int k = 0; k < 4; ++k) {
+            total_tokens_generated += acc[k].size();
+            cur_tokens[k] = acc[k].back();
+        }
+    }
+    auto t_mtp1 = std::chrono::steady_clock::now();
+    double ms_mtp = std::chrono::duration<double, std::milli>(t_mtp1 - t_mtp0).count();
+    printf("Batched MTP (%d steps): %ld tokens in %.2f ms (%.2f tok/s aggregate, %.2f tok/step)\n",
+           kMtpSteps, (long)total_tokens_generated, ms_mtp,
+           (double)total_tokens_generated / (ms_mtp / 1000.0),
+           (double)total_tokens_generated / kMtpSteps);
+    printf("Speedup over unbatched serial: %.2fx\n",
+           ((double)total_tokens_generated / (ms_mtp / 1000.0)) / (4000.0 / ms_sum));
 
     return 0;
 }
