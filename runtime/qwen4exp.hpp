@@ -403,6 +403,12 @@ public:
         return T >= kKv8StageMinTokens && (double)T * (double)keys_per_query * kKv8UnpackNs >= (double)rows * kKv8StageNs;
     }
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe = nullptr);
+    struct BatchSlotStep {
+        Qwen4ExpSession *session = nullptr;
+        int32_t token_id = 0;
+    };
+    static void forward_batch_decode(const std::vector<BatchSlotStep> &batch,
+                                     std::vector<std::vector<float>> &out_logits);
     // The image forward (the vision build's forward extension): runs the tower over the image and
     // scatters its merged rows at the image_token_id positions of ids, then forwards exactly like the
     // overload above - which itself is this one with no image (the text path stays bit-identical and

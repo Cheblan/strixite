@@ -1931,6 +1931,238 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     return logits;
 }
 
+void Qwen4ExpSession::forward_batch_decode(const std::vector<BatchSlotStep> &batch,
+                                           std::vector<std::vector<float>> &out_logits) {
+    const int64_t B = (int64_t)batch.size();
+    STRIX_CHECK(B >= 1 && B <= 8, "forward_batch_decode: batch size ", B, ", expected 1..8");
+    out_logits.resize(B);
+    if (B == 1) {
+        out_logits[0] = batch[0].session->forward({batch[0].token_id}, 1);
+        return;
+    }
+    Qwen4ExpSession &s0 = *batch[0].session;
+    const Qwen4ExpModel &m = s0.m_;
+    const Qwen4ExpDims &D = m.dims();
+    const Act act = m.act();
+    const size_t e = es(act);
+    const bool sep = m.shared_separate();
+    const hipStream_t stream = s0.stream_;
+    const int64_t n4 = D.H * D.d, A = D.top_k + (sep ? 0 : 1), hd = D.hd;
+
+    std::vector<int32_t> h_ids(B);
+    for (int64_t k = 0; k < B; ++k) {
+        STRIX_CHECK(batch[k].session != nullptr, "forward_batch_decode: null session at ", k);
+        STRIX_CHECK(!batch[k].session->broken_, "forward_batch_decode: session ", k, " is broken");
+        STRIX_CHECK(!batch[k].session->verify_pending_, "forward_batch_decode: session ", k, " has verify pending");
+        STRIX_CHECK(batch[k].session->pos_ + 1 <= batch[k].session->capacity_, "forward_batch_decode: session ", k, " exceeds capacity");
+        h_ids[k] = batch[k].token_id;
+    }
+
+    auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
+        kernels::linear_qw(x, w, y, M, act, out_act, stream);
+    };
+
+    auto hc_mix = [&](const Qwen4ExpModel::Hc &hc, bool inject) {
+        float *w_in = inject ? s0.w_in_.get() : nullptr;
+        uint8_t *X = s0.x_.get();
+        if (hc.down.bits == 8)
+            kernels::hc_mix_down(X, hc.down.q8, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+        else
+            kernels::hc_mix_down(X, hc.down.q4, B, D.H, D.d, D.r, inject, D.eps, s0.h_.get(), w_in, s0.inv_.get(), act, stream);
+        if (hc.up.bits == 8)
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q8, X, hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+        else
+            kernels::hc_mix_up(s0.h_.get(), hc.up.q4, X, hc.norm, s0.inv_.get(), B, D.H, D.d, s0.u_.get(), act, stream);
+    };
+
+    auto inject_y = [&] {
+        kernels::hc_inject(s0.x_.get(), s0.w_in_.get(), s0.y_.get(), B, D.H, D.d, act, stream);
+    };
+
+    // PLE:
+    std::vector<int64_t> all_ple_rows;
+    if (D.ple_layer >= 0) {
+        all_ple_rows.resize((size_t)(B * 16));
+        for (int64_t k = 0; k < B; ++k) {
+            int64_t tok = batch[k].token_id;
+            ple_ngram_ids(m.ngram_rows().hash_params(), &tok, 1, batch[k].session->ple_hist_,
+                          all_ple_rows.data() + (size_t)(k * 16));
+        }
+        const NgramRowSource &ng = m.ngram_rows();
+        if (act == Act::BF16) {
+            ng.gather(all_ple_rows.data(), (int64_t)all_ple_rows.size(),
+                      static_cast<uint16_t *>(s0.ple_host_[0].get()));
+        } else {
+            std::vector<uint16_t> bits((size_t)(B * D.ple_e));
+            ng.gather(all_ple_rows.data(), (int64_t)all_ple_rows.size(), bits.data());
+            float *f = static_cast<float *>(s0.ple_host_[0].get());
+            for (size_t j = 0; j < bits.size(); ++j) f[j] = bf16_bits_to_f32(bits[j]);
+        }
+    }
+
+    // Embedding:
+    STRIX_HIP_CHECK(hipMemcpyAsync(s0.ids_.get(), h_ids.data(), (size_t)B * 4, hipMemcpyHostToDevice, stream),
+                    "forward_batch_decode: upload ids");
+    kernels::reset_embedding_error(s0.emb_err_.get(), stream);
+    if (m.is_embed_q8()) {
+        kernels::embedding_lookup(s0.ids_.get(), B, m.embed_q8(), s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
+    } else {
+        kernels::embedding_lookup(s0.ids_.get(), B, m.embed(), D.vocab, D.d, s0.x_.get(), act, s0.emb_err_.get(), stream, D.H, n4);
+    }
+
+    for (int64_t i = 0; i < D.layers; ++i) {
+        const Qwen4ExpModel::Layer &l = m.layer(i);
+
+        if (i == D.ple_layer) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(s0.ple_e_.get(), s0.ple_host_[0].get(),
+                                           (size_t)(B * D.ple_e) * e, hipMemcpyHostToDevice, stream),
+                            "forward_batch_decode: upload PLE rows");
+            lin(s0.ple_e_.get(), l.ple_kv, s0.ple_kv_.get(), B, act);
+            const kernels::PleShape sh{1, D.H, D.d, D.ple_taps, D.ple_dil, D.ple_ld};
+            for (int64_t k = 0; k < B; ++k) {
+                Qwen4ExpSession &sk = *batch[k].session;
+                uint8_t *kv_k = s0.ple_kv_.get() + (size_t)(k * D.ple_ld) * e;
+                uint8_t *x_k = s0.x_.get() + (size_t)(k * n4) * e;
+                float *sigma_k = s0.ple_sigma_.get() + (size_t)(k * D.H);
+                kernels::ple_gate(kv_k, x_k, l.ple_norm_key, l.ple_norm_query, l.ple_norm_conv,
+                                  sk.ple_state_.get(), sh, D.eps, sk.ple_hist_buf_.get(), sigma_k, act, stream);
+                kernels::ple_conv(sk.ple_hist_buf_.get(), sigma_k, kv_k, l.ple_conv, sh, x_k,
+                                  sk.ple_state_.get(), act, stream);
+            }
+        }
+
+        hc_mix(l.hc_attn, true);
+
+        if (!D.is_attention[(size_t)i]) {
+            lin(s0.u_.get(), l.in_proj, s0.proj_.get(), B, act);
+            for (int64_t k = 0; k < B; ++k) {
+                Qwen4ExpSession &sk = *batch[k].session;
+                uint8_t *gp_k = s0.proj_.get() + (size_t)(k * D.gstride) * e;
+                uint8_t *qkv_k = s0.qkv_.get() + (size_t)(k * D.conv_c) * e;
+                float *beta_k = s0.beta_.get() + (size_t)(k * D.gv);
+                float *g_k = s0.g_.get() + (size_t)(k * D.gv);
+                uint8_t *core_k = s0.core_.get() + (size_t)(k * (D.gv * kHD)) * e;
+                const bool fresh = sk.pos_ == 0;
+
+                kernels::gdn_front(gp_k, {1, D.gk, kHD, D.gv, kHD, D.gstride, D.conv_c + D.gz, D.conv_c + D.gz + D.gv},
+                                   l.conv_w, sk.conv_state_[(size_t)i].get(), sk.conv_state_[(size_t)i].get(),
+                                   fresh, l.A_log, l.dt_bias, qkv_k, beta_k, g_k, act, stream);
+
+                kernels::delta_rule(qkv_k, beta_k, g_k, {1, D.gk, D.gv, D.conv_c},
+                                   sk.rec_state_[(size_t)i].get(), sk.rec_state_[(size_t)i].get(),
+                                   fresh, core_k, act, stream, kernels::DeltaRulePath::Auto,
+                                   s0.precision_.gdn);
+            }
+            kernels::rmsnorm_gated(s0.core_.get(), s0.proj_.get() + (size_t)D.conv_c * e, l.gdn_norm,
+                                   s0.gnorm_.get(), B * D.gv, kHD, D.eps, kernels::GateAct::Sigmoid,
+                                   act, stream, D.gv, D.gstride);
+            lin(s0.gnorm_.get(), l.out_proj, s0.y_.get(), B, act);
+        } else {
+            lin(s0.u_.get(), l.qkv, s0.proj_.get(), B, act);
+            const int64_t W = D.hkv * hd;
+            for (int64_t k = 0; k < B; ++k) {
+                Qwen4ExpSession &sk = *batch[k].session;
+                const int64_t pos_k = sk.pos_;
+                uint8_t *proj_k = s0.proj_.get() + (size_t)(k * D.astride) * e;
+                uint8_t *kc = sk.k_cache_[(size_t)i].get();
+                uint8_t *vc = sk.v_cache_[(size_t)i].get();
+                uint8_t *k_out = kc + (size_t)(pos_k * W) * e;
+                uint8_t *v_out = vc + (size_t)(pos_k * W) * e;
+
+                kernels::NormRopeJob nr[4] = {
+                    {proj_k, D.astride, 2 * hd, proj_k, D.astride, 2 * hd, D.hq, hd, l.q_norm},
+                    {proj_k + (size_t)(D.hq * 2 * hd) * e, D.astride, hd, k_out, W, hd, D.hkv, hd, l.k_norm},
+                    {proj_k + (size_t)(D.hq * 2 * hd + D.hkv * hd) * e, D.astride, hd, v_out, W, hd, D.hkv, hd, nullptr},
+                    {proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, proj_k + (size_t)D.idx_col * e, D.astride, D.idx_d, D.idx_h, D.idx_d, l.idx_q_norm}
+                };
+                const bool qsa_layer = pos_k + 1 > D.dense_key_limit();
+                kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, 1, D.eps, D.rot, sk.rope_pos(pos_k),
+                                           m.inv_freq(), act, stream, m.rope_scale());
+
+                kernels::qsa_block_keys(proj_k + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, 1, pos_k,
+                                        pos_k % kernels::kQsaBlock ? sk.tail_[sk.tail_cur_][(size_t)i].get() : nullptr,
+                                        sk.tail_[1 - sk.tail_cur_][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
+                                        m.inv_freq(), D.rot, sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
+                                        act, stream, m.rope_scale());
+
+                const kernels::AttentionShape as{1, pos_k, D.hq, D.hkv, hd, D.astride, 2 * hd};
+                const float scale = 1.0f / std::sqrt((float)hd);
+                uint8_t *core_k = s0.core_.get() + (size_t)(k * (D.hq * hd)) * e;
+
+                if (!qsa_layer) {
+                    kernels::attention(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as, scale,
+                                       core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_, act, stream);
+                } else {
+                    const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
+                    void *iq = proj_k + (size_t)D.idx_col * e;
+                    kernels::qsa_scores(iq, D.astride, D.idx_d, 1, pos_k, D.idx_h, D.idx_d,
+                                        sk.block_keys_[(size_t)i].get(), sk.cap_blocks_,
+                                        s0.qsa_scores_.get(), sk.cap_blocks_, act, stream);
+                    kernels::qsa_topk(s0.qsa_scores_.get(), sk.cap_blocks_, 1, pos_k, qsa_k,
+                                      s0.qsa_sel_.get(), s0.qsa_nsel_.get(), s0.qsa_topk_ws_.get(),
+                                      s0.qsa_topk_ws_bytes_, stream);
+                    kernels::attention_gathered(proj_k, proj_k + (size_t)hd * e, kc, vc, sk.capacity_, as,
+                                                s0.qsa_sel_.get(), s0.qsa_nsel_.get(), qsa_k, scale,
+                                                core_k, s0.attn_ws_.get(), s0.attn_ws_bytes_,
+                                                s0.attn_err_.get(), act, stream);
+                }
+            }
+            lin(s0.core_.get(), l.o_proj, s0.y_.get(), B, act);
+        }
+        inject_y();
+
+        // MoE block:
+        hc_mix(l.hc_mlp, true);
+        kernels::linear_bf16w(s0.u_.get(), l.router, s0.router_logits_.get(), B, D.experts + 1, D.d, act, Act::F32, stream);
+        kernels::moe_router(s0.router_logits_.get(), D.experts + 1, B, D.experts, D.top_k,
+                            sep ? nullptr : s0.router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
+                            s0.route_ids_.get(), s0.route_coef_.get(), Act::F32, s0.router_err_.get(), stream);
+
+        const int64_t Estack = D.experts + (sep ? 0 : 1);
+        kernels::linear_qw_experts_gather_swiglu(s0.u_.get(), l.gate_up, Estack, s0.route_ids_.get(), B, A,
+                                                 s0.hh_.get(), act, s0.expert_err_.get(), stream);
+        kernels::linear_qw_experts_combine(s0.hh_.get(), l.down, Estack, s0.route_ids_.get(), s0.route_coef_.get(),
+                                           B, A, s0.y_.get(), act, s0.expert_err_.get(), stream);
+
+        if (sep) {
+            lin(s0.u_.get(), l.shared_gate_up, s0.gu_.get(), B, act);
+            kernels::swiglu(s0.gu_.get(), s0.hh_.get(), B, D.inter, act, stream);
+            lin(s0.hh_.get(), l.shared_down, s0.sh_y_.get(), B, act);
+            kernels::moe_shared_add_inject(s0.y_.get(), s0.sh_y_.get(), s0.router_logits_.get() + D.experts,
+                                           D.experts + 1, B, D.d, (uint32_t)D.experts, s0.x_.get(),
+                                           s0.w_in_.get(), D.H, act, s0.router_err_.get(), stream);
+        } else {
+            inject_y();
+        }
+    }
+
+    // Final mixer & LM Head:
+    hc_mix(m.final_mix(), false);
+    lin(s0.u_.get(), m.lm_head(), s0.logits_.get(), B, Act::F32);
+
+    // Read back logits:
+    const size_t n_floats = (size_t)(B * D.vocab);
+    STRIX_CHECK(s0.readback_.size() >= kReadbackLogitsAt + n_floats * 4,
+                "forward_batch_decode: readback buffer too small");
+    uint8_t *host = static_cast<uint8_t *>(s0.readback_.get());
+    STRIX_HIP_CHECK(hipMemcpyAsync(host + kReadbackLogitsAt, s0.logits_.get(), n_floats * 4,
+                                   hipMemcpyDeviceToHost, stream),
+                    "forward_batch_decode: read logits");
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream), "forward_batch_decode: sync stream");
+
+    for (int64_t k = 0; k < B; ++k) {
+        batch[k].session->tail_cur_ = 1 - batch[k].session->tail_cur_;
+        batch[k].session->pos_ += 1;
+        batch[k].session->broken_ = false;
+        batch[k].session->mtp_chain_step_ = -1;
+    }
+
+    const float *l = reinterpret_cast<const float *>(host + kReadbackLogitsAt);
+    for (int64_t k = 0; k < B; ++k) {
+        out_logits[k].assign(l + (size_t)(k * D.vocab), l + (size_t)((k + 1) * D.vocab));
+    }
+}
+
 std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
                                                    const std::vector<int64_t> &pos3) {
     STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::forward_verify: the last one awaits keep_verify / drop_verify");
