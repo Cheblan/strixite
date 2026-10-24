@@ -260,7 +260,7 @@ target_link_libraries(bench_batch_decode PRIVATE strix_serve_model)
 add_executable(test_paged_attention tools/test_paged_attention.cpp)
 target_link_libraries(test_paged_attention PRIVATE strix_model)
 
-add_executable(bench_prefill)
+add_executable(bench_prefill tools/bench_prefill.cpp)
 strix_hip_sources(bench_prefill tools/bench_prefill.cpp)
 target_link_libraries(bench_prefill PRIVATE strix_model)
 

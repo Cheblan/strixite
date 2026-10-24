@@ -1167,6 +1167,8 @@ void Qwen4ExpSession::kv8_copy(uint8_t *&cur, size_t layer, int64_t n, int64_t f
 
 void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
     STRIX_CHECK(out != nullptr, "Qwen4ExpSession::export_state: null output");
+    STRIX_CHECK(kv_format_ != KvFormat::Paged,
+                "Qwen4ExpSession::export_state: prompt cache export is not supported with paged KV cache");
     STRIX_CHECK(can_restore(s), "Qwen4ExpSession::export_state: the snapshot (position ", s.pos(),
                 ") is not valid for this session's KV cache any more");
     const int64_t n = s.pos();
@@ -1235,6 +1237,8 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
 
 void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, int64_t from) {
     STRIX_CHECK(in != nullptr, "Qwen4ExpSession::import_state: null input");
+    STRIX_CHECK(kv_format_ != KvFormat::Paged,
+                "Qwen4ExpSession::import_state: prompt cache import is not supported with paged KV cache");
     STRIX_CHECK(n >= 1 && n < capacity_, "Qwen4ExpSession::import_state: n = ", n, ", expected 1..", capacity_ - 1);
     STRIX_CHECK(from >= 0 && from < n, "Qwen4ExpSession::import_state: from = ", from, ", expected 0..", n - 1);
     STRIX_CHECK(bytes >= sizeof(Qwen4ExpStateHeader), "Qwen4ExpSession::import_state: ", bytes,
