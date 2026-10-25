@@ -156,6 +156,21 @@ int run(int argc, char **argv) {
                     "' is not a plain path - can't find the sibling vision.strixw");
         return weights.substr(0, slash) + "/vision.strixw";
     }();
+    const std::string mtp_weights = [&] {
+        if (!use_mtp) return std::string();
+        const std::string explicit_path = settings.text("mtp-weights");
+        if (!explicit_path.empty()) {
+            STRIX_CHECK(std::filesystem::is_regular_file(explicit_path),
+                        "strix_server: mtp-weights '", explicit_path, "' is not a file");
+            return explicit_path;
+        }
+        const size_t slash = weights.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            const std::string sibling = weights.substr(0, slash) + "/mtp.strixw";
+            if (std::filesystem::is_regular_file(sibling)) return sibling;
+        }
+        return std::string();
+    }();
     // Before the ~30 s weight load: a missing tower file is a setup mistake, named with both ways out.
     if (vision) {
         const size_t ts = tokenizer.rfind('/');
@@ -167,7 +182,7 @@ int run(int argc, char **argv) {
                         "files), or set vision = off");
     }
     Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows, yarn_factor,
-                        placement, vision_weights);
+                        placement, vision_weights, mtp_weights);
     if (placement != WeightPlacement::Device)
         slog(LogLevel::Info, "startup: placement %s (test machines only)", weight_placement_name(placement));
     if (yarn_factor > 1.0f)
@@ -176,14 +191,23 @@ int run(int argc, char **argv) {
              (double)model.rope_scale());
     slog(LogLevel::Info, "startup: %.1f GiB of weights loaded in %.1f s",
                  (double)model.weights().data_bytes() / (1ull << 30), model.weights().load_seconds());
-    // MTP drafts score a Q4 copy of the draft vocabulary's LM head rows (Qwen4ExpModel::make_draft_head_q4; strixite
-    // PR #2): half the bytes per draft call, the verify still decides every token.
+    if (model.has_separate_mtp()) {
+        slog(LogLevel::Info, "startup: MTP head: loaded from %s (ignored main weights MTP if present)",
+             mtp_weights.c_str());
+    }
+    // MTP draft head: Q4 G64 copy (strixite PR #2) or native lossless Q8 LM head (mtp-draft-head = q8/native).
+    const std::string draft_head_mode = settings.text("mtp-draft-head");
     if (use_mtp && model.has_mtp()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
-        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
-             (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (draft_head_mode == "q8" || draft_head_mode == "native") {
+            slog(LogLevel::Info, "startup: MTP draft head: native Q8 (first %lld LM head rows, lossless logits)",
+                 (long long)mtp_vocab);
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
+            slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+                 (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
     }
     std::unique_ptr<vision::ServedVision> served_vision;
     if (vision) {
@@ -262,7 +286,7 @@ int run(int argc, char **argv) {
         mi.prompt_cache = cache_gib > 0;
         mi.ram_margin = cache_opts.ram_margin;
         mi.capacity = capacity;
-        mi.state_bytes = [&backends](int64_t n) { return backends.front()->state_bytes_at(n); };
+        mi.state_bytes = [&backends](int64_t n) -> uint64_t { return backends.front()->state_bytes_at(n); };
         mi.row_cache_rows = table ? table->cache_rows() : 0;
         mi.row_cache_row_bytes = table ? table->cache_bytes_per_row() : 0;
         mi.row_cache_min_rows = std::min<int64_t>(mi.row_cache_rows, NgramTableRows::kDefaultCacheRows);

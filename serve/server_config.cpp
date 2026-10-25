@@ -279,6 +279,10 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"kv-cache", K::Text, 0, 0, "q8",
          "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes), bf16, or paged (dynamically allocated 32-token physical blocks from PagePool)"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
+        {"mtp-weights", K::PathOrOff, 0, 0, "off",
+         "path to mtp.strixw file (off = auto-detect sibling mtp.strixw next to weights, else main weights)"},
+        {"mtp-draft-head", K::Text, 0, 0, "q4",
+         "MTP draft head quantization: q4 (on-the-fly Q4 G64 copy) or q8/native (lossless native Q8 LM head)"},
         // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).
         {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},

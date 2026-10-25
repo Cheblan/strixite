@@ -100,12 +100,14 @@ public:
     Qwen4ExpModel(const std::string &weights, const std::string &ngram, kernels::Act act,
                   bool allow_truncated = false, int64_t ngram_cache_rows = NgramTableRows::kDefaultCacheRows,
                   float yarn_factor = 1.0f, WeightPlacement placement = WeightPlacement::Device,
-                  const std::string &vision = "");
+                  const std::string &vision = "", const std::string &mtp = "");
     const Qwen4ExpDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }
     const StrixwDevice &weights() const { return *w_; }
     bool truncated() const { return truncated_; }
     bool shared_separate() const { return shared_separate_; }
+    bool has_separate_mtp() const { return mtp_w_ != nullptr; }
+    const StrixwDevice *mtp_weights() const { return mtp_w_.get(); }
     // The image tower: loaded only when the constructor got a vision file. vision() throws without one
     // (no fallback path - the session's image forward is the only reader and it checks first).
     bool has_vision() const { return vision_ != nullptr; }
@@ -177,6 +179,7 @@ private:
     Qwen4ExpDims dims_;
     kernels::Act act_;
     std::unique_ptr<StrixwDevice> w_;
+    std::unique_ptr<StrixwDevice> mtp_w_;  // the constructor's mtp file, nullptr = from w_
     std::unique_ptr<VisionTower> vision_;  // the constructor's vision file, empty = no tower
     std::unique_ptr<NgramRowSource> ngram_;
     std::vector<Layer> layers_;

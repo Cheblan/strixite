@@ -582,18 +582,21 @@ ConvertPlan make_plan(const Source &src, const ConvertOptions &opt) {
         p.quant_single("lm_head.weight", "lm_head", -1);
     }
     for (int64_t l : layers) p.layer(lm + "layers." + std::to_string(l) + ".", l);
-    if (opt.mtp) {
+    if (opt.mtp && !opt.mtp_separate) {
         for (const char *n : {"mtp.fc_embedding.weight", "mtp.fc_hidden.weight"}) p.quant_single(n, "mtp_fc", -2);
         for (const char *n : {"mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight"}) p.f32(n, -2);
         p.hc("mtp.hyper_connection_mixer.", false, -2);
         p.layer("mtp.layers.0.", -2);
     }
-    for (const std::string &n : src.names())
+    for (const std::string &n : src.names()) {
         if (n.rfind("model.visual.", 0) == 0)
             p.plan.skipped.emplace_back(n, opt.vision ? "vision tower: not in this file (written to vision.strixw)"
                                                        : "vision tower: not loaded (text only)");
+        if (opt.mtp_separate && n.rfind("mtp.", 0) == 0)
+            p.plan.skipped.emplace_back(n, "MTP draft head: not in this file (written to mtp.strixw)");
+    }
     // A full conversion accounts for every source tensor; anything unplanned is a spec gap, not a skip.
-    const bool full = opt.layers.empty() && opt.globals && opt.mtp;
+    const bool full = opt.layers.empty() && opt.globals && (opt.mtp || opt.mtp_separate);
     if (full) {
         std::set<std::string> skipped;
         for (const auto &s : p.plan.skipped) skipped.insert(s.first);
@@ -605,6 +608,17 @@ ConvertPlan make_plan(const Source &src, const ConvertOptions &opt) {
         STRIX_CHECK(unknown.empty(), "convert: ", unknown.size(), " checkpoint tensors aren't in the conversion plan",
                     " (plan_conversion lists what goes in):", list);
     }
+    p.plan.shared_split = p.shared_split;
+    return p.plan;
+}
+
+ConvertPlan make_mtp_plan(const Source &src, const ConvertOptions &opt) {
+    Planner p(src, parse_layout(opt.layout));
+    p.plan.layers_total = 1;
+    for (const char *n : {"mtp.fc_embedding.weight", "mtp.fc_hidden.weight"}) p.quant_single(n, "mtp_fc", -2);
+    for (const char *n : {"mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight"}) p.f32(n, -2);
+    p.hc("mtp.hyper_connection_mixer.", false, -2);
+    p.layer("mtp.layers.0.", -2);
     p.plan.shared_split = p.shared_split;
     return p.plan;
 }
@@ -958,143 +972,13 @@ void write_vision_strixw(const Source &src, const ConvertOptions &opt, Log &log,
         fmt_bytes((double)out_bytes).c_str(), fmt_dur(std::chrono::duration<double>(Clock::now() - tv0).count()).c_str());
 }
 
-}  // namespace
-
-const char *convert_op_name(ConvertOp op) {
-    switch (op) {
-    case ConvertOp::Q4Merge: return "q4";
-    case ConvertOp::Q4FoldHC: return "q4-fold";
-    case ConvertOp::Q4ChunkMajor: return "q4-chunk";
-    case ConvertOp::BF16Rows: return "bf16";
-    case ConvertOp::F32Widen: return "f32";
-    case ConvertOp::I64Copy: return "i64";
-    }
-    return "?";
-}
-
-std::string checkpoint_fingerprint(const std::string &dir) { return Source(dir).fingerprint(); }
-
-ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
-    const auto t0 = Clock::now();
-    STRIX_CHECK(!opt.src_dir.empty() && (!opt.out_dir.empty() || opt.plan_only), "convert: src_dir and out_dir needed");
-    const std::string layout = layout_str(parse_layout(opt.layout));  // validates before any work
-    STRIX_CHECK(!opt.git.empty(), "convert: the converter's git hash is required (recorded in the file)");
-    const int threads = opt.threads > 0 ? opt.threads : (int)std::max(1u, std::thread::hardware_concurrency());
-    Log log(opt.console, t0);
-    ConvertResult res;
-    if (opt.tower_only) {
-        STRIX_CHECK(opt.vision, "convert --tower-only: the tower file is exactly what --vision writes, "
-                    "set both (or run the full conversion with --vision)");
-        STRIX_CHECK(!opt.plan_only, "convert --tower-only --plan: --plan already logs the tower's tensors");
-        const std::string vpath = opt.out_dir + "/vision.strixw";
-        STRIX_CHECK(!fs::exists(vpath), "convert --tower-only: '", vpath, "' already exists - remove it "
-                    "first (the converter never overwrites a finished file)");
-        fs::create_directories(opt.out_dir);
-        Source tsrc(opt.src_dir);
-        log.rule("strix-infer converter \u00b7 tower only (vision.strixw)");
-        log("  %zu shards, %s of tensor data, fingerprint %s", tsrc.shards(),
-            fmt_bytes((double)tsrc.bytes()).c_str(), tsrc.fingerprint().c_str());
-        write_vision_strixw(tsrc, opt, log, threads, res);
-        res.seconds = log.elapsed();
-        return res;
-    }
-    const std::string final_path = opt.out_dir + "/weights.strixw", partial = final_path + ".partial";
-    if (!opt.plan_only) {
-        STRIX_CHECK(!fs::exists(final_path), "convert: '", final_path,
-                    "' already exists - remove it first (the converter never overwrites a finished file)");
-        if (opt.vision)
-            STRIX_CHECK(!fs::exists(opt.out_dir + "/vision.strixw"), "convert: '", opt.out_dir,
-                        "/vision.strixw' already exists - remove it first (the converter never overwrites a finished file)");
-        const bool fresh = !fs::exists(opt.out_dir);
-        fs::create_directories(opt.out_dir);
-        log.open_file(opt.out_dir + "/convert.log");
-        if (fresh) set_no_compression(opt.out_dir, log);
-    }
-    log.rule("strix-infer converter \u00b7 Qwen3.8-Flash-Next (qwen4exp) -> strixw v" + std::to_string(kStrixwVersion));
-    log("layout: %s", layout.c_str());
-    log("converter git %s, %d threads", opt.git.c_str(), threads);
-
-    log("reading the checkpoint's headers from %s ...", opt.src_dir.c_str());
-    Source src(opt.src_dir);
-    std::string mtp_source;
-    if (!opt.mtp_from.empty()) {
-        STRIX_CHECK(opt.mtp, "convert: --mtp-from with --no-mtp - nothing would use it");
-        const auto [fp, n] = src.override_mtp(opt.mtp_from);
-        mtp_source = opt.mtp_from + " (fingerprint " + fp + ", " + std::to_string(n) + " tensors)";
-        log("  mtp.* override: %s", mtp_source.c_str());
-    }
-    log("  %zu shards, %s of tensor data, fingerprint %s", src.shards(), fmt_bytes((double)src.bytes()).c_str(),
-        src.fingerprint().c_str());
-
-    const ConvertPlan plan = make_plan(src, opt);
-    uint64_t planned_src = 0, planned_out = 0, skipped_bytes = 0;
-    std::map<std::string, std::pair<int, uint64_t>> by_op;
-    std::vector<StrixwTensor> outs;
-    for (const ConvertStep &s : plan.steps) {
-        StrixwTensor t = s.out;
-        t.components = strixw_components(t);
-        for (const std::string &n : s.sources)
-            if (!n.empty()) planned_src += src.info(n).byte_length;
-        planned_out += t.bytes();
-        auto &e = by_op[convert_op_name(s.op)];
-        e.first += 1, e.second += t.bytes();
-        outs.push_back(std::move(t));
-    }
-    std::map<std::string, std::pair<int, uint64_t>> skip_why;
-    for (const auto &[n, why] : plan.skipped) {
-        auto &e = skip_why[why];
-        e.first += 1, e.second += src.info(n).byte_length;
-        skipped_bytes += src.info(n).byte_length;
-    }
-    log.blank();
-    log.rule("plan");
-    log("%zu output tensors from %s of source -> %s (%.1f%% of the source size)", plan.steps.size(),
-        fmt_bytes((double)planned_src).c_str(), fmt_bytes((double)planned_out).c_str(),
-        100.0 * (double)planned_out / (double)std::max<uint64_t>(1, planned_src));
-    for (const auto &[op, e] : by_op)
-        log("  %-9s %4d tensors  %12s", op.c_str(), e.first, fmt_bytes((double)e.second).c_str());
-    if (skipped_bytes) log("  skipped in total: %s (not in this file)", fmt_bytes((double)skipped_bytes).c_str());
-    for (const auto &[why, e] : skip_why)
-        log("  skipped %4d source tensors (%s): %s", e.first, fmt_bytes((double)e.second).c_str(), why.c_str());
-    if (!opt.layers.empty() || !opt.globals || !opt.mtp)
-        log("  PARTIAL conversion (%s%s%s) - the file is marked complete=no and the full-coverage check is off",
-            opt.layers.empty() ? "all layers" : "some layers", opt.globals ? "" : ", no globals",
-            opt.mtp ? "" : ", no MTP");
-    res.source_bytes = planned_src, res.output_bytes = planned_out, res.tensors = plan.steps.size();
-    if (opt.plan_only) {
-        for (const ConvertStep &s : plan.steps)
-            log("  %-9s %-62s %s", convert_op_name(s.op), s.out.name.c_str(), shape_str(s.out.shape).c_str());
-        if (opt.vision)
-            for (const StrixwTensor &t : plan_vision(src, opt.vision_dims))
-                log("  %-9s %-62s %s", "bf16-vis", t.name.c_str(), shape_str(t.shape).c_str());
-        log("plan only: nothing written");
-        res.seconds = log.elapsed();
-        return res;
-    }
-
-    std::string layer_list = "all";
-    if (!opt.layers.empty()) {
-        layer_list.clear();
-        for (int64_t l : opt.layers) layer_list += (layer_list.empty() ? "" : ",") + std::to_string(l);
-    }
-    const bool complete = opt.layers.empty() && opt.globals && opt.mtp;
-    std::map<std::string, std::string> meta = {
-        {"arch", "qwen4exp"},
-        {"layout", layout},
-        {"shared_expert", plan.shared_split ? "separate" : "stacked"},
-        {"source_dir", opt.src_dir},
-        {"source_fingerprint", src.fingerprint()},
-        {"converter_git", opt.git},
-        {"created", utc_now()},
-        {"layers", layer_list},
-        {"globals", opt.globals ? "yes" : "no"},
-        {"mtp", opt.mtp ? "yes" : "no"},
-        {"mtp_source", mtp_source.empty() ? "checkpoint" : mtp_source},
-        {"complete", complete ? "yes" : "no"},
-        {"format_note", "embedding BF16 (not layout A's int8); n-gram table not included (OPEN)"}};
+void execute_plan(const Source &src, const ConvertPlan &plan, const std::string &partial,
+                  const std::string &final_path, const std::map<std::string, std::string> &meta,
+                  uint64_t planned_src, uint64_t planned_out, const std::vector<StrixwTensor> &outs,
+                  const char *rule_name, Log &log, int threads) {
     StrixwWriter writer(partial, meta, outs);
     log.blank();
-    log.rule("convert");
+    log.rule(rule_name);
     log("writing %s (%s, %zu tensors; header + index %s)", partial.c_str(),
         fmt_bytes((double)writer.file_bytes()).c_str(), outs.size(),
         fmt_bytes((double)writer.tensors().front().components.front().offset).c_str());
@@ -1298,7 +1182,215 @@ ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
     log("  verified %s in %s (%s/s)", fmt_bytes((double)planned_out).c_str(), fmt_dur(vt).c_str(),
         fmt_bytes((double)planned_out / std::max(1e-9, vt)).c_str());
     fs::rename(partial, final_path);
+}
+
+void write_mtp_strixw(const Source &src, const ConvertOptions &opt, Log &log, int threads, ConvertResult &res) {
+    const std::string final_path = opt.out_dir + "/mtp.strixw", partial = final_path + ".partial";
+    const ConvertPlan plan = make_mtp_plan(src, opt);
+    const std::string layout = layout_str(parse_layout(opt.layout));
+    std::string mtp_source;
+    if (!opt.mtp_from.empty()) {
+        mtp_source = opt.mtp_from;
+    }
+    std::map<std::string, std::string> meta = {
+        {"arch", "qwen4exp"},
+        {"kind", "mtp"},
+        {"layout", layout},
+        {"shared_expert", plan.shared_split ? "separate" : "stacked"},
+        {"source_dir", opt.src_dir},
+        {"source_fingerprint", src.fingerprint()},
+        {"converter_git", opt.git},
+        {"created", utc_now()},
+        {"mtp", "yes"},
+        {"mtp_source", mtp_source.empty() ? "checkpoint" : mtp_source},
+        {"complete", "yes"},
+        {"format_note", "MTP draft head: weights for MTP drafting; base model weights file does not contain them"}};
+
+    uint64_t planned_src = 0, planned_out = 0;
+    std::vector<StrixwTensor> outs;
+    for (const ConvertStep &s : plan.steps) {
+        StrixwTensor t = s.out;
+        t.components = strixw_components(t);
+        for (const std::string &n : s.sources)
+            if (!n.empty()) planned_src += src.info(n).byte_length;
+        planned_out += t.bytes();
+        outs.push_back(std::move(t));
+    }
+
+    log.blank();
+    log.rule("MTP draft head (mtp.strixw) \u00b7 " + fmt_bytes((double)planned_src) + " of source");
+    execute_plan(src, plan, partial, final_path, meta, planned_src, planned_out, outs, "convert mtp", log, threads);
+    res.mtp_path = final_path;
+    res.output_bytes += planned_out;
+    res.source_bytes += planned_src;
+    res.tensors += plan.steps.size();
+    log("  \u2713 %s: %zu tensors, %s, verified", final_path.c_str(), plan.steps.size(),
+        fmt_bytes((double)planned_out).c_str());
+}
+
+}  // namespace
+
+const char *convert_op_name(ConvertOp op) {
+    switch (op) {
+    case ConvertOp::Q4Merge: return "q4";
+    case ConvertOp::Q4FoldHC: return "q4-fold";
+    case ConvertOp::Q4ChunkMajor: return "q4-chunk";
+    case ConvertOp::BF16Rows: return "bf16";
+    case ConvertOp::F32Widen: return "f32";
+    case ConvertOp::I64Copy: return "i64";
+    }
+    return "?";
+}
+
+std::string checkpoint_fingerprint(const std::string &dir) { return Source(dir).fingerprint(); }
+
+ConvertResult convert_qwen4exp(const ConvertOptions &opt) {
+    const auto t0 = Clock::now();
+    STRIX_CHECK(!opt.src_dir.empty() && (!opt.out_dir.empty() || opt.plan_only), "convert: src_dir and out_dir needed");
+    const std::string layout = layout_str(parse_layout(opt.layout));  // validates before any work
+    STRIX_CHECK(!opt.git.empty(), "convert: the converter's git hash is required (recorded in the file)");
+    const int threads = opt.threads > 0 ? opt.threads : (int)std::max(1u, std::thread::hardware_concurrency());
+    Log log(opt.console, t0);
+    ConvertResult res;
+    if (opt.tower_only) {
+        STRIX_CHECK(opt.vision, "convert --tower-only: the tower file is exactly what --vision writes, "
+                    "set both (or run the full conversion with --vision)");
+        STRIX_CHECK(!opt.plan_only, "convert --tower-only --plan: --plan already logs the tower's tensors");
+        const std::string vpath = opt.out_dir + "/vision.strixw";
+        STRIX_CHECK(!fs::exists(vpath), "convert --tower-only: '", vpath, "' already exists - remove it "
+                    "first (the converter never overwrites a finished file)");
+        fs::create_directories(opt.out_dir);
+        Source tsrc(opt.src_dir);
+        log.rule("strix-infer converter \u00b7 tower only (vision.strixw)");
+        log("  %zu shards, %s of tensor data, fingerprint %s", tsrc.shards(),
+            fmt_bytes((double)tsrc.bytes()).c_str(), tsrc.fingerprint().c_str());
+        write_vision_strixw(tsrc, opt, log, threads, res);
+        res.seconds = log.elapsed();
+        return res;
+    }
+    if (opt.mtp_only) {
+        STRIX_CHECK(!opt.plan_only, "convert --mtp-only --plan: --plan already logs the MTP tensors");
+        const std::string mpath = opt.out_dir + "/mtp.strixw";
+        STRIX_CHECK(!fs::exists(mpath), "convert --mtp-only: '", mpath, "' already exists - remove it "
+                    "first (the converter never overwrites a finished file)");
+        fs::create_directories(opt.out_dir);
+        Source msrc(opt.src_dir);
+        if (!opt.mtp_from.empty()) {
+            const auto [fp, n] = msrc.override_mtp(opt.mtp_from);
+            log("  mtp.* override: %s (fingerprint %s, %zu tensors)", opt.mtp_from.c_str(), fp.c_str(), n);
+        }
+        log.rule("strix-infer converter \u00b7 MTP only (mtp.strixw)");
+        log("  %zu shards, %s of tensor data, fingerprint %s", msrc.shards(),
+            fmt_bytes((double)msrc.bytes()).c_str(), msrc.fingerprint().c_str());
+        write_mtp_strixw(msrc, opt, log, threads, res);
+        res.seconds = log.elapsed();
+        return res;
+    }
+    const std::string final_path = opt.out_dir + "/weights.strixw", partial = final_path + ".partial";
+    if (!opt.plan_only) {
+        STRIX_CHECK(!fs::exists(final_path), "convert: '", final_path,
+                    "' already exists - remove it first (the converter never overwrites a finished file)");
+        if (opt.vision)
+            STRIX_CHECK(!fs::exists(opt.out_dir + "/vision.strixw"), "convert: '", opt.out_dir,
+                        "/vision.strixw' already exists - remove it first (the converter never overwrites a finished file)");
+        if (opt.mtp_separate)
+            STRIX_CHECK(!fs::exists(opt.out_dir + "/mtp.strixw"), "convert: '", opt.out_dir,
+                        "/mtp.strixw' already exists - remove it first (the converter never overwrites a finished file)");
+        const bool fresh = !fs::exists(opt.out_dir);
+        fs::create_directories(opt.out_dir);
+        log.open_file(opt.out_dir + "/convert.log");
+        if (fresh) set_no_compression(opt.out_dir, log);
+    }
+    log.rule("strix-infer converter \u00b7 Qwen3.8-Flash-Next (qwen4exp) -> strixw v" + std::to_string(kStrixwVersion));
+    log("layout: %s", layout.c_str());
+    log("converter git %s, %d threads", opt.git.c_str(), threads);
+
+    log("reading the checkpoint's headers from %s ...", opt.src_dir.c_str());
+    Source src(opt.src_dir);
+    std::string mtp_source;
+    if (!opt.mtp_from.empty()) {
+        STRIX_CHECK(opt.mtp || opt.mtp_separate, "convert: --mtp-from with --no-mtp - nothing would use it");
+        const auto [fp, n] = src.override_mtp(opt.mtp_from);
+        mtp_source = opt.mtp_from + " (fingerprint " + fp + ", " + std::to_string(n) + " tensors)";
+        log("  mtp.* override: %s", mtp_source.c_str());
+    }
+    log("  %zu shards, %s of tensor data, fingerprint %s", src.shards(), fmt_bytes((double)src.bytes()).c_str(),
+        src.fingerprint().c_str());
+
+    const ConvertPlan plan = make_plan(src, opt);
+    uint64_t planned_src = 0, planned_out = 0, skipped_bytes = 0;
+    std::map<std::string, std::pair<int, uint64_t>> by_op;
+    std::vector<StrixwTensor> outs;
+    for (const ConvertStep &s : plan.steps) {
+        StrixwTensor t = s.out;
+        t.components = strixw_components(t);
+        for (const std::string &n : s.sources)
+            if (!n.empty()) planned_src += src.info(n).byte_length;
+        planned_out += t.bytes();
+        auto &e = by_op[convert_op_name(s.op)];
+        e.first += 1, e.second += t.bytes();
+        outs.push_back(std::move(t));
+    }
+    std::map<std::string, std::pair<int, uint64_t>> skip_why;
+    for (const auto &[n, why] : plan.skipped) {
+        auto &e = skip_why[why];
+        e.first += 1, e.second += src.info(n).byte_length;
+        skipped_bytes += src.info(n).byte_length;
+    }
+    log.blank();
+    log.rule("plan");
+    log("%zu output tensors from %s of source -> %s (%.1f%% of the source size)", plan.steps.size(),
+        fmt_bytes((double)planned_src).c_str(), fmt_bytes((double)planned_out).c_str(),
+        100.0 * (double)planned_out / (double)std::max<uint64_t>(1, planned_src));
+    for (const auto &[op, e] : by_op)
+        log("  %-9s %4d tensors  %12s", op.c_str(), e.first, fmt_bytes((double)e.second).c_str());
+    if (skipped_bytes) log("  skipped in total: %s (not in this file)", fmt_bytes((double)skipped_bytes).c_str());
+    for (const auto &[why, e] : skip_why)
+        log("  skipped %4d source tensors (%s): %s", e.first, fmt_bytes((double)e.second).c_str(), why.c_str());
+    if (!opt.layers.empty() || !opt.globals || (!opt.mtp && !opt.mtp_separate))
+        log("  PARTIAL conversion (%s%s%s) - the file is marked complete=no and the full-coverage check is off",
+            opt.layers.empty() ? "all layers" : "some layers", opt.globals ? "" : ", no globals",
+            (opt.mtp || opt.mtp_separate) ? "" : ", no MTP");
+    res.source_bytes = planned_src, res.output_bytes = planned_out, res.tensors = plan.steps.size();
+    if (opt.plan_only) {
+        for (const ConvertStep &s : plan.steps)
+            log("  %-9s %-62s %s", convert_op_name(s.op), s.out.name.c_str(), shape_str(s.out.shape).c_str());
+        if (opt.mtp_separate)
+            for (const ConvertStep &s : make_mtp_plan(src, opt).steps)
+                log("  %-9s %-62s %s", (std::string(convert_op_name(s.op)) + "-mtp").c_str(), s.out.name.c_str(),
+                    shape_str(s.out.shape).c_str());
+        if (opt.vision)
+            for (const StrixwTensor &t : plan_vision(src, opt.vision_dims))
+                log("  %-9s %-62s %s", "bf16-vis", t.name.c_str(), shape_str(t.shape).c_str());
+        log("plan only: nothing written");
+        res.seconds = log.elapsed();
+        return res;
+    }
+
+    std::string layer_list = "all";
+    if (!opt.layers.empty()) {
+        layer_list.clear();
+        for (int64_t l : opt.layers) layer_list += (layer_list.empty() ? "" : ",") + std::to_string(l);
+    }
+    const bool complete = opt.layers.empty() && opt.globals && (opt.mtp || opt.mtp_separate);
+    std::map<std::string, std::string> meta = {
+        {"arch", "qwen4exp"},
+        {"layout", layout},
+        {"shared_expert", plan.shared_split ? "separate" : "stacked"},
+        {"source_dir", opt.src_dir},
+        {"source_fingerprint", src.fingerprint()},
+        {"converter_git", opt.git},
+        {"created", utc_now()},
+        {"layers", layer_list},
+        {"globals", opt.globals ? "yes" : "no"},
+        {"mtp", opt.mtp_separate ? "separate" : (opt.mtp ? "yes" : "no")},
+        {"mtp_source", mtp_source.empty() ? "checkpoint" : mtp_source},
+        {"complete", complete ? "yes" : "no"},
+        {"format_note", "embedding BF16 (not layout A's int8); n-gram table not included (OPEN)"}};
+
+    execute_plan(src, plan, partial, final_path, meta, planned_src, planned_out, outs, "convert", log, threads);
     res.weights_path = final_path;
+    if (opt.mtp_separate) write_mtp_strixw(src, opt, log, threads, res);
     if (opt.vision) write_vision_strixw(src, opt, log, threads, res);
     res.seconds = log.elapsed();
     log("\u2714 done: %s -> %s, %zu tensors, %s in %s", fmt_bytes((double)planned_src).c_str(), final_path.c_str(),

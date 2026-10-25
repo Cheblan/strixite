@@ -2,8 +2,10 @@
 // Verbose by default: every step is logged to stderr and to <out>/convert.log.
 //
 // Usage: convert_qwen4exp --src DIR --out DIR --git HASH [--threads N] [--layout default=q4g64,...]
-//                         [--layers 0,3,7] [--no-globals] [--no-mtp] [--mtp-from FILE] [--vision]
-//                         [--tower-only] [--plan]
+//                         [--layers 0,3,7] [--no-globals] [--no-mtp] [--separate-mtp] [--mtp-only]
+//                         [--mtp-from FILE] [--vision] [--tower-only] [--plan]
+//   --separate-mtp also write <out>/mtp.strixw: the MTP draft head in its own file (omits mtp.* from weights.strixw)
+//   --mtp-only    (implies --separate-mtp) write <out>/mtp.strixw and nothing else; never touches weights.strixw
 //   --mtp-from    replace the checkpoint's mtp.* tensors with this safetensors file's (a fine-tuned draft head);
 //                 the trunk and its fingerprint stay the checkpoint's
 //   --vision      also write <out>/vision.strixw: the vision tower as exact BF16, validated against the
@@ -78,6 +80,8 @@ int run(int argc, char **argv) {
             for (std::string t; std::getline(ss, t, ',');) o.layers.push_back(parse_int(t, "--layers entry", 0, 1 << 20));
         } else if (a == "--no-globals") o.globals = false;
         else if (a == "--no-mtp") o.mtp = false;
+        else if (a == "--separate-mtp" || a == "--mtp-separate") o.mtp_separate = true;
+        else if (a == "--mtp-only") o.mtp_separate = true, o.mtp_only = true;
         else if (a == "--mtp-from") o.mtp_from = value("--mtp-from");
         else if (a == "--vision") o.vision = true;
         else if (a == "--tower-only") o.vision = true, o.tower_only = true;
@@ -85,8 +89,8 @@ int run(int argc, char **argv) {
         else {
             std::fprintf(stderr,
                          "usage: %s --src DIR --out DIR --git HASH [--threads N] [--layout default=q4g64,...] "
-                         "[--layers 0,3] [--no-globals] [--no-mtp] [--mtp-from FILE] [--vision] "
-                         "[--tower-only] [--plan]\n",
+                         "[--layers 0,3] [--no-globals] [--no-mtp] [--separate-mtp] [--mtp-only] "
+                         "[--mtp-from FILE] [--vision] [--tower-only] [--plan]\n",
                          argv[0]);
             return 2;
         }

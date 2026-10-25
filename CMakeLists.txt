@@ -264,6 +264,9 @@ add_executable(bench_prefill tools/bench_prefill.cpp)
 strix_hip_sources(bench_prefill tools/bench_prefill.cpp)
 target_link_libraries(bench_prefill PRIVATE strix_model)
 
+add_executable(test_separate_mtp tools/test_separate_mtp.cpp)
+target_link_libraries(test_separate_mtp PRIVATE strix_serve_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
