@@ -27,6 +27,7 @@ public:
     uint64_t kv_full_bytes() const { return session_.kv_full_bytes(); }
     void precommit() { session_.precommit(); }
     bool is_precommitted() const { return session_.is_precommitted(); }
+    int64_t precommitted_rows() const { return session_.precommitted_rows(); }
     void set_total_capacity(int64_t tc) { session_.set_total_capacity(tc); }
     int64_t total_capacity() const { return session_.total_capacity(); }
     void set_kv_budget(std::function<void(uint64_t)> f) { session_.set_kv_budget(std::move(f)); }
