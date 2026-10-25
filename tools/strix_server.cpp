@@ -199,8 +199,9 @@ int run(int argc, char **argv) {
     const std::string draft_head_mode = settings.text("mtp-draft-head");
     if (use_mtp && model.has_mtp()) {
         if (draft_head_mode == "q8" || draft_head_mode == "native") {
+            const int64_t head_rows = mtp_vocab == 0 ? model.dims().vocab : mtp_vocab;
             slog(LogLevel::Info, "startup: MTP draft head: native Q8 (first %lld LM head rows, lossless logits)",
-                 (long long)mtp_vocab);
+                 (long long)head_rows);
         } else {
             const auto t0 = std::chrono::steady_clock::now();
             const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
