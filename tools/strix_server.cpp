@@ -187,14 +187,19 @@ int run(int argc, char **argv) {
         slog(LogLevel::Info, "startup: MTP head: loaded from %s (ignored main weights MTP if present)",
              mtp_weights.c_str());
     }
-    // MTP drafts score a Q4 copy of the draft vocabulary's LM head rows (Qwen4ExpModel::make_draft_head_q4; strixite
-    // PR #2): half the bytes per draft call, the verify still decides every token.
+    // MTP draft head: Q4 G64 copy (strixite PR #2) or native lossless Q8 LM head (mtp-draft-head = q8/native).
+    const std::string draft_head_mode = settings.text("mtp-draft-head");
     if (use_mtp && model.has_mtp()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
-        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
-             (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (draft_head_mode == "q8" || draft_head_mode == "native") {
+            slog(LogLevel::Info, "startup: MTP draft head: native Q8 (first %lld LM head rows, lossless logits)",
+                 (long long)mtp_vocab);
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
+            slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+                 (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
     }
     std::unique_ptr<vision::ServedVision> served_vision;
     if (vision) {
