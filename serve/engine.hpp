@@ -202,6 +202,12 @@ public:
         return {forward_verify_rows(runs[0].ids, (int64_t)runs[0].ids.size(), cands, n_valid, runs[0].masks)};
     }
     virtual int64_t max_verify_rows() const { return 16; }  // rows (and logits rows) of one verify_batch forward
+    // Can seq's next verify share a verify_batch with another conversation's? More than one run means scalar
+    // positions only (Qwen4ExpSession::forward_batch's contract), so a conversation whose state carries mRoPE
+    // position state - one that has run an image, or resumed one that did - runs alone, and the arbiter packs
+    // accordingly instead of letting the batch throw and take every run in it down (issue #29). A backend
+    // without that state batches everything.
+    virtual bool batchable(int seq) const { return true; }
     // Resolve seq's run of the pending verify_batch: keep its first `rows` rows (all of them: the whole verify).
     // carry: the token seq's next forward starts with (an MTP rejection's corrected sample; -1: none) - a backend
     // may check it there.

@@ -78,6 +78,9 @@ private:
         LmBackend::VerifyRun run;
         bool cands = false;
         int64_t n_valid = 0;
+        // Asked of the backend as the run comes in (LmBackend::batchable): false when the slot's state carries
+        // mRoPE position state, which a multi-run forward refuses - this run then goes by itself.
+        bool batchable = true;
         double since = 0;
         bool done = false;
         LogitRows rows;

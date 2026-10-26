@@ -137,6 +137,15 @@ void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
         const Pending &p = pending_[s];
         const int64_t r = (int64_t)p.run.ids.size();
         if (!runs.empty() && (rows + r > budget || p.cands != cands || p.n_valid != n_valid)) continue;
+        // A run whose slot carries mRoPE position state is not batchable at all: with another run in the forward
+        // it throws (LmBackend::batchable, issue #29) and the throw takes every run of the batch down with it.
+        // So it goes by itself: as the batch when it is the oldest waiting run, otherwise this pack stops in
+        // front of it - the batch's runs go now, it goes alone right after, never behind newer arrivals.
+        if (!p.batchable) {
+            if (!runs.empty()) break;
+            runs.push_back(p.run), members.push_back(s), rows += r;
+            break;
+        }
         if (runs.empty()) cands = p.cands, n_valid = p.n_valid;
         runs.push_back(p.run), members.push_back(s), rows += r;
     }
@@ -181,7 +190,9 @@ LogitRows GpuArbiter::verify(int seq, const LmBackend::VerifyRun &run, bool cand
     STRIX_CHECK(run.seq == seq, "GpuArbiter: seq ", seq, " sends a run of seq ", run.seq);
     if (owner_ == seq) owner_ = -1;  // the chain is done
     Pending &me = pending_[seq];
-    me.run = run, me.cands = cands, me.n_valid = n_valid, me.since = now_s();
+    // Asked here, not while packing: the run's own thread still owns this slot's state (it has no run in a
+    // batch yet - checked above), so reading it costs no GPU token.
+    me.run = run, me.cands = cands, me.n_valid = n_valid, me.batchable = be_.batchable(seq), me.since = now_s();
     cv_.notify_all();
     for (;;) {
         if (me.done) break;
