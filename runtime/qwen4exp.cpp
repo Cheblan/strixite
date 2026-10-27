@@ -29,6 +29,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace strix {
 
@@ -633,6 +636,7 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamDestroy(stream_);
     }
     if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
+    if (mtp_pick_event_) (void)hipEventDestroy(mtp_pick_event_);
 }
 
 Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
@@ -2774,17 +2778,27 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
 
 Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step) {
     run_mtp(seq, token_id, step);
-    if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
+    constexpr size_t kMtpPickAlloc = sizeof(kernels::MtpPick) + 64 * sizeof(kernels::Part);
+    if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(kMtpPickAlloc, "MTP pick");
+    if (mtp_pick_event_ == nullptr)
+        STRIX_HIP_CHECK(hipEventCreateWithFlags(&mtp_pick_event_, hipEventDisableTiming),
+                        "Qwen4ExpSession: MTP pick event");
     auto *dev = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
+    void *ws = mtp_pick_.get() + sizeof(kernels::MtpPick);
     kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
-                      emb_err_.get(), dev, stream_);
+                      emb_err_.get(), dev, ws, stream_);
     // One copy into the pinned area (the logits' part - unused here) behind the forward, one synchronize.
     STRIX_CHECK(readback_.size() >= kReadbackLogitsAt + sizeof(kernels::MtpPick),
                 "Qwen4ExpSession::forward_mtp_top2: pinned area of ", readback_.size(), " bytes");
     auto *host = reinterpret_cast<kernels::MtpPick *>(static_cast<uint8_t *>(readback_.get()) + kReadbackLogitsAt);
     STRIX_HIP_CHECK(hipMemcpyAsync(host, dev, sizeof(kernels::MtpPick), hipMemcpyDeviceToHost, stream_),
                     "Qwen4ExpSession::forward_mtp_top2: the pick");
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::forward_mtp_top2: end of the draft");
+    STRIX_HIP_CHECK(hipEventRecord(mtp_pick_event_, stream_), "Qwen4ExpSession::forward_mtp_top2: event");
+    while (hipEventQuery(mtp_pick_event_) == hipErrorNotReady) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#endif
+    }
     const kernels::MtpPick p = *host;
     kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
     kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");

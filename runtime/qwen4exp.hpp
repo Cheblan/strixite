@@ -827,6 +827,7 @@ private:
     PinnedHostBuffer mask_host_;
     DeviceBuffer<uint32_t> mask_dev_;
     hipEvent_t mask_uploaded_ = nullptr;
+    hipEvent_t mtp_pick_event_ = nullptr;
     bool mask_upload_recorded_ = false;
     DeviceBuffer<uint8_t> cand_dev_, cand_ws_;
     size_t cand_ws_bytes_ = 0;
