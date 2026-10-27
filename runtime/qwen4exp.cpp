@@ -698,6 +698,22 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamDestroy(stream_);
     }
     if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
+    if (prof_events_.init && prof_events_.active) {
+        (void)hipEventDestroy(prof_events_.total_start);
+        (void)hipEventDestroy(prof_events_.total_stop);
+        (void)hipEventDestroy(prof_events_.embed_start);
+        (void)hipEventDestroy(prof_events_.embed_stop);
+        (void)hipEventDestroy(prof_events_.head_start);
+        (void)hipEventDestroy(prof_events_.head_stop);
+        (void)hipEventDestroy(prof_events_.draft_start);
+        (void)hipEventDestroy(prof_events_.draft_stop);
+        for (int i = 0; i < 48; ++i) {
+            if (prof_events_.attn_start[i]) (void)hipEventDestroy(prof_events_.attn_start[i]);
+            if (prof_events_.attn_stop[i]) (void)hipEventDestroy(prof_events_.attn_stop[i]);
+            if (prof_events_.moe_start[i]) (void)hipEventDestroy(prof_events_.moe_start[i]);
+            if (prof_events_.moe_stop[i]) (void)hipEventDestroy(prof_events_.moe_stop[i]);
+        }
+    }
 }
 
 Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
@@ -1579,6 +1595,27 @@ void Qwen4ExpSession::import_state(int seq, const uint8_t *in, size_t bytes, int
     sq.rewind_to.push_back(0);  // the KV cache below n was rewritten (or completed): no older snapshot matches it
 }
 
+void Qwen4ExpSession::init_prof_events() {
+    if (prof_events_.init) return;
+    prof_events_.init = true;
+    prof_events_.active = std::getenv("STRIX_PROFILE_GPU") != nullptr;
+    if (!prof_events_.active) return;
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.total_start), "init_prof_events total_start");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.total_stop), "init_prof_events total_stop");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.embed_start), "init_prof_events embed_start");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.embed_stop), "init_prof_events embed_stop");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.head_start), "init_prof_events head_start");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.head_stop), "init_prof_events head_stop");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.draft_start), "init_prof_events draft_start");
+    STRIX_HIP_CHECK(hipEventCreate(&prof_events_.draft_stop), "init_prof_events draft_stop");
+    for (int i = 0; i < 48; ++i) {
+        STRIX_HIP_CHECK(hipEventCreate(&prof_events_.attn_start[i]), "init_prof_events attn_start");
+        STRIX_HIP_CHECK(hipEventCreate(&prof_events_.attn_stop[i]), "init_prof_events attn_stop");
+        STRIX_HIP_CHECK(hipEventCreate(&prof_events_.moe_start[i]), "init_prof_events moe_start");
+        STRIX_HIP_CHECK(hipEventCreate(&prof_events_.moe_stop[i]), "init_prof_events moe_stop");
+    }
+}
+
 // The end of a forward: the error words and the logits come back in one go - async copies into pinned memory on
 // stream_ behind the forward, one synchronize, then the checks on the host copies. It used to be a synchronize and
 // five blocking hipMemcpy calls (~40 us each on gfx1151), per forward - and the MTP
@@ -1608,6 +1645,27 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
     if (n_floats) d2h(host + kReadbackLogitsAt, logits_.get(), n_floats * 4, "logits");
     if (n_cand_rows) d2h(host + kReadbackLogitsAt, cand_dev_.get(), cand_bytes + (size_t)n_cand_rows * 4, "candidates");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::read_back", what, ": end of the forward");
+    if (prof_events_.active) {
+        float ms_total = 0, ms_embed = 0, ms_head = 0, ms_moe = 0, ms_attn = 0;
+        hipEventElapsedTime(&ms_total, prof_events_.total_start, prof_events_.total_stop);
+        hipEventElapsedTime(&ms_embed, prof_events_.embed_start, prof_events_.embed_stop);
+        hipEventElapsedTime(&ms_head, prof_events_.head_start, prof_events_.head_stop);
+        for (int i = 0; i < 48; ++i) {
+            float ms = 0;
+            hipEventElapsedTime(&ms, prof_events_.attn_start[i], prof_events_.attn_stop[i]);
+            ms_attn += ms;
+            hipEventElapsedTime(&ms, prof_events_.moe_start[i], prof_events_.moe_stop[i]);
+            ms_moe += ms;
+        }
+        float ms_bubbles = ms_total - (ms_embed + ms_head + ms_moe + ms_attn);
+        std::fprintf(stderr,
+            "[GPU Profile] T=%-2ld %-8s | Total: %6.2f ms | MoE: %5.2f ms (%4.1f%%) | Attn: %5.2f ms (%4.1f%%) | Head: %4.2f ms (%4.1f%%) | Bubbles: %4.2f ms\n",
+            (long)last_prof_T_, last_prof_verify_ ? "verify" : "decode",
+            ms_total, ms_moe, ms_total > 0 ? 100.0f * ms_moe / ms_total : 0.0f,
+            ms_attn, ms_total > 0 ? 100.0f * ms_attn / ms_total : 0.0f,
+            ms_head, ms_total > 0 ? 100.0f * ms_head / ms_total : 0.0f,
+            ms_bubbles);
+    }
     const std::string tag = std::string("Qwen4ExpSession") + what;
     kernels::report_router_error(words, (tag + " router").c_str());
     kernels::report_expert_error(words + 3, (tag + " experts").c_str());
@@ -1907,6 +1965,10 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     // After broken_ = true: a mismatching span (rows != T) takes the session down cleanly instead of leaving
     // a half-consumed history.
     broken_ = true;
+    init_prof_events();
+    last_prof_T_ = T;
+    last_prof_verify_ = batch.size() == 1 && runs[0].sq->gdn_to_spare;
+    if (prof_events_.active) hipEventRecord(prof_events_.total_start, stream_);
     for (Run &r : runs) {
         Qwen4ExpSeqState &sq = *r.sq;
         if (!sq.pending3.empty()) {
@@ -2043,6 +2105,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
 
     // Embedding, written straight into all 4 streams (one launch over every run's rows). all_ids is pageable, not
     // pinned: a pinned buffer here would need an event gate before its next write (the gfx1151 pinned-reuse hazard).
+    if (prof_events_.active) hipEventRecord(prof_events_.embed_start, stream_);
     STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), all_ids.data(), (size_t)T * 4, hipMemcpyHostToDevice, stream_),
                     "uploading ", T, " token ids");
     kernels::reset_embedding_error(emb_err_.get(), stream_);
@@ -2055,6 +2118,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     // merged rows overwrite the image_token_id rows in every stream before layer 0 reads x_ (and before
     // the probe below - a probed embed_streams is after the scatter).
     if (image != nullptr) run_tower_and_scatter(ids, *image);
+    if (prof_events_.active) hipEventRecord(prof_events_.embed_stop, stream_);
     show("embed_streams", x_.get(), n4, pt);  // [T, H * d]: the embedding in each of the H streams
 
     for (int64_t i = 0; i < D.layers; ++i) {
@@ -2122,6 +2186,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         }
 
         if (i == D.ple_layer) inv_ready = false;  // the PLE changed X after the last injection
+        if (prof_events_.active && i < 48) hipEventRecord(prof_events_.attn_start[i], stream_);
         STRIX_TRACE_SET(stage, "L" + std::to_string(i) + (D.is_attention[(size_t)i] ? " attn" : " gdn"));
         hc_mix(l.hc_attn, true, inv_ready);
         show(L + "attn_in", u_.get(), D.d, pt);
@@ -2309,6 +2374,10 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         }
         show(L + "mixer", y_.get(), D.d, pt);
         inv_ready = inject_y();
+        if (prof_events_.active && i < 48) {
+            hipEventRecord(prof_events_.attn_stop[i], stream_);
+            hipEventRecord(prof_events_.moe_start[i], stream_);
+        }
 
         STRIX_TRACE_SET(stage, "L" + std::to_string(i) + " moe");
         hc_mix(l.hc_mlp, true, inv_ready);
@@ -2390,11 +2459,13 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             inv_ready = inject_y();
         }
         show(L + "out", x_.get(), n4, pt);
+        if (prof_events_.active && i < 48) hipEventRecord(prof_events_.moe_stop[i], stream_);
     }
     // Indexer tails: every attention layer wrote tail_out = the other buffer this call, per run.
     for (Run &r : runs) r.sq->tail_cur = 1 - r.sq->tail_cur;
 
     STRIX_TRACE_SET(stage, "head");
+    if (prof_events_.active) hipEventRecord(prof_events_.head_start, stream_);
     hc_mix(m_.final_mix(), false, inv_ready);
     show("final_mixed", u_.get(), D.d, pt);
     // The logits rows: each run's last nL rows. One run whose rows end the batch (today's serving, and every
@@ -2467,6 +2538,10 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                            hipMemcpyDeviceToDevice, stream_),
                             "MTP previous streams");
         }
+    }
+    if (prof_events_.active) {
+        hipEventRecord(prof_events_.head_stop, stream_);
+        hipEventRecord(prof_events_.total_stop, stream_);
     }
     std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.vocab), "");
     for (Run &r : runs) r.sq->pos += r.Tr, r.sq->verify_carry = 0;  // the run's rows consumed its carried token
@@ -2855,6 +2930,8 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
 }
 
 Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step) {
+    init_prof_events();
+    if (prof_events_.active) hipEventRecord(prof_events_.draft_start, stream_);
     run_mtp(seq, token_id, step);
     if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
     auto *dev = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
@@ -2867,6 +2944,13 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     STRIX_HIP_CHECK(hipMemcpyAsync(host, dev, sizeof(kernels::MtpPick), hipMemcpyDeviceToHost, stream_),
                     "Qwen4ExpSession::forward_mtp_top2: the pick");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::forward_mtp_top2: end of the draft");
+    if (prof_events_.active) {
+        hipEventRecord(prof_events_.draft_stop, stream_);
+        hipEventSynchronize(prof_events_.draft_stop);
+        float ms_draft = 0;
+        hipEventElapsedTime(&ms_draft, prof_events_.draft_start, prof_events_.draft_stop);
+        std::fprintf(stderr, "  [MTP Draft step %ld] %.2f ms\n", (long)step, ms_draft);
+    }
     const kernels::MtpPick p = *host;
     kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
     kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
