@@ -436,6 +436,8 @@ public:
     // The kernel-step precision choices for every forward from now on (default: all exact).
     void set_precision(const PrecisionOptions &p);
     const PrecisionOptions &precision() const { return precision_; }
+    void set_grouped_min_tokens(int64_t n) { grouped_min_tokens_ = n; }
+    int64_t grouped_min_tokens() const { return grouped_min_tokens_; }
     ~Qwen4ExpSession();
     Qwen4ExpSession(const Qwen4ExpSession &) = delete;
     Qwen4ExpSession &operator=(const Qwen4ExpSession &) = delete;
@@ -538,7 +540,8 @@ public:
     // - break-even ~38 tokens, so 48. Re-swept after the F16 prefill GEMMs (one forward from position 0, ms): T = 6 58.8 per-slot vs 57.0 grouped, 8 72.0 vs 65.9, 12 100.0 vs 84.8, 20 152.6
     // vs 118.4, 40 203.1 vs 109.8 - so 6. A 4-draft MTP verify (5 tokens) stays per-slot. Tool-call turns (12-32 new
     // tokens) were paying 40-70 ms each for the old threshold.
-    static constexpr int64_t kGroupedMinTokens = 6;
+    static constexpr int64_t kDefaultGroupedMinTokens = 6;
+    int64_t grouped_min_tokens_ = kDefaultGroupedMinTokens;
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
     // mixes on the matrix units (a 64-row tile). Swept on the served layout (prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
     // 24 131 vs 129, 32 136 vs 144, 48 145 vs 226 - break-even ~24-26, so 32. Re-swept with the experts grouped

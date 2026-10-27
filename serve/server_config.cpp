@@ -307,6 +307,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "attention K/V cache: q8 (8 bits, layout c: ~56% of bf16's memory and prompt-cache bytes) or bf16"},
         {"kv-precommit", K::OnOff, 0, 0, "off",
          "pre-commit and map the full capacity for every slot upfront at startup (eliminates mid-generation OOM and page-fault latency spikes)"},
+        {"moe-grouped-min-tokens", K::Int, 1, 64, "6",
+         "Minimum tokens in forward to run grouped MoE (below: per-slot gather)"},
         {"mtp", K::OnOff, 0, 0, "on", "MTP drafting"},
         // MTP defaults: chained drafts at margin 1.5 with a 65536-id draft vocabulary, 7 drafts (reasons in
         // deploy/strix-server.conf).

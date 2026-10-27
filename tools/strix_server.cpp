@@ -130,6 +130,7 @@ int run(int argc, char **argv) {
     precision.gdn = parse_gdn_precision(settings.text("gdn-precision"));  // an unknown value fails startup
     precision.attention = parse_attention_precision(settings.text("attention-precision"));
     const KvFormat kv_format = parse_kv_format(settings.text("kv-cache"));  // an unknown value fails startup
+    const int64_t moe_grouped_min_tokens = settings.integer("moe-grouped-min-tokens");
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
@@ -221,6 +222,8 @@ int run(int argc, char **argv) {
              (long long)cfg.vision_preprocess_limit);
     }
     Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
+    if (moe_grouped_min_tokens >= 1) backend.set_grouped_min_tokens(moe_grouped_min_tokens);
+    slog(LogLevel::Info, "startup: MoE grouped min tokens = %lld", (long long)moe_grouped_min_tokens);
     if (total_capacity > 0) backend.set_total_capacity(total_capacity);
     if (kv_precommit) {
         backend.precommit();
