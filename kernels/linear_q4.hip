@@ -185,6 +185,25 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
         const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
         const float mn = bf16_bits_to_f32(mrow[c * kChunk / G]);
+        if constexpr (HB == 0 && std::is_same_v<T, uint16_t>) {
+            uint32_t cp[kChunk / 2];
+#pragma unroll
+            for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+            const uint4 *xp = reinterpret_cast<const uint4 *>(xrow + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dot = dot2(xw[j], cp[4 * i + j], dot);
+                    xsum = dot2(xw[j], kOnePair, xsum);
+                }
+            }
+            acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+            continue;
+        }
         float xv[kChunk];
         load_x32(xrow, c * kChunk, xv);
         float dot = 0.f, xsum = 0.f;
@@ -292,8 +311,11 @@ __global__ void __launch_bounds__(kThreads)
     for (int64_t a = 0; a < A; ++a) ok = ok && ids[m * A + a] >= 0 && ids[m * A + a] < E;
     float acc = 0.f;
     if (ok && n < N) {
-        for (uint32_t c = (uint32_t)(ks * warpSize + lane); c < (uint32_t)A * kc; c += (uint32_t)(KS * warpSize)) {
-            const uint32_t a = c / kc, cc = c % kc;
+        uint32_t c = (uint32_t)(ks * warpSize + lane);
+        uint32_t a = c / kc, cc = c % kc;
+        const uint32_t step = (uint32_t)(KS * warpSize);
+        const uint32_t total_c = (uint32_t)A * kc;
+        while (c < total_c) {
             const int64_t row = (int64_t)ids[m * A + a] * N + n;
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
             uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
@@ -301,15 +323,41 @@ __global__ void __launch_bounds__(kThreads)
             const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
             const float mn = bf16_bits_to_f32(minv[row * (K / G) + (int64_t)cc * kChunk / G]);
-            float xv[kChunk];
-            load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
-            float dot = 0.f, xsum = 0.f;
+            if constexpr (HB == 0 && std::is_same_v<T, uint16_t>) {
+                uint32_t cp[kChunk / 2];
 #pragma unroll
-            for (int i = 0; i < kChunk; ++i) {
-                dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-                xsum += xv[i];
+                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+                const uint4 *hp = reinterpret_cast<const uint4 *>(h + (m * A + a) * K + (int64_t)cc * kChunk);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = hp[i];
+                    const uint32_t hw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dot = dot2(hw[j], cp[4 * i + j], dot);
+                        xsum = dot2(hw[j], kOnePair, xsum);
+                    }
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+            } else {
+                float xv[kChunk];
+                load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
+                    xsum += xv[i];
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
             }
-            acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+
+            c += step;
+            cc += step;
+            while (cc >= kc) {
+                cc -= kc;
+                ++a;
+            }
         }
     }
     acc = reduce_row(acc, part, wave, ks, KS);
