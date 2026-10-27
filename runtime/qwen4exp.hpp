@@ -924,6 +924,20 @@ private:
     void keep_verify_full(Qwen4ExpSeqState &sq);
     void keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows);
     void drop_verify_seq(Qwen4ExpSeqState &sq);
+
+    struct ProfEvents {
+        bool init = false;
+        bool active = false;
+        hipEvent_t total_start = nullptr, total_stop = nullptr;
+        hipEvent_t embed_start = nullptr, embed_stop = nullptr;
+        hipEvent_t head_start = nullptr, head_stop = nullptr;
+        hipEvent_t attn_start[48] = {}, attn_stop[48] = {};
+        hipEvent_t moe_start[48] = {}, moe_stop[48] = {};
+        hipEvent_t draft_start = nullptr, draft_stop = nullptr;
+    } prof_events_;
+    void init_prof_events();
+    int64_t last_prof_T_ = 0;
+    bool last_prof_verify_ = false;
 };
 
 }  // namespace strix
