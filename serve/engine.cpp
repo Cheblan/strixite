@@ -991,7 +991,7 @@ void Engine::run(Job &job, Slot &sl) {
                     if (t0.best_v - t0.second_v >= options_.mtp_margin && d0 != im_end_ && d0 != eot_ &&
                         !(d0 == call_begin_ && options_.think_close_on_call && parser.in_reasoning())) {
                         ids.push_back(d0);
-                        const int64_t rem = std::min<int64_t>(2, steps - 1);
+                        const int64_t rem = steps - 1;
                         if (rem > 0) {
                             const std::vector<Top2> chain = sl.be->forward_mtp_chain(d0, rem, /*start_step=*/1);
                             for (int64_t step = 0; step < (int64_t)chain.size(); ++step) {
