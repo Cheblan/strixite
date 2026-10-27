@@ -329,6 +329,9 @@ int run(int argc, char **argv) {
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
     eng_opts.mtp_draft = mtp_draft;
+    eng_opts.pld = settings.on("pld");
+    eng_opts.pld_n = settings.integer("pld-n");
+    eng_opts.pld_k = settings.integer("pld-k");
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;
     eng_opts.think_nudge_wording = nudge_wording;
@@ -339,6 +342,9 @@ int run(int argc, char **argv) {
     eng_opts.degraded = degraded;
     slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s, think close before a call %s",
          think_end_guard ? "on" : "off", literal_tags ? "on" : "off", think_close_on_call ? "on" : "off");
+    slog(LogLevel::Info, "startup: PLD (prompt-lookup drafting) %s%s",
+         eng_opts.pld ? "on" : "off",
+         eng_opts.pld ? (" (n=" + std::to_string(eng_opts.pld_n) + ", k=" + std::to_string(eng_opts.pld_k) + ")").c_str() : "");
     if (think_nudge)
         slog(LogLevel::Info, "startup: thinking nudge on: %.0f%% self-copy over %lld tokens past %lld, wording %s",
              100.0 * nudge_policy.rate, (long long)nudge_policy.window, (long long)nudge_policy.min_tokens,

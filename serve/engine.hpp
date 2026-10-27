@@ -356,6 +356,7 @@ struct GenerationResult {
     std::string error;          // finish_reason == error
     int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t pld_rounds = 0, pld_drafted_tokens = 0, pld_accepted_tokens = 0;
     // How this request verifies ran (its decode window in GpuArbiter): shared with another slot run, or ran
     // alone because the conversation carries mRoPE position state and cannot share a forward.
     int64_t verify_shared_runs = 0, verify_solo_mrope = 0;
@@ -403,6 +404,7 @@ struct EngineStats {
     int64_t requests_ok = 0, requests_error = 0, requests_cancelled = 0;
     int64_t prompt_tokens = 0, cached_tokens = 0, prefill_tokens = 0, generated_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t pld_rounds = 0, pld_drafted_tokens = 0, pld_accepted_tokens = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};
     int64_t think_nudges = 0;  // thinking nudges fed
     int64_t think_end_blocked = 0;  // GenerationResult::think_end_blocked, summed
@@ -439,6 +441,9 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        bool pld = false;         // prompt-lookup drafting (PLD) beside the MTP head
+        int64_t pld_n = 3;        // matching n-gram length (including the draft token that opens the chain)
+        int64_t pld_k = 3;        // max draft continuation tokens from context lookup
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
