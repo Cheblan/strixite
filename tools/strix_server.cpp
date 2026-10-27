@@ -102,6 +102,18 @@ int run(int argc, char **argv) {
     cfg.model_id = settings.text("model-id");
     const int64_t slot_capacity = settings.integer("slot-capacity");
     const int64_t total_capacity = settings.integer("total-capacity");
+    const int64_t total_slots = settings.integer("total-slots");
+    const bool kv_precommit = settings.on("kv-precommit");
+    if (total_capacity > 0) {
+        STRIX_CHECK(slot_capacity <= total_capacity,
+                    "startup: slot-capacity (", slot_capacity, ") cannot exceed total-capacity (", total_capacity, ")");
+        if (kv_precommit) {
+            STRIX_CHECK(total_slots * slot_capacity <= total_capacity,
+                        "startup: kv-precommit: total-slots (", total_slots, ") * slot-capacity (", slot_capacity,
+                        " = ", total_slots * slot_capacity, " tokens) exceeds total-capacity (", total_capacity,
+                        "); to use dynamic oversubscription across slots, set kv-precommit = off");
+        }
+    }
     const int64_t chunk = settings.integer("chunk");
     const int64_t chunk_shared = settings.integer("chunk-shared");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
@@ -207,18 +219,6 @@ int run(int argc, char **argv) {
              served_vision->cfg.mean[0], served_vision->cfg.mean[1], served_vision->cfg.mean[2],
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
-    }
-    const int64_t total_slots = settings.integer("total-slots");
-    const bool kv_precommit = settings.on("kv-precommit");
-    if (total_capacity > 0) {
-        STRIX_CHECK(slot_capacity <= total_capacity,
-                    "startup: slot-capacity (", slot_capacity, ") cannot exceed total-capacity (", total_capacity, ")");
-        if (kv_precommit) {
-            STRIX_CHECK(total_slots * slot_capacity <= total_capacity,
-                        "startup: kv-precommit: total-slots (", total_slots, ") * slot-capacity (", slot_capacity,
-                        " = ", total_slots * slot_capacity, " tokens) exceeds total-capacity (", total_capacity,
-                        "); to use dynamic oversubscription across slots, set kv-precommit = off");
-        }
     }
     Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
     if (total_capacity > 0) backend.set_total_capacity(total_capacity);
