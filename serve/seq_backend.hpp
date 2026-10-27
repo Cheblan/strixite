@@ -130,6 +130,7 @@ public:
     void set_lookahead(const std::vector<int32_t> &next_ids) override;
     bool has_mtp() const override { return be().has_mtp(); }
     Top2 forward_mtp_top2(int32_t token_id, int64_t step) override;
+    std::vector<Top2> forward_mtp_chain(int32_t first_id, int64_t steps) override;
     std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override;
     LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                            const LogitMasks *masks = nullptr) override;

@@ -28,8 +28,9 @@ struct MtpPick {
 static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");
 
 // logits [n] FP32 (1 <= n <= 2^31 - 1); the error words and slot are the forward's device ones (read, not reset);
-// out on the device. One block.
+// out on the device. One block. If next_id is non-null, out->best is also written to *next_id in device memory.
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
-              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
+              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream,
+              int32_t *next_id = nullptr);
 
 }  // namespace strix::kernels

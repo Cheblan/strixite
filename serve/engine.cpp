@@ -983,21 +983,35 @@ void Engine::run(Job &job, Slot &sl) {
                 // Each token's PLE rows start loading as soon as it is known, while the next draft runs - so the
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 sl.be->prefetch_ple(ids, 0);
-                StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
-                for (int64_t step = 0; step < steps; ++step) {
-                    const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
-                    STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
-                    const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
-                    // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
-                    if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
-                    // A draft the response format refuses would be rejected anyway: don't verify it.
-                    if (so) {
+                if (!so) {
+                    const std::vector<Top2> chain = sl.be->forward_mtp_chain(id, steps);
+                    for (int64_t step = 0; step < (int64_t)chain.size(); ++step) {
+                        const Top2 &t = chain[(size_t)step];
+                        STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
+                        const int32_t d = t.best;
+                        if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                        // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
+                        if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
+                        ids.push_back(d);
+                    }
+                    if (ids.size() > 1) {
+                        sl.be->prefetch_ple(ids, 1);
+                    }
+                } else {
+                    StructuredOutput::Cursor draft_at = so->cursor();
+                    for (int64_t step = 0; step < steps; ++step) {
+                        const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
+                        STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
+                        const int32_t d = t.best;
+                        if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                        // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
+                        if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
+                        // A draft the response format refuses would be rejected anyway: don't verify it.
                         if (!so->allows(draft_at, d)) break;
                         draft_at = so->after(draft_at, d);
+                        ids.push_back(d);
+                        if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                     }
-                    ids.push_back(d);
-                    if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {

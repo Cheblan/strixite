@@ -44,6 +44,13 @@ public:
         t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
         return t;
     }
+    std::vector<Top2> forward_mtp_chain(int32_t first_id, int64_t steps) override {
+        const std::vector<Qwen4ExpSession::MtpTop2> p = session_.forward_mtp_chain(first_id, steps);
+        std::vector<Top2> res;
+        res.reserve(p.size());
+        for (const auto &t : p) res.push_back({t.best, t.best_v, t.second_v, t.nan});
+        return res;
+    }
     std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override {
         return session_.forward_verify(ids, n_logits);
     }
@@ -81,6 +88,13 @@ public:
         Top2 t;
         t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
         return t;
+    }
+    std::vector<Top2> forward_mtp_chain(int seq, int32_t first_id, int64_t steps) override {
+        const std::vector<Qwen4ExpSession::MtpTop2> p = session_.forward_mtp_chain_seq(seq, first_id, steps);
+        std::vector<Top2> res;
+        res.reserve(p.size());
+        for (const auto &t : p) res.push_back({t.best, t.best_v, t.second_v, t.nan});
+        return res;
     }
     void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) override {
         session_.prefetch_ple(seq, ids, first);

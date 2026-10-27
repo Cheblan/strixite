@@ -677,6 +677,8 @@ public:
     };
     MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step = 0);
     MtpTop2 forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step = 0);  // the draft's pick on a slot
+    std::vector<MtpTop2> forward_mtp_chain(int32_t first_id, int64_t steps);
+    std::vector<MtpTop2> forward_mtp_chain_seq(int seq, int32_t first_id, int64_t steps);
     // The draft's vocabulary: forward_mtp scores only ids [0, n) (the LM head's first n rows - BPE ids run roughly
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.
     void set_mtp_vocab(int64_t n);

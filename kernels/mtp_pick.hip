@@ -36,7 +36,7 @@ __device__ inline Part shfl_xor(const Part &p, int off) {
 
 __global__ void __launch_bounds__(kThreads)
     mtp_pick_kernel(const float *x, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
-                    const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out) {
+                    const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, int32_t *next_id) {
     __shared__ Part wave_part[kThreads / kLanes];
     const int tid = threadIdx.x, lane = tid % kLanes, wave = tid / kLanes;
     // Each thread's indices ascend, so a strict > keeps the lower index of equal values (top2's order).
@@ -61,10 +61,12 @@ __global__ void __launch_bounds__(kThreads)
     p = lane < kThreads / kLanes ? wave_part[lane] : Part{-INFINITY, -INFINITY, INT_MAX, 0u};
     for (int off = kLanes / 2; off > 0; off >>= 1) p = merge(p, shfl_xor(p, off));
     if (lane == 0) {
-        out->best = p.i1 == INT_MAX ? 0 : p.i1;  // every logit NaN: top2 would answer 0 (and flag it)
+        const int32_t b = p.i1 == INT_MAX ? 0 : p.i1;  // every logit NaN: top2 would answer 0 (and flag it)
+        out->best = b;
         out->best_v = p.b1, out->second_v = p.b2, out->nan = p.nan;
         out->pad = 0;
         out->emb = *emb_err;
+        if (next_id != nullptr) *next_id = b;
     }
     if (lane < 3) {
         out->err[lane] = router_err[lane];
@@ -76,14 +78,15 @@ __global__ void __launch_bounds__(kThreads)
 }  // namespace
 
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
-              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream) {
+              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream,
+              int32_t *next_id) {
     STRIX_CHECK(logits != nullptr && router_err != nullptr && expert_err != nullptr && attn_err != nullptr &&
                     emb_err != nullptr && out != nullptr,
                 "mtp_pick: null pointer (logits=", (const void *)logits, ", router_err=", (const void *)router_err,
                 ", expert_err=", (const void *)expert_err, ", attn_err=", (const void *)attn_err,
                 ", emb_err=", (const void *)emb_err, ", out=", (const void *)out, ")");
     STRIX_CHECK(n >= 1 && n <= INT_MAX, "mtp_pick: n = ", n, " logits, expected 1..", INT_MAX);
-    mtp_pick_kernel<<<1, kThreads, 0, stream>>>(logits, n, router_err, expert_err, attn_err, emb_err, out);
+    mtp_pick_kernel<<<1, kThreads, 0, stream>>>(logits, n, router_err, expert_err, attn_err, emb_err, out, next_id);
     STRIX_HIP_CHECK_LAUNCH("mtp_pick n=", n);
 }
 

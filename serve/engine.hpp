@@ -105,6 +105,17 @@ public:
         STRIX_CHECK(!ml.empty(), "LmBackend::forward_mtp_top2: the backend's MTP draft (step ", step, ") returned no logits");
         return top2(ml.data(), (int64_t)ml.size());
     }
+    virtual std::vector<Top2> forward_mtp_chain(int32_t first_id, int64_t steps) {
+        std::vector<Top2> res;
+        res.reserve((size_t)steps);
+        int32_t cur = first_id;
+        for (int64_t s = 0; s < steps; ++s) {
+            Top2 t = forward_mtp_top2(cur, s);
+            res.push_back(t);
+            cur = t.best;
+        }
+        return res;
+    }
     // Verifying drafts: a forward whose state changes can be undone (drop) or kept - exactly one of the two before
     // anything else. The default saves / restores snapshot slot kDraftSlot; a backend may do it cheaper.
     virtual std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) {
@@ -180,6 +191,10 @@ public:
     virtual Top2 forward_mtp_top2(int seq, int32_t token_id, int64_t step) {
         check_seq(seq, "forward_mtp_top2");
         return forward_mtp_top2(token_id, step);
+    }
+    virtual std::vector<Top2> forward_mtp_chain(int seq, int32_t first_id, int64_t steps) {
+        check_seq(seq, "forward_mtp_chain");
+        return forward_mtp_chain(first_id, steps);
     }
     virtual void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) {
         check_seq(seq, "prefetch_ple");

@@ -301,6 +301,14 @@ Top2 SeqBackend::forward_mtp_top2(int32_t token_id, int64_t step) {
     return t;
 }
 
+std::vector<Top2> SeqBackend::forward_mtp_chain(int32_t first_id, int64_t steps) {
+    std::vector<Top2> res;
+    arb_.run(seq_, GpuArbiter::Kind::Draft, [&] {
+        res = arb_.backend().forward_mtp_chain(seq_, first_id, steps);
+    });
+    return res;
+}
+
 std::vector<float> SeqBackend::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) {
     return forward_verify_rows(ids, n_logits, false, 0).full;
 }

@@ -2772,6 +2772,54 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
     return forward_mtp_top2_seq(0, token_id, step);
 }
 
+std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain(int32_t first_id, int64_t steps) {
+    return forward_mtp_chain_seq(0, first_id, steps);
+}
+
+std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain_seq(int seq, int32_t first_id, int64_t steps) {
+    if (steps <= 0) return {};
+    if (steps == 1) return {forward_mtp_top2_seq(seq, first_id, 0)};
+
+    constexpr int64_t kMaxSteps = 16;
+    STRIX_CHECK(steps <= kMaxSteps, "forward_mtp_chain_seq: steps ", steps, " > ", kMaxSteps);
+
+    const size_t pick_bytes = sizeof(kernels::MtpPick) * (size_t)steps;
+    if (mtp_pick_.size() < pick_bytes) {
+        mtp_pick_ = DeviceBuffer<uint8_t>(pick_bytes, "MTP pick chain");
+    }
+    auto *dev_base = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
+
+    for (int64_t step = 0; step < steps; ++step) {
+        run_mtp(seq, step == 0 ? first_id : -1, step);
+        auto *dev = dev_base + step;
+        int32_t *next_id = (step + 1 < steps) ? ids_.get() : nullptr;
+        kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
+                          emb_err_.get(), dev, stream_, next_id);
+        mtp_done(seq, step);
+    }
+
+    STRIX_CHECK(readback_.size() >= kReadbackLogitsAt + pick_bytes,
+                "Qwen4ExpSession::forward_mtp_chain_seq: pinned area of ", readback_.size(), " bytes");
+    auto *host_base = reinterpret_cast<kernels::MtpPick *>(static_cast<uint8_t *>(readback_.get()) + kReadbackLogitsAt);
+    STRIX_HIP_CHECK(hipMemcpyAsync(host_base, dev_base, pick_bytes, hipMemcpyDeviceToHost, stream_),
+                    "Qwen4ExpSession::forward_mtp_chain_seq: the picks");
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::forward_mtp_chain_seq: end of the draft chain");
+
+    std::vector<MtpTop2> results;
+    results.reserve((size_t)steps);
+    for (int64_t step = 0; step < steps; ++step) {
+        const kernels::MtpPick &p = host_base[step];
+        kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
+        kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
+        kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
+        kernels::report_embedding_error(p.emb, m_.dims().vocab);
+        STRIX_CHECK(p.nan || (p.best >= 0 && p.best < mtp_vocab_), "Qwen4ExpSession::forward_mtp_chain_seq: pick ", p.best,
+                    " outside the draft vocabulary [0, ", mtp_vocab_, ")");
+        results.push_back({p.best, p.best_v, p.second_v, p.nan != 0});
+    }
+    return results;
+}
+
 Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step) {
     run_mtp(seq, token_id, step);
     if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
@@ -2811,7 +2859,7 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     STRIX_CHECK(!broken_, fn, ": an earlier call failed midway; reset() the session first");
     const Qwen4ExpDims &D = m_.dims();
-    STRIX_CHECK(token_id >= 0 && token_id < D.vocab, fn, ": token ", token_id, " outside [0, ", D.vocab, ")");
+    STRIX_CHECK(token_id >= -1 && token_id < D.vocab, fn, ": token ", token_id, " outside [-1, ", D.vocab, ")");
     STRIX_CHECK(step >= 0, fn, ": step ", step, ", expected >= 0");
     const int64_t pending = pending_verify_seq();
     STRIX_CHECK(pending < 0, fn, ": a forward_verify on seq ", pending,
@@ -2872,7 +2920,9 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
                     " / ", mtp_x_.size(), " bytes, expected equal (they're swapped)");
         std::swap(mtp_x_, sq.mtp_chain_prev);
     }
-    STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), &token_id, 4, hipMemcpyHostToDevice, stream_), "uploading the MTP token id");
+    if (token_id >= 0) {
+        STRIX_HIP_CHECK(hipMemcpyAsync(ids_.get(), &token_id, 4, hipMemcpyHostToDevice, stream_), "uploading the MTP token id");
+    }
     kernels::reset_embedding_error(emb_err_.get(), stream_);
     mtp_input(0, T, step == 0 ? sq.mtp_prev.get() : sq.mtp_chain_prev.get());
 
