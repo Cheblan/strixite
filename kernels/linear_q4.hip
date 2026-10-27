@@ -30,6 +30,13 @@ __device__ inline uint16_t f32_to_bf16_bits(float f) {
 __device__ inline void store(float *p, int64_t i, float v) { p[i] = v; }
 __device__ inline void store(uint16_t *p, int64_t i, float v) { p[i] = f32_to_bf16_bits(v); }
 
+typedef unsigned int v4u __attribute__((vector_size(16)));
+
+__device__ inline uint4 nt_load_uint4(const void *ptr) {
+    v4u v = __builtin_nontemporal_load(reinterpret_cast<const v4u *>(ptr));
+    return *reinterpret_cast<const uint4 *>(&v);
+}
+
 // 32 consecutive activations of row `row` starting at k, as FP32.
 __device__ inline void load_x32(const float *x, int64_t off, float (&v)[kChunk]) {
     const float4 *p = reinterpret_cast<const float4 *>(x + off);
@@ -180,7 +187,7 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
                                        int64_t chunks, int ks, int KS, int lane, int64_t K = 0) {
     float acc = 0.f;
     for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
-        uint4 packed = reinterpret_cast<const uint4 *>(qrow)[c];
+        uint4 packed = nt_load_uint4(reinterpret_cast<const uint4 *>(qrow) + c);
         uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
         const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
@@ -296,7 +303,7 @@ __global__ void __launch_bounds__(kThreads)
             const uint32_t a = c / kc, cc = c % kc;
             const int64_t row = (int64_t)ids[m * A + a] * N + n;
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
-            uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
+            uint4 packed = nt_load_uint4(reinterpret_cast<const uint4 *>(qrow) + cc);
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
