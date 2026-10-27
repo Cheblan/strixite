@@ -297,6 +297,164 @@ __global__ void __launch_bounds__(kThreads)
 // Combine: y[m, :] = sum_a coef[m, a] * h[m, a, :] * W[ids[m, a]]^T - one
 // output row is a single A*K-long reduction; lanes walk its chunks flattened
 // across experts, so short expert rows (K=640 is 20 chunks) still fill a wave.
+struct UniqueExpertRoute {
+    int32_t expert_id;
+    int32_t count;
+    int32_t slots[8];
+    int32_t tokens[8];
+};
+__device__ UniqueExpertRoute d_routes[128];
+__device__ int32_t d_num_unique;
+
+__global__ void __launch_bounds__(32)
+pack_unique_routes_kernel(const int32_t *ids, int64_t M, int64_t A, int64_t E, uint32_t *err) {
+    if (threadIdx.x != 0) return;
+    const int total_slots = (int)(M * A);
+    int num_unique = 0;
+    for (int slot = 0; slot < total_slots; ++slot) {
+        const int32_t eid = ids[slot];
+        if (eid < 0 || eid >= E) {
+            expert_id_ok(eid, E, err, slot);
+            continue;
+        }
+        const int32_t tok = slot / (int)A;
+        int found_idx = -1;
+        for (int u = 0; u < num_unique; ++u) {
+            if (d_routes[u].expert_id == eid) {
+                found_idx = u;
+                break;
+            }
+        }
+        if (found_idx >= 0) {
+            const int c = d_routes[found_idx].count;
+            if (c < 8) {
+                d_routes[found_idx].slots[c] = slot;
+                d_routes[found_idx].tokens[c] = tok;
+                d_routes[found_idx].count = c + 1;
+            }
+        } else {
+            d_routes[num_unique].expert_id = eid;
+            d_routes[num_unique].count = 1;
+            d_routes[num_unique].slots[0] = slot;
+            d_routes[num_unique].tokens[0] = tok;
+            num_unique++;
+        }
+    }
+    d_num_unique = num_unique;
+}
+
+// Weight-Reused Gather SwiGLU:
+// Evaluates all tokens in draft batch M <= 8 that share an expert using ONE weight load.
+template <typename T, int G, int HB>
+__global__ void __launch_bounds__(kThreads)
+linear_q4_experts_gather_swiglu_reused_kernel(const T *x, const uint8_t *q, const uint16_t *scale,
+                                              const uint16_t *minv, T *y, int64_t N, int64_t K) {
+    const int u_idx = blockIdx.y;
+    if (u_idx >= d_num_unique) return;
+
+    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
+    const int64_t I = N / 2, j = (int64_t)blockIdx.x * (blockDim.x / warpSize) + wave;
+    if (j >= I) return;
+
+    __shared__ UniqueExpertRoute s_route;
+    if (threadIdx.x == 0) s_route = d_routes[u_idx];
+    __syncthreads();
+
+    const int32_t id = s_route.expert_id;
+    const int count = s_route.count;
+    int tok[8], slot[8];
+    for (int k = 0; k < count; ++k) {
+        tok[k] = s_route.tokens[k];
+        slot[k] = s_route.slots[k];
+    }
+
+    const int64_t rg = (int64_t)id * N + j, ru = rg + I;
+    const uint8_t *qg = q + rg * qsplit_row_bytes<HB>(K);
+    const uint8_t *qu = q + ru * qsplit_row_bytes<HB>(K);
+    const uint16_t *sg = scale + rg * (K / G);
+    const uint16_t *su = scale + ru * (K / G);
+    const uint16_t *mg = minv + rg * (K / G);
+    const uint16_t *mu = minv + ru * (K / G);
+    const int64_t chunks = K / kChunk;
+
+    // Gate row
+    float acc_g[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) acc_g[k] = 0.f;
+
+    for (int64_t c = lane; c < chunks; c += warpSize) {
+        const uint4 packed = reinterpret_cast<const uint4 *>(qg)[c];
+        const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        const float s = bf16_bits_to_f32(sg[c * kChunk / G]);
+        const float mn = bf16_bits_to_f32(mg[c * kChunk / G]);
+        uint32_t cp[kChunk / 2];
+#pragma unroll
+        for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+
+        for (int k = 0; k < count; ++k) {
+            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (int64_t)tok[k] * K + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    dot = dot2(xw[p], cp[4 * i + p], dot);
+                    xsum = dot2(xw[p], kOnePair, xsum);
+                }
+            }
+            acc_g[k] = fmaf(s, dot, fmaf(mn, xsum, acc_g[k]));
+        }
+    }
+    for (int k = 0; k < count; ++k) {
+        for (int off = warpSize / 2; off > 0; off >>= 1) acc_g[k] += __shfl_xor(acc_g[k], off);
+    }
+
+    // Up row
+    float acc_u[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) acc_u[k] = 0.f;
+
+    for (int64_t c = lane; c < chunks; c += warpSize) {
+        const uint4 packed = reinterpret_cast<const uint4 *>(qu)[c];
+        const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        const float s = bf16_bits_to_f32(su[c * kChunk / G]);
+        const float mn = bf16_bits_to_f32(mu[c * kChunk / G]);
+        uint32_t cp[kChunk / 2];
+#pragma unroll
+        for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+
+        for (int k = 0; k < count; ++k) {
+            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (int64_t)tok[k] * K + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    dot = dot2(xw[p], cp[4 * i + p], dot);
+                    xsum = dot2(xw[p], kOnePair, xsum);
+                }
+            }
+            acc_u[k] = fmaf(s, dot, fmaf(mn, xsum, acc_u[k]));
+        }
+    }
+    for (int k = 0; k < count; ++k) {
+        for (int off = warpSize / 2; off > 0; off >>= 1) acc_u[k] += __shfl_xor(acc_u[k], off);
+    }
+
+    if (lane == 0) {
+        for (int k = 0; k < count; ++k) {
+            const float g = as_stored(acc_g[k], y);
+            const float u = as_stored(acc_u[k], y);
+            const float hv = as_stored(silu(g), y) * u;
+            store(y, (int64_t)slot[k] * I + j, hv);
+        }
+    }
+}
+
 template <typename T, int G, int HB>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_combine_kernel(const T *h, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
@@ -427,10 +585,21 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
     const unsigned bx = (unsigned)((out_rows + rows_per_block - 1) / rows_per_block);
     dim3 block(kThreads);
 #define STRIX_Q4_EXPERTS(G)                                                                                         \
-    if (swiglu)                                                                                                     \
-        linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
-            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                                \
-    else if (combine)                                                                                               \
+    if (swiglu) {                                                                                                   \
+        if constexpr (HB == 0 && std::is_same_v<T, uint16_t> && G == 128) {                                        \
+            if (M > 1 && M <= 8 && A <= 16 && KS == 1) {                                                           \
+                pack_unique_routes_kernel<<<1, 32, 0, stream>>>(ids, M, A, E, err);                                \
+                linear_q4_experts_gather_swiglu_reused_kernel<T, G, HB><<<dim3(bx, (unsigned)(M * A)), block, 0, stream>>>( \
+                    x, w.q, w.scale, w.minv, y, N, w.K);                                                            \
+            } else {                                                                                                \
+                linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
+                    x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                       \
+            }                                                                                                       \
+        } else {                                                                                                    \
+            linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
+                x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                           \
+        }                                                                                                           \
+    } else if (combine)                                                                                             \
         linear_q4_experts_combine_kernel<T, G, HB><<<dim3(bx, (unsigned)M), block, 0, stream>>>(                    \
             x, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err);                                          \
     else                                                                                                            \
