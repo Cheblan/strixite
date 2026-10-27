@@ -32,7 +32,7 @@ template <> __device__ inline float load<uint16_t>(const uint16_t *p, int64_t i)
 template <typename T, int NV>
 __global__ void __launch_bounds__(kLanes)
     moe_router_kernel(const T *logits, int64_t ld, int E, int k, const T *shared, int64_t shared_ld, int32_t shared_id,
-                      int32_t *ids, float *coef, int A, uint32_t *err) {
+                      int32_t *ids, float *coef, int A, uint32_t *err, float threshold, int min_k) {
     const int64_t m = blockIdx.x;
     const int lane = threadIdx.x;
     const T *row = logits + m * ld;
@@ -79,6 +79,7 @@ __global__ void __launch_bounds__(kLanes)
     lane_best(lv, li);
     float my_v = -INFINITY, top = 0.f;
     int my_i = -1;
+    int top_id = -1;
     for (int r = 0; r < k; ++r) {
         float bv = lv;
         int bi = li;
@@ -87,7 +88,10 @@ __global__ void __launch_bounds__(kLanes)
             const int oi = __shfl_xor(bi, off, kLanes);
             if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
         }
-        if (r == 0) top = bv;
+        if (r == 0) {
+            top = bv;
+            top_id = bi;
+        }
         if (lane == r) my_v = bv, my_i = bi;
         if (bi == li) {  // this lane's best was picked (indices are unique to a lane)
 #pragma unroll
@@ -101,9 +105,26 @@ __global__ void __launch_bounds__(kLanes)
     const float ex = lane < k ? expf(my_v - top) : 0.f;
     float sum = ex;
     for (int off = kLanes / 2; off > 0; off >>= 1) sum += __shfl_xor(sum, off, kLanes);
-    if (lane < k) {
-        id_row[lane] = my_i;
-        coef_row[lane] = ex / sum;
+    if (threshold <= 0.f) {
+        if (lane < k) {
+            id_row[lane] = my_i;
+            coef_row[lane] = ex / sum;
+        }
+    } else {
+        const float p = (lane < k && sum > 0.f) ? (ex / sum) : 0.f;
+        const bool keep = (lane < min_k) || (p >= threshold);
+        float p_kept = (lane < k && keep) ? p : 0.f;
+        float keep_sum = p_kept;
+        for (int off = kLanes / 2; off > 0; off >>= 1) keep_sum += __shfl_xor(keep_sum, off, kLanes);
+        if (lane < k) {
+            if (keep) {
+                id_row[lane] = my_i;
+                coef_row[lane] = keep_sum > 0.f ? (p / keep_sum) : p;
+            } else {
+                id_row[lane] = top_id;
+                coef_row[lane] = 0.0f;
+            }
+        }
     }
     if (shared != nullptr && lane == 0) {
         id_row[k] = shared_id;
@@ -183,7 +204,7 @@ __global__ void __launch_bounds__(kAddThreads)
 
 void moe_router(const void *logits, int64_t ld, int64_t M, int64_t E, int64_t k, const void *shared_logit,
                 int64_t shared_ld, int32_t shared_id, int32_t *ids, float *coef, Act act, uint32_t *err,
-                hipStream_t stream) {
+                hipStream_t stream, float threshold, int min_k) {
     STRIX_CHECK(logits != nullptr && ids != nullptr && coef != nullptr && err != nullptr,
                 "moe_router: null pointer (logits=", logits, ", ids=", (const void *)ids, ", coef=", (const void *)coef,
                 ", err=", (const void *)err, ")");
@@ -197,6 +218,8 @@ void moe_router(const void *logits, int64_t ld, int64_t M, int64_t E, int64_t k,
         STRIX_CHECK(shared_id >= 0, "moe_router: shared_id = ", shared_id, ", expected >= 0 (its expert row block)");
     }
     STRIX_CHECK((const void *)ids != (const void *)coef, "moe_router: ids and coef are the same buffer");
+    if (min_k < 1) min_k = 1;
+    if (min_k > k) min_k = (int)k;
     const int A = (int)k + (shared_logit != nullptr ? 1 : 0);
     dim3 grid((unsigned)M), block(kLanes);
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, "moe_router: unsupported activation dtype ", (int)act);
@@ -206,7 +229,7 @@ void moe_router(const void *logits, int64_t ld, int64_t M, int64_t E, int64_t k,
         using T = decltype(tag);
         moe_router_kernel<T, decltype(nvc)::value><<<grid, block, 0, stream>>>(
             static_cast<const T *>(logits), ld, (int)E, (int)k, static_cast<const T *>(shared_logit), shared_ld,
-            shared_id, ids, coef, A, err);
+            shared_id, ids, coef, A, err, threshold, min_k);
     };
     auto by_nv = [&](auto tag) {
         switch (nv) {

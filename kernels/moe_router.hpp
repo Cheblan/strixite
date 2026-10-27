@@ -35,9 +35,11 @@ namespace strix::kernels {
 // shared_logit: null for no shared slot (A = k); else token m's gate logit at
 // shared_logit[m * shared_ld], same dtype, and slot k gets id shared_id.
 // k in 1..min(E, 32); E in 1..1024.
+// threshold: dynamic MoE expert pruning; prune tail experts with p < threshold (aliased to expert 0 with coef 0).
+// min_k: minimum number of experts always kept per token (ranks < min_k are never pruned).
 void moe_router(const void *logits, int64_t ld, int64_t M, int64_t E, int64_t k, const void *shared_logit,
                 int64_t shared_ld, int32_t shared_id, int32_t *ids, float *coef, Act act, uint32_t *err,
-                hipStream_t stream);
+                hipStream_t stream, float threshold = 0.0f, int min_k = 4);
 void check_router_error(const uint32_t *err, const char *what);
 // The same check on the 3 words already on the host (read back with the forward's one sync).
 void report_router_error(const uint32_t e[3], const char *what);

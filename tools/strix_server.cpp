@@ -222,6 +222,13 @@ int run(int argc, char **argv) {
     }
     Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots);
     if (total_capacity > 0) backend.set_total_capacity(total_capacity);
+    const float moe_threshold = (float)settings.number("moe-threshold");
+    const int64_t moe_min_k = settings.integer("moe-min-k");
+    if (moe_threshold > 0.f) {
+        backend.set_moe_threshold(moe_threshold, moe_min_k);
+        slog(LogLevel::Info, "startup: MoE threshold pruning on (threshold: %.3f, min-k: %lld)",
+             moe_threshold, (long long)moe_min_k);
+    }
     if (kv_precommit) {
         backend.precommit();
         slog(LogLevel::Info, "startup: KV cache: statically pre-committed full capacity (%s tokens per slot, %lld slots, total %s tokens)",

@@ -665,6 +665,12 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, 12), "zero expert error");
     STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, 12), "zero router error");
     mtp_vocab_ = D.vocab;
+    if (const char *th = std::getenv("STRIX_MOE_THRESHOLD")) {
+        moe_threshold_ = std::strtof(th, nullptr);
+    }
+    if (const char *mk = std::getenv("STRIX_MOE_MIN_K")) {
+        moe_min_k_ = std::strtoll(mk, nullptr, 10);
+    }
     if (mtp_) {
         mtp_emb_ = act_buf(D.d, "MTP embedding");
         mtp_norm_emb_ = act_buf(D.d, "MTP normed embedding");
@@ -2394,7 +2400,8 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         show(L + "router_logits", router_logits_.get(), D.experts + 1, ProbeType::F32);
         kernels::moe_router(router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
                             sep ? nullptr : router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
-                            route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
+                            route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_,
+                            moe_threshold_, (int)moe_min_k_);
         show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
         show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
@@ -3098,7 +3105,8 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     kernels::linear_bf16w(u_.get(), l.router, router_logits_.get(), T, D.experts + 1, D.d, act, Act::F32, stream_);
     kernels::moe_router(router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
                         sep ? nullptr : router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
-                        route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
+                        route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_,
+                        moe_threshold_, (int)moe_min_k_);
     const int64_t Estack = D.experts + (sep ? 0 : 1);
     kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(), act,
                                              expert_err_.get(), stream_);

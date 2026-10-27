@@ -709,6 +709,14 @@ public:
     void set_mtp_vocab(int64_t n);
     int64_t mtp_vocab() const { return mtp_vocab_; }
 
+    // Dynamic MoE expert threshold pruning: prune tail experts with p < threshold; 0 = off.
+    void set_moe_threshold(float threshold, int64_t min_k = 4) {
+        moe_threshold_ = threshold;
+        moe_min_k_ = min_k;
+    }
+    float moe_threshold() const { return moe_threshold_; }
+    int64_t moe_min_k() const { return moe_min_k_; }
+
 private:
     const Qwen4ExpModel &m_;
     // One sequence state per serving slot (feat/multi-sequence): what the server runs
@@ -771,6 +779,8 @@ private:
     // step swaps mtp_x_ against the state's mtp_chain_prev_, so only one state may draft at a time).
     bool mtp_ = false;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
+    float moe_threshold_ = 0.0f;
+    int64_t moe_min_k_ = 4;
     DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_;
     DeviceBuffer<float> mtp_ones_;
     // Bumped by every mtp_input (the one writer of mtp_x_'s rows). A draft chain records it after each step

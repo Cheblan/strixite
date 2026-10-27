@@ -30,6 +30,11 @@ public:
     int64_t precommitted_rows() const { return session_.precommitted_rows(); }
     void set_total_capacity(int64_t tc) { session_.set_total_capacity(tc); }
     int64_t total_capacity() const { return session_.total_capacity(); }
+    void set_moe_threshold(float threshold, int64_t min_k = 4) {
+        session_.set_moe_threshold(threshold, min_k);
+    }
+    float moe_threshold() const { return session_.moe_threshold(); }
+    int64_t moe_min_k() const { return session_.moe_min_k(); }
     void set_slot_busy(int seq, bool busy) override { session_.set_slot_busy(seq, busy); }
     void set_on_slot_evicted(std::function<void(int seq)> f) override { session_.set_on_slot_evicted(std::move(f)); }
     void set_kv_budget(std::function<void(uint64_t)> f) { session_.set_kv_budget(std::move(f)); }
