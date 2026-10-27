@@ -654,7 +654,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         hc_ws_bytes_ = kernels::hc_wmma_workspace_bytes(M, D.H, D.r + D.H);
         hc_ws_ = DeviceBuffer<float>(hc_ws_bytes_ / 4, "hc mix partials");
     }
-    if (M >= kGroupedMinTokens) {
+    if (M >= 1) {
         const int64_t Estack = D.experts + (m_.shared_separate() ? 0 : 1);
         group_ws_bytes_ = kernels::moe_route_workspace_bytes(M, A, Estack);
         group_ws_ = DeviceBuffer<int32_t>(group_ws_bytes_ / 4, "expert grouping");
@@ -2407,12 +2407,12 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         };
         // Prefill (the grouped combine, then the injection's fused form): the shared expert's gated add rides in the
         // combine's reduce (kernels::MoeSharedAdd, bit-identical to moe_shared_add after it), so it runs first.
-        const bool fold_shared = sep && fuse_inv && T >= kGroupedMinTokens;
+        const bool fold_shared = sep && fuse_inv && T >= grouped_min_tokens_;
         if (fold_shared) shared_expert();
         const kernels::MoeSharedAdd shared_add{sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1,
                                                (uint32_t)D.experts, router_err_.get()};
         bool h_f16 = false;
-        if (T >= kGroupedMinTokens) {
+        if (T >= grouped_min_tokens_) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
             // until its kernel moves over.
             const kernels::MoeMath em = moe_math == kernels::MoeMath::WmmaBf16 && l.gate_up.bits == 4 &&

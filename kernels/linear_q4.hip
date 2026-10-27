@@ -185,15 +185,34 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
         const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
         const float mn = bf16_bits_to_f32(mrow[c * kChunk / G]);
-        float xv[kChunk];
-        load_x32(xrow, c * kChunk, xv);
-        float dot = 0.f, xsum = 0.f;
+        if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+            uint32_t cp[kChunk / 2];
 #pragma unroll
-        for (int i = 0; i < kChunk; ++i) {
-            dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-            xsum += xv[i];
+            for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+            const uint4 *xp = reinterpret_cast<const uint4 *>(xrow + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dot = dot2(xw[j], cp[4 * i + j], dot);
+                    xsum = dot2(xw[j], kOnePair, xsum);
+                }
+            }
+            acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+        } else {
+            float xv[kChunk];
+            load_x32(xrow, c * kChunk, xv);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i) {
+                dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
+                xsum += xv[i];
+            }
+            acc = fmaf(s, dot, fmaf(mn, xsum, acc));
         }
-        acc = fmaf(s, dot, fmaf(mn, xsum, acc));
     }
     return acc;
 }
@@ -301,15 +320,34 @@ __global__ void __launch_bounds__(kThreads)
             const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
             const float mn = bf16_bits_to_f32(minv[row * (K / G) + (int64_t)cc * kChunk / G]);
-            float xv[kChunk];
-            load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
-            float dot = 0.f, xsum = 0.f;
+            if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+                uint32_t cp[kChunk / 2];
 #pragma unroll
-            for (int i = 0; i < kChunk; ++i) {
-                dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
-                xsum += xv[i];
+                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+                const uint4 *xp = reinterpret_cast<const uint4 *>(h + (m * A + a) * K + (int64_t)cc * kChunk);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = xp[i];
+                    const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dot = dot2(xw[j], cp[4 * i + j], dot);
+                        xsum = dot2(xw[j], kOnePair, xsum);
+                    }
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+            } else {
+                float xv[kChunk];
+                load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
+                    xsum += xv[i];
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
             }
-            acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
         }
     }
     acc = reduce_row(acc, part, wave, ks, KS);
