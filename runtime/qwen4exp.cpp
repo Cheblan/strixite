@@ -2772,16 +2772,16 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
     return forward_mtp_top2_seq(0, token_id, step);
 }
 
-std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain(int32_t first_id, int64_t steps) {
-    return forward_mtp_chain_seq(0, first_id, steps);
+std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain(int32_t first_id, int64_t steps, int64_t start_step) {
+    return forward_mtp_chain_seq(0, first_id, steps, start_step);
 }
 
-std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain_seq(int seq, int32_t first_id, int64_t steps) {
+std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain_seq(int seq, int32_t first_id, int64_t steps, int64_t start_step) {
     if (steps <= 0) return {};
-    if (steps == 1) return {forward_mtp_top2_seq(seq, first_id, 0)};
+    if (steps == 1 && start_step == 0) return {forward_mtp_top2_seq(seq, first_id, 0)};
 
     constexpr int64_t kMaxSteps = 16;
-    STRIX_CHECK(steps <= kMaxSteps, "forward_mtp_chain_seq: steps ", steps, " > ", kMaxSteps);
+    STRIX_CHECK(start_step + steps <= kMaxSteps, "forward_mtp_chain_seq: steps ", start_step + steps, " > ", kMaxSteps);
 
     const size_t pick_bytes = sizeof(kernels::MtpPick) * (size_t)steps;
     if (mtp_pick_.size() < pick_bytes) {
@@ -2789,10 +2789,11 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain_seq(int
     }
     auto *dev_base = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
 
-    for (int64_t step = 0; step < steps; ++step) {
-        run_mtp(seq, step == 0 ? first_id : -1, step);
-        auto *dev = dev_base + step;
-        int32_t *next_id = (step + 1 < steps) ? ids_.get() : nullptr;
+    for (int64_t i = 0; i < steps; ++i) {
+        const int64_t step = start_step + i;
+        run_mtp(seq, i == 0 ? first_id : -1, step);
+        auto *dev = dev_base + i;
+        int32_t *next_id = (i + 1 < steps) ? ids_.get() : nullptr;
         kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
                           emb_err_.get(), dev, stream_, next_id);
         mtp_done(seq, step);
@@ -2807,8 +2808,8 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain_seq(int
 
     std::vector<MtpTop2> results;
     results.reserve((size_t)steps);
-    for (int64_t step = 0; step < steps; ++step) {
-        const kernels::MtpPick &p = host_base[step];
+    for (int64_t i = 0; i < steps; ++i) {
+        const kernels::MtpPick &p = host_base[i];
         kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
         kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
         kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
