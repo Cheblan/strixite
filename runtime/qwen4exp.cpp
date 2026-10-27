@@ -2807,7 +2807,7 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     STRIX_CHECK(p.nan || (p.best >= 0 && p.best < mtp_vocab_), "Qwen4ExpSession::forward_mtp_top2: pick ", p.best,
                 " outside the draft vocabulary [0, ", mtp_vocab_, ")");
     mtp_done(seq, step);
-    return {p.best, p.best_v, p.second_v, p.nan != 0};
+    return {p.best, p.best_v, p.second_v, p.nan != 0, p.prob};
 }
 
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {

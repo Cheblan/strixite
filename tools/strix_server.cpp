@@ -119,6 +119,7 @@ int run(int argc, char **argv) {
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
+    const float mtp_p = (float)settings.number("mtp-p");
     const int64_t ngram_cache_rows = settings.integer("ngram-cache-rows");
     const std::string capture_dir = settings.text("capture-dir");  // empty: no capture
     const bool think_nudge = settings.on("think-nudge");
@@ -307,6 +308,7 @@ int run(int argc, char **argv) {
     Engine::Options eng_opts;
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
+    eng_opts.mtp_p = mtp_p;
     eng_opts.mtp_draft = mtp_draft;
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;

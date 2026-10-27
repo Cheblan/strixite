@@ -674,6 +674,7 @@ public:
         int32_t best = 0;
         float best_v = 0, second_v = 0;
         bool nan = false;
+        float prob = 0.0f;
     };
     MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step = 0);
     MtpTop2 forward_mtp_top2_seq(int seq, int32_t token_id, int64_t step = 0);  // the draft's pick on a slot

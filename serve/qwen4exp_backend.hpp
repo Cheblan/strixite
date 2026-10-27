@@ -41,7 +41,7 @@ public:
     Top2 forward_mtp_top2(int32_t token_id, int64_t step) override {  // reduced on the GPU, one small copy back
         const Qwen4ExpSession::MtpTop2 p = session_.forward_mtp_top2(token_id, step);
         Top2 t;
-        t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
+        t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan, t.prob = p.prob;
         return t;
     }
     std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override {
@@ -79,7 +79,7 @@ public:
     Top2 forward_mtp_top2(int seq, int32_t token_id, int64_t step) override {
         const Qwen4ExpSession::MtpTop2 p = session_.forward_mtp_top2_seq(seq, token_id, step);
         Top2 t;
-        t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
+        t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan, t.prob = p.prob;
         return t;
     }
     void prefetch_ple(int seq, const std::vector<int32_t> &ids, int64_t first) override {

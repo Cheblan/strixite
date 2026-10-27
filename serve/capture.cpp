@@ -42,6 +42,7 @@ std::string write_capture(const std::string &dir, const CaptureRecord &rec, int6
     h.set("finish", json::Value::string(rec.finish));
     h.set("mtp_draft", json::Value::integer(rec.mtp_draft));
     h.set("mtp_margin", json::Value::number(rec.mtp_margin));
+    h.set("mtp_p", json::Value::number(rec.mtp_p));
     const std::string tmp = path + ".partial";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -80,7 +81,8 @@ CaptureRecord read_capture(const std::string &path) {
     r.user_turn = h.find("user_turn")->as_bool("user_turn");
     r.finish = h.find("finish")->as_string("finish");
     r.mtp_draft = h.find("mtp_draft")->as_int("mtp_draft");
-    r.mtp_margin = h.find("mtp_margin")->as_double("mtp_margin");
+    r.mtp_margin = h.find("mtp_margin") ? h.find("mtp_margin")->as_double("mtp_margin") : 0.0;
+    r.mtp_p = h.find("mtp_p") ? h.find("mtp_p")->as_double("mtp_p") : 0.0;
     r.tokens.resize((size_t)tn);
     f.read(reinterpret_cast<char *>(r.tokens.data()), (std::streamsize)(tn * 4));
     r.steps.resize((size_t)sn);

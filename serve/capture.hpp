@@ -38,6 +38,7 @@ struct CaptureRecord {
     std::string finish;
     int64_t mtp_draft = 0;
     double mtp_margin = 0;
+    double mtp_p = 0;
 };
 
 // Checks the record (sizes, step sums) and writes it into dir (which must exist) as ".partial", then renames; returns

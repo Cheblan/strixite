@@ -15,9 +15,10 @@
 
 namespace strix::kernels {
 
-// A partial top-2: the best value and its index (INT_MAX = nothing seen yet), the runner-up value, NaN seen.
+// A partial top-2: the best value and its index (INT_MAX = nothing seen yet), the runner-up value, online sum of exp(x - b1), NaN seen.
 struct Part {
     float b1, b2;
+    float sum_exp;
     int i1;
     uint32_t nan;
 };
@@ -29,7 +30,7 @@ struct MtpPick {
     float best_v, second_v;
     uint32_t nan;  // 1 if any logit was NaN (best / values are then meaningless)
     uint32_t err[9];
-    uint32_t pad;
+    float prob;
     EmbeddingError emb;
 };
 static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");

@@ -19,12 +19,13 @@ struct SamplingParams {
     uint64_t seed = 0;
 };
 
-// The largest logit (lowest id on a tie) and the runner-up's value (-inf if n == 1; equal to the best on a tie) over
-// x[0, n), and whether any of it is NaN. Skips 64-logit blocks with nothing above the runner-up, branch-free.
+// The largest logit (lowest id on a tie), runner-up's value (-inf if n == 1; equal to the best on a tie) over
+// x[0, n), softmax probability of the top-1 token, and whether any of it is NaN.
 struct Top2 {
     int32_t best = 0;
     float best_v = 0, second_v = 0;
     bool nan = false;
+    float prob = 0.0f;
 };
 Top2 top2(const float *x, int64_t n);
 

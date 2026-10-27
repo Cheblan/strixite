@@ -68,6 +68,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
                 " tokens, expected </think> first and only once, and room for it + <tool_call> in a backend chunk of ",
                 backend.max_chunk());
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
+    STRIX_CHECK(options_.mtp_p >= 0.0f && options_.mtp_p <= 1.0f, "Engine: mtp_p ", options_.mtp_p, ", expected in [0, 1]");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
@@ -90,10 +91,10 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     for (auto &sl : slots_) sl->thread = std::thread([this, s = sl.get()] { worker(*s); });
 }
 
-Engine::Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache, float mtp_margin)
+Engine::Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache, float mtp_margin, float mtp_p)
     : Engine(backend, tok, [&] {
           Options o;
-          o.cache = cache, o.mtp_margin = mtp_margin;
+          o.cache = cache, o.mtp_margin = mtp_margin, o.mtp_p = mtp_p;
           return o;
       }()) {}
 
@@ -421,7 +422,7 @@ void Engine::capture(Slot &sl, const GenerationRequest &req, const std::vector<C
         rec.id = req.id, rec.prompt_n = P, rec.tokens = sl.seq, rec.steps = steps;
         rec.tools = req.parser.tools && req.parser.tools->is_array() ? (int64_t)req.parser.tools->as_array("tools").size() : 0;
         rec.one_shot = req.one_shot, rec.user_turn = req.user_turn, rec.finish = reason;
-        rec.mtp_draft = options_.mtp_draft, rec.mtp_margin = options_.mtp_margin;
+        rec.mtp_draft = options_.mtp_draft, rec.mtp_margin = options_.mtp_margin, rec.mtp_p = options_.mtp_p;
         const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch()).count();
         write_capture(options_.capture_dir, rec, ms);
@@ -988,7 +989,9 @@ void Engine::run(Job &job, Slot &sl) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    if (t.best_v - t.second_v < options_.mtp_margin ||
+                        (options_.mtp_p > 0.0f && t.prob < options_.mtp_p) ||
+                        d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.

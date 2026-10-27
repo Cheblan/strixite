@@ -97,6 +97,16 @@ Top2 top2(const float *x, int64_t n) {
             for (int64_t j = 0; j < kBlock; ++j) consider(i + j);
     }
     for (; i < n; ++i) consider(i);
+    if (t.nan) {
+        t.prob = 0.0f;
+    } else {
+        double s = 0.0;
+        for (int64_t j = 0; j < n; ++j) {
+            const float diff = x[j] - t.best_v;
+            if (diff > -20.0f) s += std::exp((double)diff);
+        }
+        t.prob = s > 0.0 ? (float)(1.0 / s) : 0.0f;
+    }
     return t;
 }
 

@@ -424,6 +424,7 @@ public:
     struct Options {
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
+        float mtp_p = 0.0f;       // softmax probability threshold required to draft MTP token (0.0 = disabled)
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
@@ -460,7 +461,8 @@ public:
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
-    Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache = nullptr, float mtp_margin = 1.5f);
+    Engine(LmBackend &backend, const Tokenizer &tok, PromptCache *cache = nullptr, float mtp_margin = 1.5f,
+           float mtp_p = 0.0f);
     ~Engine();  // finishes the running request, fails the queued ones, joins the worker
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
@@ -477,6 +479,7 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    float mtp_p() const { return options_.mtp_p; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
