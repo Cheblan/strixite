@@ -288,17 +288,6 @@ struct WmmaWCodes {
                                        wmma_bf16_bits_to_f16x2(mw[r * kWin + slot]), lds, r, kin);
         }
     }
-        static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
-#pragma unroll
-        for (int i = 0; i < kLoads; ++i) {
-            const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
-            const int kin = (l % kLoadsPerRow) * kCodesPerLoad;
-            // a 16-byte load's codes lie in one group (32 codes at Q4, 16 at Q8; G >= 32)
-            const int slot = (int)(((k0 + kin) / G) % kWin);
-            wmma_stage_codes_f16<BITS>(q[i], wmma_bf16_bits_to_f16x2(sw[r * kWin + slot]),
-                                       wmma_bf16_bits_to_f16x2(mw[r * kWin + slot]), lds + r * kWmmaLd + kin);
-        }
-    }
 };
 
 // Q6 / Q5 (formats/q6.hpp, q5.hpp: per row a low plane [K/2] - Q4's nibbles - then a high plane [K * HB / 8], HB = 2
