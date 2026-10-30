@@ -112,7 +112,31 @@ __device__ inline uint32_t wmma_pack_codes(uint32_t a, uint32_t b) {
     return (__float_as_uint((float)a) >> 16) | (__float_as_uint((float)b) & 0xffff0000u);
 }
 
-// One 16-byte load of codes (BITS 4: 32 codes, 8: 16) into LDS at dst (16-byte aligned) as BF16 bits, in K order.
+// One 16-byte load of codes (BITS 4: 32 codes, 8: 16) into LDS at dst (16-byte aligned) as BF16 bits, in K order (unswizzled).
+template <int BITS>
+__device__ inline void wmma_stage_codes(const uint4 &q, uint16_t *dst) {
+    constexpr int kCodes = BITS == 4 ? 32 : 16;
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+    uint32_t d[kCodes / 2];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        if constexpr (BITS == 4) {  // codes 8w + 2p, 8w + 2p + 1 = byte p's low, high nibble
+            const uint32_t lo = words[w] & 0x0f0f0f0fu, hi = (words[w] >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) d[4 * w + p] = wmma_pack_codes((lo >> (8 * p)) & 0xffu, (hi >> (8 * p)) & 0xffu);
+        } else {
+            d[2 * w] = wmma_pack_codes(words[w] & 0xffu, (words[w] >> 8) & 0xffu);
+            d[2 * w + 1] = wmma_pack_codes((words[w] >> 16) & 0xffu, words[w] >> 24);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kCodes / 8; ++j) {
+        *reinterpret_cast<uint4 *>(dst + 8 * j) =
+            make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    }
+}
+
+// One 16-byte load of codes into XOR-swizzled LDS at lds with row r and column offset kin.
 template <int BITS>
 __device__ inline void wmma_stage_codes(const uint4 &q, uint16_t *lds, int r, int kin) {
     constexpr int kCodes = BITS == 4 ? 32 : 16;
@@ -170,7 +194,26 @@ __device__ inline void wmma_q8_word_to_f16(uint32_t w, wmma_f16x2 s, wmma_f16x2 
 }
 
 // One 16-byte load of codes (BITS 4: 32 codes, 8: 16 - all in one group, scale sc / min mn as F16 pairs) dequantized
-// to F16 and written to LDS in K order.
+// to F16 and written to LDS in K order (unswizzled).
+template <int BITS>
+__device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *dst) {
+    static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
+    constexpr int kCodes = BITS == 4 ? 32 : 16;
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+    uint32_t d[kCodes / 2];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        if constexpr (BITS == 4) wmma_q4_word_to_f16(words[w], sc, mn, d + 4 * w);
+        else wmma_q8_word_to_f16(words[w], sc, mn, d + 2 * w);
+    }
+#pragma unroll
+    for (int j = 0; j < kCodes / 8; ++j) {
+        *reinterpret_cast<uint4 *>(dst + 8 * j) =
+            make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    }
+}
+
+// One 16-byte load of codes into XOR-swizzled LDS at lds with row r and column offset kin.
 template <int BITS>
 __device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *lds, int r, int kin) {
     static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");

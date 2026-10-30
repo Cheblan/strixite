@@ -545,9 +545,11 @@ __global__ void __launch_bounds__(kWmmaThreads)
     static_assert(!XH || ((COMBINE || SWI) && sizeof(T) == 2), "XH: the down's x / the SwiGLU gather's h, BF16 path");
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 16-byte code load lies in one group");
     using WT = WmmaWCodes<4, G, kWmmaBN>;
-    constexpr int TR = RX, kHalf = kWmmaBN / 2, kTileElems = (TR + kWmmaBN) * kWmmaLd;
-    static_assert(!SWI || TR * (kHalf + 1) * 4 <= kTileElems * 2, "SWI: the up accumulators fit in the tiles' LDS");
+    constexpr int TR = RX, kHalf = kWmmaBN / 2;
     constexpr int kOutLd = kWmmaBN + 8;  // COMBINE: the BF16 output tile's LDS row stride (16-byte aligned rows)
+    constexpr int kEpilogueElems = (TR * (kHalf + 1) * 2 > TR * kOutLd) ? TR * (kHalf + 1) * 2 : TR * kOutLd;
+    constexpr int kTileElems = ((TR + kWmmaBN) * kWmmaLd > kEpilogueElems) ? (TR + kWmmaBN) * kWmmaLd : kEpilogueElems;
+    static_assert(!SWI || TR * (kHalf + 1) * 4 <= kTileElems * 2, "SWI: the up accumulators fit in the tiles' LDS");
     static_assert(TR * kOutLd <= kTileElems && kOutLd * 2 % 16 == 0, "COMBINE: the output tile fits in the tiles' LDS");
     __shared__ __attribute__((aligned(16))) uint16_t tiles_lds[kTileElems];
     uint16_t *xs = tiles_lds, *wsm = tiles_lds + TR * kWmmaLd;
