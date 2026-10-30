@@ -68,6 +68,19 @@ __device__ inline uint32_t code_pair(const uint32_t (&words)[4], int p) {
     const float lo = (float)(b & 0xFu), hi = (float)(b >> 4);
     return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
 }
+
+// Unpack all 8 nibbles of a 32-bit word into 4 packed BF16 pairs (2 nibbles per pair, low nibble first)
+__device__ inline void unpack_word_to_4_pairs(uint32_t w, uint32_t *out) {
+    const uint32_t b0 = w & 0xFFu;
+    const uint32_t b1 = (w >> 8) & 0xFFu;
+    const uint32_t b2 = (w >> 16) & 0xFFu;
+    const uint32_t b3 = w >> 24;
+
+    out[0] = (__float_as_uint((float)(b0 & 0xFu)) >> 16) | (__float_as_uint((float)(b0 >> 4)) & 0xffff0000u);
+    out[1] = (__float_as_uint((float)(b1 & 0xFu)) >> 16) | (__float_as_uint((float)(b1 >> 4)) & 0xffff0000u);
+    out[2] = (__float_as_uint((float)(b2 & 0xFu)) >> 16) | (__float_as_uint((float)(b2 >> 4)) & 0xffff0000u);
+    out[3] = (__float_as_uint((float)(b3 & 0xFu)) >> 16) | (__float_as_uint((float)(b3 >> 4)) & 0xffff0000u);
+}
 constexpr uint32_t kOnePair = 0x3F803F80u;  // BF16 (1, 1)
 
 // One output row per KS waves of a block: wave w handles row w / KS and the
@@ -182,9 +195,28 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
     for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
         uint4 packed = reinterpret_cast<const uint4 *>(qrow)[c];
         uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-        const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
         const float mn = bf16_bits_to_f32(mrow[c * kChunk / G]);
+        if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+            uint32_t cp[kChunk / 2];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
+            const uint4 *xp = reinterpret_cast<const uint4 *>(xrow + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dot = dot2(xw[j], cp[4 * i + j], dot);
+                    xsum = dot2(xw[j], kOnePair, xsum);
+                }
+            }
+            acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+            continue;
+        }
+        const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         float xv[kChunk];
         load_x32(xrow, c * kChunk, xv);
         float dot = 0.f, xsum = 0.f;
@@ -298,9 +330,28 @@ __global__ void __launch_bounds__(kThreads)
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
             uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-            const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
             const float mn = bf16_bits_to_f32(minv[row * (K / G) + (int64_t)cc * kChunk / G]);
+            if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+                uint32_t cp[kChunk / 2];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
+                const uint4 *xp = reinterpret_cast<const uint4 *>(h + (m * A + a) * K + (int64_t)cc * kChunk);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = xp[i];
+                    const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dot = dot2(xw[j], cp[4 * i + j], dot);
+                        xsum = dot2(xw[j], kOnePair, xsum);
+                    }
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+                continue;
+            }
+            const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             float xv[kChunk];
             load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
             float dot = 0.f, xsum = 0.f;
