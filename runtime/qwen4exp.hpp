@@ -516,9 +516,8 @@ public:
     // [n_logits, vocab] FP32. If it throws, the session refuses further calls until reset().
     static constexpr int64_t kMaxLogits = 16;
     // Forwards of at least this many tokens run the MoE experts grouped by expert (each expert's weights read
-    // once per tile, kernels/moe_grouped); with XOR-swizzled zero-pad LDS (98 VGPR, 2 waves/SIMD), grouped WMMA
-    // beats per-slot vector loops starting from 2-token MTP verify.
-    static constexpr int64_t kGroupedMinTokens = 2;
+    // once per tile, kernels/moe_grouped); shorter ones (decode, MTP verify) the per-slot kernels.
+    static constexpr int64_t kGroupedMinTokens = 6;
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
     // mixes on the matrix units (a 64-row tile). Swept on the served layout (prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
     // 24 131 vs 129, 32 136 vs 144, 48 145 vs 226 - break-even ~24-26, so 32. Re-swept with the experts grouped
