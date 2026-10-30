@@ -115,7 +115,7 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
             if constexpr (std::is_same_v<TX, uint16_t>) {
                 uint32_t cp[kChunk / 2];
 #pragma unroll
-                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+                for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     if (r < rows) {
@@ -292,10 +292,78 @@ __global__ void __launch_bounds__(kThreads)
     if (ok && j < I) {  // no early return: every wave reaches reduce_row's barrier
         const T *xr = x + (int64_t)blockIdx.z * K;
         const int64_t rg = (int64_t)id * N + j, ru = rg + I;
-        vg = q4_row_partial<T, G, HB>(q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
-        vu = q4_row_partial<T, G, HB>(q + ru * qsplit_row_bytes<HB>(K), scale + ru * (K / G), minv + ru * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
+        const uint8_t *q_g = q + rg * qsplit_row_bytes<HB>(K);
+        const uint8_t *q_u = q + ru * qsplit_row_bytes<HB>(K);
+        const uint16_t *s_g_ptr = scale + rg * (K / G);
+        const uint16_t *s_u_ptr = scale + ru * (K / G);
+        const uint16_t *m_g_ptr = minv + rg * (K / G);
+        const uint16_t *m_u_ptr = minv + ru * (K / G);
+        const int64_t chunks = K / kChunk;
+
+        if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+            for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+                uint4 packed_g = reinterpret_cast<const uint4 *>(q_g)[c];
+                uint4 packed_u = reinterpret_cast<const uint4 *>(q_u)[c];
+                const float s_g = bf16_bits_to_f32(s_g_ptr[c * kChunk / G]);
+                const float s_u = bf16_bits_to_f32(s_u_ptr[c * kChunk / G]);
+                const float mn_g = bf16_bits_to_f32(m_g_ptr[c * kChunk / G]);
+                const float mn_u = bf16_bits_to_f32(m_u_ptr[c * kChunk / G]);
+
+                uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+                uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+
+                uint32_t cp_g[kChunk / 2], cp_u[kChunk / 2];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    unpack_word_to_4_pairs(words_g[w], cp_g + 4 * w);
+                    unpack_word_to_4_pairs(words_u[w], cp_u + 4 * w);
+                }
+
+                const uint4 *xp = reinterpret_cast<const uint4 *>(xr + c * kChunk);
+                float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = xp[i];
+                    const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        dot_g = dot2(xw[p], cp_g[4 * i + p], dot_g);
+                        dot_u = dot2(xw[p], cp_u[4 * i + p], dot_u);
+                        xsum = dot2(xw[p], kOnePair, xsum);
+                    }
+                }
+                vg = fmaf(s_g, dot_g, fmaf(mn_g, xsum, vg));
+                vu = fmaf(s_u, dot_u, fmaf(mn_u, xsum, vu));
+            }
+        } else {
+            for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+                uint4 packed_g = reinterpret_cast<const uint4 *>(q_g)[c];
+                uint4 packed_u = reinterpret_cast<const uint4 *>(q_u)[c];
+                const float s_g = bf16_bits_to_f32(s_g_ptr[c * kChunk / G]);
+                const float s_u = bf16_bits_to_f32(s_u_ptr[c * kChunk / G]);
+                const float mn_g = bf16_bits_to_f32(m_g_ptr[c * kChunk / G]);
+                const float mn_u = bf16_bits_to_f32(m_u_ptr[c * kChunk / G]);
+
+                uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+                uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+                const QHigh32<HB> hb_g = QHigh32<HB>::load(q_g, K, c * kChunk);
+                const QHigh32<HB> hb_u = QHigh32<HB>::load(q_u, K, c * kChunk);
+
+                float xv[kChunk];
+                load_x32(xr, c * kChunk, xv);
+
+                float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    float xi = xv[i];
+                    dot_g = fmaf(xi, (float)(((words_g[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_g.at(i)), dot_g);
+                    dot_u = fmaf(xi, (float)(((words_u[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_u.at(i)), dot_u);
+                    xsum += xi;
+                }
+                vg = fmaf(s_g, dot_g, fmaf(mn_g, xsum, vg));
+                vu = fmaf(s_u, dot_u, fmaf(mn_u, xsum, vu));
+            }
+        }
     }
     vg = reduce_row(vg, part_g, wave, ks, KS);
     vu = reduce_row(vu, part_u, wave, ks, KS);
