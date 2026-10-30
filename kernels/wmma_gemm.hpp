@@ -21,11 +21,37 @@
 namespace strix::kernels {
 
 constexpr int kWmmaKC = 64;             // K per step (a multiple of every group size's 32-code chunk)
-constexpr int kWmmaLd = kWmmaKC + 8;    // LDS row stride in BF16 elements (padding against bank conflicts)
-static_assert(kWmmaLd * 2 % 16 == 0, "rows 16-byte aligned: fragments load with 128-bit reads (wmma_load_rows_a16)");
+constexpr int kWmmaLd = kWmmaKC;        // Unpadded LDS row stride with XOR swizzling (zero padding waste)
+static_assert(kWmmaLd * 2 % 16 == 0, "rows 16-byte aligned: fragments load with 128-bit reads (wmma_load_swizzled_rows_a16)");
 constexpr int kWmmaThreads = 256;       // 8 waves of 32
 
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+
+// 16-byte chunk XOR swizzling across LDS banks (gfx11 RDNA 3 / 3.5: 32 banks x 4B = 128B/cycle).
+// chunk in 0..7 (each chunk is 8 BF16/FP16 elements = 16 bytes).
+__device__ inline int wmma_swizzle_chunk(int r, int chunk) {
+    return r * kWmmaLd + ((chunk ^ (r & 0x7)) * 8);
+}
+
+__device__ inline wmma_bf16x16 wmma_load_swizzled_rows_a16(const uint16_t *lds, int r0, int kk) {
+    const int r = r0 + (int)(threadIdx.x % 16);
+    const int chunk0 = kk / 8;
+    const int chunk1 = chunk0 + 1;
+    const uint4 lo = *reinterpret_cast<const uint4 *>(lds + wmma_swizzle_chunk(r, chunk0));
+    const uint4 hi = *reinterpret_cast<const uint4 *>(lds + wmma_swizzle_chunk(r, chunk1));
+    const wmma_u32x8 v = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    return __builtin_bit_cast(wmma_bf16x16, v);
+}
+
+__device__ inline wmma_f16x16 wmma_load_swizzled_rows_a16_f16(const uint16_t *lds, int r0, int kk) {
+    const int r = r0 + (int)(threadIdx.x % 16);
+    const int chunk0 = kk / 8;
+    const int chunk1 = chunk0 + 1;
+    const uint4 lo = *reinterpret_cast<const uint4 *>(lds + wmma_swizzle_chunk(r, chunk0));
+    const uint4 hi = *reinterpret_cast<const uint4 *>(lds + wmma_swizzle_chunk(r, chunk1));
+    const wmma_u32x8 v = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    return __builtin_bit_cast(wmma_f16x16, v);
+}
 
 __device__ inline uint16_t wmma_f32_to_bf16(float f) {
     uint32_t u = __float_as_uint(f);
@@ -44,9 +70,9 @@ __device__ inline void wmma_step_f16(const uint16_t *xs, const uint16_t *ws, int
     for (int kk = 0; kk < kWmmaKC; kk += 16) {
         wmma_f16x16 a[TM], b[TN];
 #pragma unroll
-        for (int i = 0; i < TM; ++i) a[i] = wmma_load_rows_a16_f16(xs + (wr0 + 16 * i) * kWmmaLd + kk, kWmmaLd);
+        for (int i = 0; i < TM; ++i) a[i] = wmma_load_swizzled_rows_a16_f16(xs, wr0 + 16 * i, kk);
 #pragma unroll
-        for (int j = 0; j < TN; ++j) b[j] = wmma_load_rows_a16_f16(ws + (wc0 + 16 * j) * kWmmaLd + kk, kWmmaLd);
+        for (int j = 0; j < TN; ++j) b[j] = wmma_load_swizzled_rows_a16_f16(ws, wc0 + 16 * j, kk);
 #pragma unroll
         for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -61,9 +87,9 @@ __device__ inline void wmma_step(const uint16_t *xs, const uint16_t *ws, int wr0
     for (int kk = 0; kk < kWmmaKC; kk += 16) {
         wmma_bf16x16 a[TM], b[TN];
 #pragma unroll
-        for (int i = 0; i < TM; ++i) a[i] = wmma_load_rows_a16(xs + (wr0 + 16 * i) * kWmmaLd + kk, kWmmaLd);
+        for (int i = 0; i < TM; ++i) a[i] = wmma_load_swizzled_rows_a16(xs, wr0 + 16 * i, kk);
 #pragma unroll
-        for (int j = 0; j < TN; ++j) b[j] = wmma_load_rows_a16(ws + (wc0 + 16 * j) * kWmmaLd + kk, kWmmaLd);
+        for (int j = 0; j < TN; ++j) b[j] = wmma_load_swizzled_rows_a16(ws, wc0 + 16 * j, kk);
 #pragma unroll
         for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -88,7 +114,7 @@ __device__ inline uint32_t wmma_pack_codes(uint32_t a, uint32_t b) {
 
 // One 16-byte load of codes (BITS 4: 32 codes, 8: 16) into LDS at dst (16-byte aligned) as BF16 bits, in K order.
 template <int BITS>
-__device__ inline void wmma_stage_codes(const uint4 &q, uint16_t *dst) {
+__device__ inline void wmma_stage_codes(const uint4 &q, uint16_t *lds, int r, int kin) {
     constexpr int kCodes = BITS == 4 ? 32 : 16;
     const uint32_t words[4] = {q.x, q.y, q.z, q.w};
     uint32_t d[kCodes / 2];
@@ -103,9 +129,11 @@ __device__ inline void wmma_stage_codes(const uint4 &q, uint16_t *dst) {
             d[2 * w + 1] = wmma_pack_codes((words[w] >> 16) & 0xffu, words[w] >> 24);
         }
     }
-    uint4 *out = reinterpret_cast<uint4 *>(dst);
 #pragma unroll
-    for (int j = 0; j < kCodes / 8; ++j) out[j] = make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    for (int j = 0; j < kCodes / 8; ++j) {
+        *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(r, (kin / 8) + j)) =
+            make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    }
 }
 
 // ---- F16: weights dequantized to F16 (code * scale + min, one rounding), x as
@@ -142,9 +170,9 @@ __device__ inline void wmma_q8_word_to_f16(uint32_t w, wmma_f16x2 s, wmma_f16x2 
 }
 
 // One 16-byte load of codes (BITS 4: 32 codes, 8: 16 - all in one group, scale sc / min mn as F16 pairs) dequantized
-// to F16 and written to LDS at dst (16-byte aligned) in K order.
+// to F16 and written to LDS in K order.
 template <int BITS>
-__device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *dst) {
+__device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_f16x2 mn, uint16_t *lds, int r, int kin) {
     static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
     constexpr int kCodes = BITS == 4 ? 32 : 16;
     const uint32_t words[4] = {q.x, q.y, q.z, q.w};
@@ -154,9 +182,11 @@ __device__ inline void wmma_stage_codes_f16(const uint4 &q, wmma_f16x2 sc, wmma_
         if constexpr (BITS == 4) wmma_q4_word_to_f16(words[w], sc, mn, d + 4 * w);
         else wmma_q8_word_to_f16(words[w], sc, mn, d + 2 * w);
     }
-    uint4 *out = reinterpret_cast<uint4 *>(dst);
 #pragma unroll
-    for (int j = 0; j < kCodes / 8; ++j) out[j] = make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    for (int j = 0; j < kCodes / 8; ++j) {
+        *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(r, (kin / 8) + j)) =
+            make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+    }
 }
 
 // Weight tile of raw codes, in two halves so the next K step's global loads can be in flight during this step's
@@ -231,7 +261,7 @@ struct WmmaWCodes {
         for (int i = 0; i < kLoads; ++i) {
             const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
             const int kin = (l % kLoadsPerRow) * kCodesPerLoad;
-            wmma_stage_codes<BITS>(q[i], lds + r * kWmmaLd + kin);
+            wmma_stage_codes<BITS>(q[i], lds, r, kin);
         }
         stage_window(sw, mw);
     }
@@ -247,6 +277,17 @@ struct WmmaWCodes {
     // F16 path: this thread's codes dequantized with their groups' scale / min from the staged window (the step at
     // k0 from k_base), written to LDS [BN][kWmmaLd] as F16 bits. BITS 4 or 8.
     __device__ void stage_f16(uint16_t *lds, const uint16_t *sw, const uint16_t *mw, int64_t k0) const {
+        static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
+#pragma unroll
+        for (int i = 0; i < kLoads; ++i) {
+            const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
+            const int kin = (l % kLoadsPerRow) * kCodesPerLoad;
+            // a 16-byte load's codes lie in one group (32 codes at Q4, 16 at Q8; G >= 32)
+            const int slot = (int)(((k0 + kin) / G) % kWin);
+            wmma_stage_codes_f16<BITS>(q[i], wmma_bf16_bits_to_f16x2(sw[r * kWin + slot]),
+                                       wmma_bf16_bits_to_f16x2(mw[r * kWin + slot]), lds, r, kin);
+        }
+    }
         static_assert(BITS == 4 || BITS == 8, "F16 staging: Q4 / Q8 codes");
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
@@ -319,9 +360,11 @@ struct WmmaWCodesSplit {
                 const uint32_t b = ((lw[(c + 1) / 8] >> (4 * ((c + 1) % 8))) & 0xFu) | (high(c + 1) << 4);
                 d[c / 2] = wmma_pack_codes(a, b);
             }
-            uint4 *out = reinterpret_cast<uint4 *>(lds + r * kWmmaLd + kin);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) out[j] = make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+            for (int j = 0; j < 4; ++j) {
+                *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(r, (kin / 8) + j)) =
+                    make_uint4(d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]);
+            }
         }
         if (win)
 #pragma unroll
@@ -357,7 +400,7 @@ struct WmmaWBf16 {
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
             const int l = (int)threadIdx.x + i * kWmmaThreads;
-            *reinterpret_cast<uint4 *>(lds + (l / kSegs) * kWmmaLd + (l % kSegs) * 8) = v[i];
+            *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(l / kSegs, l % kSegs)) = v[i];
         }
     }
 };
@@ -404,7 +447,7 @@ struct WmmaXTile {
             for (int i = 0; i < 4; ++i)
                 h[i] = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(__uint_as_float(b[p][i] << 16),
                                                                                __uint_as_float(b[p][i] & 0xffff0000u)));
-            *reinterpret_cast<uint4 *>(lds + (seg / kSegs) * kWmmaLd + (seg % kSegs) * 8) = make_uint4(h[0], h[1], h[2], h[3]);
+            *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(seg / kSegs, seg % kSegs)) = make_uint4(h[0], h[1], h[2], h[3]);
         }
     }
     __device__ void stage(uint16_t *lds, float *rs) const {
@@ -412,7 +455,7 @@ struct WmmaXTile {
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
             if (seg >= BM * kSegs) break;  // wave-uniform (whole waves per pass)
-            *reinterpret_cast<uint4 *>(lds + r * kWmmaLd + (seg % kSegs) * 8) = make_uint4(b[p][0], b[p][1], b[p][2], b[p][3]);
+            *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(r, seg % kSegs)) = make_uint4(b[p][0], b[p][1], b[p][2], b[p][3]);
             if constexpr (!SUMS) continue;
             float sum = 0.f;
 #pragma unroll
@@ -450,7 +493,7 @@ struct WmmaXTileF32ToF16 {
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads;
             if (seg >= BM * kSegs) break;  // wave-uniform
-            *reinterpret_cast<uint4 *>(lds + (seg / kSegs) * kWmmaLd + (seg % kSegs) * 8) =
+            *reinterpret_cast<uint4 *>(lds + wmma_swizzle_chunk(seg / kSegs, seg % kSegs)) =
                 make_uint4(b[p][0], b[p][1], b[p][2], b[p][3]);
         }
     }
@@ -473,9 +516,9 @@ __device__ inline void wmma_step_scaled(const uint16_t *xs, const uint16_t *ws, 
             wmma_bf16x16 a[TM], b[TN];
 #pragma unroll
             for (int i = 0; i < TM; ++i)
-                if (i < tm_active) a[i] = wmma_load_rows_a16(xs + (wr0 + 16 * i) * kWmmaLd + kk, kWmmaLd);
+                if (i < tm_active) a[i] = wmma_load_swizzled_rows_a16(xs, wr0 + 16 * i, kk);
 #pragma unroll
-            for (int j = 0; j < TN; ++j) b[j] = wmma_load_rows_a16(ws + (wc0 + 16 * j) * kWmmaLd + kk, kWmmaLd);
+            for (int j = 0; j < TN; ++j) b[j] = wmma_load_swizzled_rows_a16(ws, wc0 + 16 * j, kk);
 #pragma unroll
             for (int i = 0; i < TM; ++i)
                 if (i < tm_active)

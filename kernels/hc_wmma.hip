@@ -200,7 +200,7 @@ struct UpCodes {
             const int l = (int)threadIdx.x + i * kWmmaThreads, lr = l / kLoadsPerRow, kin = (l % kLoadsPerRow) * kCodesPerLoad;
             const int slot = (int)(((k0 + kin) / G) % kWin);  // a load's codes lie in one group (G >= 32)
             wmma_stage_codes_f16<BITS>(q[i], wmma_bf16_bits_to_f16x2(sw[lr * kWin + slot]),
-                                       wmma_bf16_bits_to_f16x2(mw[lr * kWin + slot]), lds + lr * kWmmaLd + kin);
+                                       wmma_bf16_bits_to_f16x2(mw[lr * kWin + slot]), lds, lr, kin);
         }
     }
 };

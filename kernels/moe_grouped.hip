@@ -455,7 +455,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
                     h[i] = XH && COMBINE ? xt.b[p][i] : bf16x2_to_f16x2(xt.b[p][i]);  // XH: x is F16 already
-                *reinterpret_cast<uint4 *>(xs + (seg / kSegs) * kWmmaLd + (seg % kSegs) * 8) =
+                *reinterpret_cast<uint4 *>(xs + wmma_swizzle_chunk(seg / kSegs, seg % kSegs)) =
                     make_uint4(h[0], h[1], h[2], h[3]);
             }
             cs[crow * kCodeLd + chalf] = cq;
@@ -485,7 +485,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
                 const wmma_f16x16 bf = __builtin_bit_cast(wmma_f16x16, bv);
 #pragma unroll
                 for (int i = 0; i < TMA; ++i)
-                    acc[i] = wmma_f16(wmma_load_rows_a16_f16(xs + 16 * i * kWmmaLd + kk * 16, kWmmaLd), bf, acc[i]);
+                    acc[i] = wmma_f16(wmma_load_swizzled_rows_a16_f16(xs, 16 * i, kk * 16), bf, acc[i]);
             }
             lds_barrier();  // the next step's loads stay in flight
         }
@@ -614,9 +614,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
             for (int kk = 0; kk < kWmmaKC; kk += 16) {
                 wmma_f16x16 a[TMA], b[2];
 #pragma unroll
-                for (int i = 0; i < TMA; ++i) a[i] = wmma_load_rows_a16_f16(xs + 16 * (2 * i + wm) * kWmmaLd + kk, kWmmaLd);
+                for (int i = 0; i < TMA; ++i) a[i] = wmma_load_swizzled_rows_a16_f16(xs, 16 * (2 * i + wm), kk);
 #pragma unroll
-                for (int j = 0; j < 2; ++j) b[j] = wmma_load_rows_a16_f16(wsm + (wn * 32 + 16 * j) * kWmmaLd + kk, kWmmaLd);
+                for (int j = 0; j < 2; ++j) b[j] = wmma_load_swizzled_rows_a16_f16(wsm, wn * 32 + 16 * j, kk);
 #pragma unroll
                 for (int i = 0; i < TMA; ++i)
 #pragma unroll
