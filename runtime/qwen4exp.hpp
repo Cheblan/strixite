@@ -517,7 +517,8 @@ public:
     static constexpr int64_t kMaxLogits = 16;
     // Forwards of at least this many tokens run the MoE experts grouped by expert (each expert's weights read
     // once per tile, kernels/moe_grouped); shorter ones (decode, MTP verify) the per-slot kernels.
-    static constexpr int64_t kGroupedMinTokens = 6;
+    // Fused dot2 gather SwiGLU is faster than grouped WMMA up to T = 8 (32.17 vs 34.83 ms at T = 6; 42.60 vs 45.26 ms at T = 8).
+    static constexpr int64_t kGroupedMinTokens = 9;
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
     // mixes on the matrix units (a 64-row tile). Swept on the served layout (prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
     // 24 131 vs 129, 32 136 vs 144, 48 145 vs 226 - break-even ~24-26, so 32. Re-swept with the experts grouped
