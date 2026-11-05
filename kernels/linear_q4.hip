@@ -68,6 +68,19 @@ __device__ inline uint32_t code_pair(const uint32_t (&words)[4], int p) {
     const float lo = (float)(b & 0xFu), hi = (float)(b >> 4);
     return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
 }
+
+// Unpack all 8 nibbles of a 32-bit word into 4 packed BF16 pairs (2 nibbles per pair, low nibble first)
+__device__ inline void unpack_word_to_4_pairs(uint32_t w, uint32_t *out) {
+    const uint32_t b0 = w & 0xFFu;
+    const uint32_t b1 = (w >> 8) & 0xFFu;
+    const uint32_t b2 = (w >> 16) & 0xFFu;
+    const uint32_t b3 = w >> 24;
+
+    out[0] = (__float_as_uint((float)(b0 & 0xFu)) >> 16) | (__float_as_uint((float)(b0 >> 4)) & 0xffff0000u);
+    out[1] = (__float_as_uint((float)(b1 & 0xFu)) >> 16) | (__float_as_uint((float)(b1 >> 4)) & 0xffff0000u);
+    out[2] = (__float_as_uint((float)(b2 & 0xFu)) >> 16) | (__float_as_uint((float)(b2 >> 4)) & 0xffff0000u);
+    out[3] = (__float_as_uint((float)(b3 & 0xFu)) >> 16) | (__float_as_uint((float)(b3 >> 4)) & 0xffff0000u);
+}
 constexpr uint32_t kOnePair = 0x3F803F80u;  // BF16 (1, 1)
 
 // One output row per KS waves of a block: wave w handles row w / KS and the
@@ -102,7 +115,7 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
             if constexpr (std::is_same_v<TX, uint16_t>) {
                 uint32_t cp[kChunk / 2];
 #pragma unroll
-                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+                for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     if (r < rows) {
@@ -182,9 +195,28 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
     for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
         uint4 packed = reinterpret_cast<const uint4 *>(qrow)[c];
         uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-        const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
         const float mn = bf16_bits_to_f32(mrow[c * kChunk / G]);
+        if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+            uint32_t cp[kChunk / 2];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
+            const uint4 *xp = reinterpret_cast<const uint4 *>(xrow + c * kChunk);
+            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dot = dot2(xw[j], cp[4 * i + j], dot);
+                    xsum = dot2(xw[j], kOnePair, xsum);
+                }
+            }
+            acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+            continue;
+        }
+        const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         float xv[kChunk];
         load_x32(xrow, c * kChunk, xv);
         float dot = 0.f, xsum = 0.f;
@@ -260,10 +292,78 @@ __global__ void __launch_bounds__(kThreads)
     if (ok && j < I) {  // no early return: every wave reaches reduce_row's barrier
         const T *xr = x + (int64_t)blockIdx.z * K;
         const int64_t rg = (int64_t)id * N + j, ru = rg + I;
-        vg = q4_row_partial<T, G, HB>(q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
-        vu = q4_row_partial<T, G, HB>(q + ru * qsplit_row_bytes<HB>(K), scale + ru * (K / G), minv + ru * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
+        const uint8_t *q_g = q + rg * qsplit_row_bytes<HB>(K);
+        const uint8_t *q_u = q + ru * qsplit_row_bytes<HB>(K);
+        const uint16_t *s_g_ptr = scale + rg * (K / G);
+        const uint16_t *s_u_ptr = scale + ru * (K / G);
+        const uint16_t *m_g_ptr = minv + rg * (K / G);
+        const uint16_t *m_u_ptr = minv + ru * (K / G);
+        const int64_t chunks = K / kChunk;
+
+        if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+            for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+                uint4 packed_g = reinterpret_cast<const uint4 *>(q_g)[c];
+                uint4 packed_u = reinterpret_cast<const uint4 *>(q_u)[c];
+                const float s_g = bf16_bits_to_f32(s_g_ptr[c * kChunk / G]);
+                const float s_u = bf16_bits_to_f32(s_u_ptr[c * kChunk / G]);
+                const float mn_g = bf16_bits_to_f32(m_g_ptr[c * kChunk / G]);
+                const float mn_u = bf16_bits_to_f32(m_u_ptr[c * kChunk / G]);
+
+                uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+                uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+
+                uint32_t cp_g[kChunk / 2], cp_u[kChunk / 2];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    unpack_word_to_4_pairs(words_g[w], cp_g + 4 * w);
+                    unpack_word_to_4_pairs(words_u[w], cp_u + 4 * w);
+                }
+
+                const uint4 *xp = reinterpret_cast<const uint4 *>(xr + c * kChunk);
+                float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = xp[i];
+                    const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        dot_g = dot2(xw[p], cp_g[4 * i + p], dot_g);
+                        dot_u = dot2(xw[p], cp_u[4 * i + p], dot_u);
+                        xsum = dot2(xw[p], kOnePair, xsum);
+                    }
+                }
+                vg = fmaf(s_g, dot_g, fmaf(mn_g, xsum, vg));
+                vu = fmaf(s_u, dot_u, fmaf(mn_u, xsum, vu));
+            }
+        } else {
+            for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+                uint4 packed_g = reinterpret_cast<const uint4 *>(q_g)[c];
+                uint4 packed_u = reinterpret_cast<const uint4 *>(q_u)[c];
+                const float s_g = bf16_bits_to_f32(s_g_ptr[c * kChunk / G]);
+                const float s_u = bf16_bits_to_f32(s_u_ptr[c * kChunk / G]);
+                const float mn_g = bf16_bits_to_f32(m_g_ptr[c * kChunk / G]);
+                const float mn_u = bf16_bits_to_f32(m_u_ptr[c * kChunk / G]);
+
+                uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+                uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+                const QHigh32<HB> hb_g = QHigh32<HB>::load(q_g, K, c * kChunk);
+                const QHigh32<HB> hb_u = QHigh32<HB>::load(q_u, K, c * kChunk);
+
+                float xv[kChunk];
+                load_x32(xr, c * kChunk, xv);
+
+                float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    float xi = xv[i];
+                    dot_g = fmaf(xi, (float)(((words_g[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_g.at(i)), dot_g);
+                    dot_u = fmaf(xi, (float)(((words_u[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_u.at(i)), dot_u);
+                    xsum += xi;
+                }
+                vg = fmaf(s_g, dot_g, fmaf(mn_g, xsum, vg));
+                vu = fmaf(s_u, dot_u, fmaf(mn_u, xsum, vu));
+            }
+        }
     }
     vg = reduce_row(vg, part_g, wave, ks, KS);
     vu = reduce_row(vu, part_u, wave, ks, KS);
@@ -272,6 +372,145 @@ __global__ void __launch_bounds__(kThreads)
         const float g = as_stored(vg, y), u = as_stored(vu, y);
         const float hv = as_stored(silu(g), y) * u;  // BF16: bf16(bf16(silu(g)) * u), as swiglu_bf16
         store(y, slot * I + j, ok ? hv : __int_as_float(0x7fc00000));
+    }
+}
+
+
+struct UniqueExpertRoute {
+    int32_t expert_id;
+    int32_t count;
+    int32_t slots[8];
+    int32_t tokens[8];
+};
+__device__ UniqueExpertRoute d_routes[128];
+__device__ int32_t d_num_unique;
+
+__global__ void __launch_bounds__(32)
+pack_unique_routes_kernel(const int32_t *ids, int64_t M, int64_t A, int64_t E, uint32_t *err) {
+    if (threadIdx.x != 0) return;
+    const int total_slots = (int)(M * A);
+    int num_unique = 0;
+    for (int slot = 0; slot < total_slots; ++slot) {
+        const int32_t eid = ids[slot];
+        if (eid < 0 || eid >= E) {
+            expert_id_ok(eid, E, err, slot);
+            continue;
+        }
+        const int32_t tok = slot / (int)A;
+        int found_idx = -1;
+        for (int u = 0; u < num_unique; ++u) {
+            if (d_routes[u].expert_id == eid) {
+                found_idx = u;
+                break;
+            }
+        }
+        if (found_idx >= 0) {
+            const int c = d_routes[found_idx].count;
+            if (c < 8) {
+                d_routes[found_idx].slots[c] = slot;
+                d_routes[found_idx].tokens[c] = tok;
+                d_routes[found_idx].count = c + 1;
+            }
+        } else {
+            d_routes[num_unique].expert_id = eid;
+            d_routes[num_unique].count = 1;
+            d_routes[num_unique].slots[0] = slot;
+            d_routes[num_unique].tokens[0] = tok;
+            num_unique++;
+        }
+    }
+    d_num_unique = num_unique;
+}
+
+// Fused Weight-Reused Gather SwiGLU:
+// Evaluates all tokens in draft batch M <= 8 that share an expert using ONE weight load and fused Gate+Up.
+template <typename T, int G, int HB>
+__global__ void __launch_bounds__(kThreads)
+linear_q4_experts_gather_swiglu_reused_kernel(const T *x, const uint8_t *q, const uint16_t *scale,
+                                              const uint16_t *minv, T *y, int64_t N, int64_t K) {
+    const int u_idx = blockIdx.y;
+    if (u_idx >= d_num_unique) return;
+
+    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
+    const int64_t I = N / 2, j = (int64_t)blockIdx.x * (blockDim.x / warpSize) + wave;
+    if (j >= I) return;
+
+    __shared__ UniqueExpertRoute s_route;
+    if (threadIdx.x == 0) s_route = d_routes[u_idx];
+    __syncthreads();
+
+    const int32_t id = s_route.expert_id;
+    const int count = s_route.count;
+    int tok[8], slot[8];
+    for (int k = 0; k < count; ++k) {
+        tok[k] = s_route.tokens[k];
+        slot[k] = s_route.slots[k];
+    }
+
+    const int64_t rg = (int64_t)id * N + j, ru = rg + I;
+    const uint8_t *qg = q + rg * qsplit_row_bytes<HB>(K);
+    const uint8_t *qu = q + ru * qsplit_row_bytes<HB>(K);
+    const uint16_t *sg = scale + rg * (K / G);
+    const uint16_t *su = scale + ru * (K / G);
+    const uint16_t *mg = minv + rg * (K / G);
+    const uint16_t *mu = minv + ru * (K / G);
+    const int64_t chunks = K / kChunk;
+
+    float acc_g[8], acc_u[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) { acc_g[k] = 0.f; acc_u[k] = 0.f; }
+
+    for (int64_t c = lane; c < chunks; c += warpSize) {
+        const uint4 packed_g = reinterpret_cast<const uint4 *>(qg)[c];
+        const uint4 packed_u = reinterpret_cast<const uint4 *>(qu)[c];
+        const float s_g = bf16_bits_to_f32(sg[c * kChunk / G]);
+        const float s_u = bf16_bits_to_f32(su[c * kChunk / G]);
+        const float mn_g = bf16_bits_to_f32(mg[c * kChunk / G]);
+        const float mn_u = bf16_bits_to_f32(mu[c * kChunk / G]);
+
+        const uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+        const uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+
+        uint32_t cp_g[kChunk / 2], cp_u[kChunk / 2];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            unpack_word_to_4_pairs(words_g[w], cp_g + 4 * w);
+            unpack_word_to_4_pairs(words_u[w], cp_u + 4 * w);
+        }
+
+        for (int k = 0; k < count; ++k) {
+            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (int64_t)tok[k] * K + c * kChunk);
+            float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk / 8; ++i) {
+                const uint4 u = xp[i];
+                const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    dot_g = dot2(xw[p], cp_g[4 * i + p], dot_g);
+                    dot_u = dot2(xw[p], cp_u[4 * i + p], dot_u);
+                    xsum = dot2(xw[p], kOnePair, xsum);
+                }
+            }
+            acc_g[k] = fmaf(s_g, dot_g, fmaf(mn_g, xsum, acc_g[k]));
+            acc_u[k] = fmaf(s_u, dot_u, fmaf(mn_u, xsum, acc_u[k]));
+        }
+    }
+
+    for (int k = 0; k < count; ++k) {
+        for (int off = warpSize / 2; off > 0; off >>= 1) {
+            acc_g[k] += __shfl_xor(acc_g[k], off);
+            acc_u[k] += __shfl_xor(acc_u[k], off);
+        }
+    }
+
+    if (lane == 0) {
+        for (int k = 0; k < count; ++k) {
+            const float g = as_stored(acc_g[k], y);
+            const float u = as_stored(acc_u[k], y);
+            const float hv = as_stored(silu(g), y) * u;
+            store(y, (int64_t)slot[k] * I + j, hv);
+        }
     }
 }
 
@@ -292,15 +531,43 @@ __global__ void __launch_bounds__(kThreads)
     for (int64_t a = 0; a < A; ++a) ok = ok && ids[m * A + a] >= 0 && ids[m * A + a] < E;
     float acc = 0.f;
     if (ok && n < N) {
-        for (uint32_t c = (uint32_t)(ks * warpSize + lane); c < (uint32_t)A * kc; c += (uint32_t)(KS * warpSize)) {
-            const uint32_t a = c / kc, cc = c % kc;
+        uint32_t c = (uint32_t)(ks * warpSize + lane);
+        uint32_t a = c / kc, cc = c % kc;
+        const uint32_t step = (uint32_t)(KS * warpSize);
+        const uint32_t total_c = (uint32_t)A * kc;
+        while (c < total_c) {
             const int64_t row = (int64_t)ids[m * A + a] * N + n;
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
             uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-            const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
             const float mn = bf16_bits_to_f32(minv[row * (K / G) + (int64_t)cc * kChunk / G]);
+            if constexpr (std::is_same_v<T, uint16_t> && HB == 0) {
+                uint32_t cp[kChunk / 2];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) unpack_word_to_4_pairs(words[w], cp + 4 * w);
+                const uint4 *xp = reinterpret_cast<const uint4 *>(h + (m * A + a) * K + (int64_t)cc * kChunk);
+                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk / 8; ++i) {
+                    const uint4 u = xp[i];
+                    const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        dot = dot2(xw[j], cp[4 * i + j], dot);
+                        xsum = dot2(xw[j], kOnePair, xsum);
+                    }
+                }
+                acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+                c += step;
+                cc += step;
+                while (cc >= kc) {
+                    cc -= kc;
+                    ++a;
+                }
+                continue;
+            }
+            const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             float xv[kChunk];
             load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
             float dot = 0.f, xsum = 0.f;
@@ -310,6 +577,12 @@ __global__ void __launch_bounds__(kThreads)
                 xsum += xv[i];
             }
             acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+            c += step;
+            cc += step;
+            while (cc >= kc) {
+                cc -= kc;
+                ++a;
+            }
         }
     }
     acc = reduce_row(acc, part, wave, ks, KS);
@@ -379,10 +652,21 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
     const unsigned bx = (unsigned)((out_rows + rows_per_block - 1) / rows_per_block);
     dim3 block(kThreads);
 #define STRIX_Q4_EXPERTS(G)                                                                                         \
-    if (swiglu)                                                                                                     \
-        linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
-            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                                \
-    else if (combine)                                                                                               \
+    if (swiglu) {                                                                                                   \
+        if constexpr (HB == 0 && std::is_same_v<T, uint16_t> && G == 128) {                                        \
+            if (M > 1 && M <= 8 && A <= 16 && KS == 1) {                                                           \
+                pack_unique_routes_kernel<<<1, 32, 0, stream>>>(ids, M, A, E, err);                                \
+                linear_q4_experts_gather_swiglu_reused_kernel<T, G, HB><<<dim3(bx, (unsigned)(M * A)), block, 0, stream>>>( \
+                    x, w.q, w.scale, w.minv, y, N, w.K);                                                            \
+            } else {                                                                                                \
+                linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
+                    x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                       \
+            }                                                                                                       \
+        } else {                                                                                                    \
+            linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
+                x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                           \
+        }                                                                                                           \
+    } else if (combine)                                                                                               \
         linear_q4_experts_combine_kernel<T, G, HB><<<dim3(bx, (unsigned)M), block, 0, stream>>>(                    \
             x, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err);                                          \
     else                                                                                                            \

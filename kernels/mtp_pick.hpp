@@ -15,6 +15,13 @@
 
 namespace strix::kernels {
 
+// A partial top-2: the best value and its index (INT_MAX = nothing seen yet), the runner-up value, NaN seen.
+struct Part {
+    float b1, b2;
+    int i1;
+    uint32_t nan;
+};
+
 // Device and host layout (one copy): the pick, then the router / expert / attention error words (3 each, as
 // read_back lays them out) and the embedding error slot.
 struct MtpPick {
@@ -28,8 +35,9 @@ struct MtpPick {
 static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");
 
 // logits [n] FP32 (1 <= n <= 2^31 - 1); the error words and slot are the forward's device ones (read, not reset);
-// out on the device. One block.
+// out on the device. workspace: optional device workspace of at least 64 * sizeof(Part) bytes for multi-block reduction.
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
-              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
+              const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, void *workspace = nullptr,
+              hipStream_t stream = nullptr);
 
 }  // namespace strix::kernels
