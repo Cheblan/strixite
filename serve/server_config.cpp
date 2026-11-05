@@ -330,7 +330,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
-        {"hybrid-draft", K::OnOff, 0, 0, "on", "hybrid context n-gram + MTP speculative drafting"},
+        {"hybrid-draft", K::OnOff, 0, 0, "off", "hybrid context n-gram + MTP speculative drafting"},
         {"pld-n", K::Int, 2, 8, "3", "hybrid draft: minimum context matching n-gram length"},
         {"pld-k", K::Int, 1, 15, "4", "hybrid draft: max tokens pulled from context per round"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),

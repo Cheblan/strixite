@@ -3554,7 +3554,8 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
                                l.conv_w, sq.conv_state[li].get(), sq.conv_state[li].get(), false, l.A_log, l.dt_bias,
                                qkv_.get(), beta_.get(), g_.get(), act, stream_);
             kernels::delta_rule(qkv_.get(), beta_.get(), g_.get(), {rows, D.gk, D.gv, D.conv_c}, sq.rec_state[li].get(),
-                                sq.rec_state[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto);
+                                sq.rec_state[li].get(), false, core_.get(), act, stream_, kernels::DeltaRulePath::Auto,
+                                precision_.gdn);
         } else {
             // Attention: the tail (and any block completed within the kept rows - same keys the verify wrote) from
             // the tail before the verify, which it only read. Same block-window triples as the verify's forward.
