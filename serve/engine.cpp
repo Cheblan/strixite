@@ -19,6 +19,60 @@ namespace strix {
 
 namespace {
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// Prompt Lookup Decoding (PLD): searches backwards in seq for an earlier occurrence of the n-gram
+// ending with (id, d). Returns the index of 'd' in seq (so seq[hit + 1] is the next continuation token), or -1 if not found.
+int64_t pld_find_match(const std::vector<int32_t> &seq, int32_t id, int32_t d, int64_t n_match, int64_t max_lookback = 16384) {
+    const int64_t sz = (int64_t)seq.size();
+    if (sz < 1) return -1;
+    if (n_match <= 2) {
+        const int64_t floor_i = std::max<int64_t>(0, sz - 1 - max_lookback);
+        for (int64_t i = sz - 2; i >= floor_i; --i) {
+            if (seq[(size_t)i] == id && seq[(size_t)(i + 1)] == d) {
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+    const int64_t prefix_len = n_match - 2;
+    if (sz < prefix_len) return -1;
+    const int32_t *prefix = &seq[(size_t)(sz - prefix_len)];
+    const int64_t floor_i = std::max<int64_t>(0, sz - n_match - max_lookback);
+    for (int64_t i = sz - n_match; i >= floor_i; --i) {
+        if (seq[(size_t)(i + prefix_len)] == id && seq[(size_t)(i + prefix_len + 1)] == d) {
+            if (std::equal(prefix, prefix + prefix_len, &seq[(size_t)i])) {
+                return i + prefix_len + 1;
+            }
+        }
+    }
+    return -1;
+}
+
+// Searches backwards in seq for an earlier occurrence of suffix ending with id (n_match length).
+// Returns the index of id in seq, or -1 if not found.
+int64_t pld_find_prefix_match(const std::vector<int32_t> &seq, int32_t id, int64_t n_match, int64_t max_lookback = 16384) {
+    const int64_t sz = (int64_t)seq.size();
+    if (sz < 1) return -1;
+    if (n_match <= 1) {
+        const int64_t floor_i = std::max<int64_t>(0, sz - max_lookback);
+        for (int64_t i = sz - 1; i >= floor_i; --i) {
+            if (seq[(size_t)i] == id) return i;
+        }
+        return -1;
+    }
+    const int64_t prefix_len = n_match - 1;
+    if (sz < prefix_len) return -1;
+    const int32_t *prefix = &seq[(size_t)(sz - prefix_len)];
+    const int64_t floor_i = std::max<int64_t>(0, sz - prefix_len - max_lookback);
+    for (int64_t i = sz - prefix_len; i >= floor_i; --i) {
+        if (seq[(size_t)(i + prefix_len - 1)] == id) {
+            if (std::equal(prefix, prefix + prefix_len - 1, &seq[(size_t)i])) {
+                return i + prefix_len - 1;
+            }
+        }
+    }
+    return -1;
+}
 }  // namespace
 
 bool ends_sentence(std::string_view tail) {
@@ -70,6 +124,8 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
+    STRIX_CHECK(options_.pld_n >= 2 && options_.pld_n <= 16, "Engine: pld_n ", options_.pld_n, ", expected 2..16");
+    STRIX_CHECK(options_.pld_k >= 1 && options_.pld_k <= 16, "Engine: pld_k ", options_.pld_k, ", expected 1..16");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
@@ -864,6 +920,12 @@ void log_detail(const GenerationResult &r) {
                  fmt_n(r.mtp_rollbacks).c_str(), fmt_n(r.mtp_reject_at[0]).c_str(), fmt_n(r.mtp_reject_at[1]).c_str(),
                  fmt_n(r.mtp_reject_at[2]).c_str(), fmt_n(r.mtp_reject_at[3]).c_str());
     }
+    if (r.pld_drafted_tokens > 0) {
+        slog_row(LogLevel::Info, "hybrid-draft", "%s/%s context drafts accepted (%.1f%%) in %s rounds",
+                 fmt_n(r.pld_accepted_tokens).c_str(), fmt_n(r.pld_drafted_tokens).c_str(),
+                 100.0 * (double)r.pld_accepted_tokens / (double)r.pld_drafted_tokens,
+                 fmt_n(r.pld_rounds).c_str());
+    }
     const BackendStats &b = r.backend;
     if (b.ple_gathers > 0) {
         // The n-gram (PLE) table's rows: from the RAM row cache, else read from the table file - on demand inside a
@@ -959,6 +1021,9 @@ void Engine::run(Job &job, Slot &sl) {
             (reason == "error" ? stats_.requests_error : reason == "cancelled" ? stats_.requests_cancelled : stats_.requests_ok)++;
             stats_.generated_tokens += res.completion_tokens - generated_counted;  // the rest of the per-step count
             stats_.mtp_drafted_tokens += res.mtp_drafted_tokens;
+            stats_.pld_rounds += res.pld_rounds;
+            stats_.pld_drafted_tokens += res.pld_drafted_tokens;
+            stats_.pld_accepted_tokens += res.pld_accepted_tokens;
             stats_.think_nudges += res.think_nudges;
             stats_.think_end_blocked += res.think_end_blocked;
             stats_.think_closed_for_call += res.think_closed_for_call;
@@ -1393,11 +1458,29 @@ void Engine::run(Job &job, Slot &sl) {
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 sl.be->prefetch_ple(ids, 0);
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
+                int64_t pld_drafted = 0;
                 for (int64_t step = 0; step < steps; ++step) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
-                    const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    int32_t d = t.best;
+                    const float margin = t.best_v - t.second_v;
+
+                    bool mtp_ok = (margin >= options_.mtp_margin && d != im_end_ && d != eot_);
+                    // If MTP margin drops at step 0, check if context lookup matches:
+                    if (!mtp_ok && options_.hybrid_draft && step == 0) {
+                        int64_t p_hit = pld_find_prefix_match(sl.seq, id, options_.pld_n);
+                        if (p_hit < 0 && options_.pld_n > 2) p_hit = pld_find_prefix_match(sl.seq, id, 2);
+                        if (p_hit >= 0 && p_hit + 1 < (int64_t)sl.seq.size()) {
+                            int32_t cand = sl.seq[(size_t)(p_hit + 1)];
+                            if (cand == t.best || cand == t.second_v || margin >= 0.5f) {
+                                d = cand;
+                                mtp_ok = (d != im_end_ && d != eot_);
+                            }
+                        }
+                    }
+
+                    if (!mtp_ok) break;
+
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
@@ -1407,6 +1490,29 @@ void Engine::run(Job &job, Slot &sl) {
                     }
                     ids.push_back(d);
                     if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
+
+                    // Hybrid context expansion:
+                    if (options_.hybrid_draft && step == 0) {
+                        int64_t hit = pld_find_match(sl.seq, id, d, options_.pld_n);
+                        if (hit < 0 && options_.pld_n > 2) hit = pld_find_match(sl.seq, id, d, 2);
+                        if (hit >= 0 && hit + 1 < (int64_t)sl.seq.size()) {
+                            ++res.pld_rounds;
+                            while ((int64_t)ids.size() - 1 < steps && pld_drafted < options_.pld_k && hit + 1 < (int64_t)sl.seq.size()) {
+                                int32_t cand = sl.seq[(size_t)(++hit)];
+                                if (cand == im_end_ || cand == eot_) break;
+                                if (cand == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
+                                if (so) {
+                                    if (!so->allows(draft_at, cand)) break;
+                                    draft_at = so->after(draft_at, cand);
+                                }
+                                ids.push_back(cand);
+                                ++pld_drafted;
+                                if ((int64_t)ids.size() - 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);
+                            }
+                            res.pld_drafted_tokens += pld_drafted;
+                            break;  // Draft filled from context continuation; skip subsequent MTP forwards
+                        }
+                    }
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {
@@ -1443,6 +1549,9 @@ void Engine::run(Job &job, Slot &sl) {
                             cut = true;
                             break;
                         }
+                    }
+                    if (pld_drafted > 0) {
+                        res.pld_accepted_tokens += std::max<int64_t>(0, std::min<int64_t>(j - 1, pld_drafted));
                     }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
                         sl.be->keep_verify_prefix(ids, j + 1);
