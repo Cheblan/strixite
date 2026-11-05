@@ -36,7 +36,11 @@ void Qwen4ExpBackend::build_session() {
         for (int i = 0; i < 4; ++i) snapshots_.back().push_back(session_->make_snapshot(k));
     }
     session_->set_precision(precision_);
-    if (mtp_vocab_ > 0) session_->set_mtp_vocab(mtp_vocab_);
+    if (model_.draft_head_q4().bits != 0) {
+        session_->set_mtp_vocab(model_.draft_head_q4().N());
+    } else if (mtp_vocab_ > 0) {
+        session_->set_mtp_vocab(mtp_vocab_);
+    }
     if (kv_budget_) session_->set_kv_budget(kv_budget_);
 }
 

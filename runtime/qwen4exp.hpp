@@ -169,10 +169,14 @@ public:
     // 32 / 64 / 128 and divides the head's K; no copy made yet (call once, at load, before any session drafts -
     // sessions read it without locking). threads: 1..64 CPU workers for the requantization (~0.1 s at 65,536 rows).
     void make_draft_head_q4(int64_t rows, int64_t G = 64, int threads = 16);
+    void make_draft_head_q4(const std::vector<int32_t> &draft_tokens, int64_t G = 64, int threads = 16);
     // The copy (bits == 0 until make_draft_head_q4 ran).
     const QWeightView &draft_head_q4() const { return draft_head_; }
     // Device bytes the copy holds (0 when none, or when it is the loaded Q4 head itself).
     size_t draft_head_q4_bytes() const { return draft_q4_ ? draft_q4_bytes_ : 0; }
+    // Sparse draft tokens mapping (empty if contiguous [0, rows)).
+    const std::vector<int32_t> &draft_tokens() const { return draft_tokens_; }
+    bool has_draft_tokens() const { return !draft_tokens_.empty(); }
 
 private:
     Qwen4ExpDims dims_;
@@ -187,6 +191,7 @@ private:
     QWeightView draft_head_;                 // make_draft_head_q4's copy (bits 0: none)
     std::unique_ptr<Q4Device> draft_q4_;     // its storage when made from a Q8 head
     size_t draft_q4_bytes_ = 0;
+    std::vector<int32_t> draft_tokens_;      // sparse draft vocabulary mapping (draft_idx -> token_id)
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;
     MtpHead mtp_;
     Hc final_;
@@ -196,7 +201,9 @@ private:
 // What strix_server does at load when MTP is on, shared so every tool that loads the model runs the served path: the Q4 draft head copy (Qwen4ExpModel::make_draft_head_q4, group 64) over the rows the drafts
 // score - mtp_vocab rows, or the whole vocabulary when mtp_vocab is 0. Returns the rows copied. Throws (from
 // make_draft_head_q4) when the model has no MTP head or mtp_vocab is outside 0..vocab.
-int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab);
+// When draft_tokens is provided, creates a sparse remapped draft head over those specific token IDs.
+int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab,
+                                   const std::vector<int32_t> &draft_tokens = {});
 
 // Called with each intermediate under the reference implementation's names where they exist ("embed", "L<i>.attn_in",
 // "L<i>.mixer", "L<i>.mlp_in", "L<i>.router_logits", "L<i>.moe", "L<i>.out", "final_mixed") plus what a

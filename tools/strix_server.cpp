@@ -175,8 +175,15 @@ int run(int argc, char **argv) {
     // PR #2): half the bytes per draft call, the verify still decides every token.
     if (use_mtp && model.has_mtp()) {
         const auto t0 = std::chrono::steady_clock::now();
-        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
-        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+        const bool mtp_sparse = settings.on("mtp-sparse");
+        std::vector<int32_t> draft_tokens;
+        if (mtp_sparse) {
+            const int64_t target = mtp_vocab == 0 ? 65536 : mtp_vocab;
+            draft_tokens = tok.build_sparse_draft_vocab(target, model.dims().vocab);
+        }
+        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab, draft_tokens);
+        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of %s%lld LM head rows, %.1f MB, made in %.2f s",
+             model.has_draft_tokens() ? "remapped sparse " : "the first ",
              (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }

@@ -223,28 +223,49 @@ const VisionTower &Qwen4ExpModel::vision() const {
 }
 
 void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
+    std::vector<int32_t> tokens((size_t)rows);
+    for (int64_t i = 0; i < rows; ++i) tokens[(size_t)i] = (int32_t)i;
+    make_draft_head_q4(tokens, G, threads);
+}
+
+void Qwen4ExpModel::make_draft_head_q4(const std::vector<int32_t> &draft_tokens, int64_t G, int threads) {
     const char *fn = "Qwen4ExpModel::make_draft_head_q4";
     STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
     STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
     STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
     const int64_t N = lm_head_.N(), K = lm_head_.K();
     STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
+    const int64_t rows = (int64_t)draft_tokens.size();
     STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
     STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
     STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
     STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
 
-    if (lm_head_.bits == 4) {  // already Q4: the draft reads the loaded head (a row prefix of it)
+    for (int64_t i = 0; i < rows; ++i) {
+        STRIX_CHECK(draft_tokens[(size_t)i] >= 0 && draft_tokens[(size_t)i] < N, fn, ": draft token index ", i,
+                    " = ", draft_tokens[(size_t)i], " outside [0, ", N, ")");
+    }
+
+    bool is_contiguous_prefix = (rows == N);
+    if (!is_contiguous_prefix) {
+        is_contiguous_prefix = true;
+        for (int64_t i = 0; i < rows; ++i) {
+            if (draft_tokens[(size_t)i] != (int32_t)i) {
+                is_contiguous_prefix = false;
+                break;
+            }
+        }
+    }
+
+    if (lm_head_.bits == 4 && is_contiguous_prefix) {  // already Q4: the draft reads the loaded head (a row prefix of it)
         STRIX_CHECK(lm_head_.q4.G == G, fn, ": the LM head is Q4 with group size ", lm_head_.q4.G, ", asked for ", G,
                     " - a Q4 head is used as loaded, not requantized");
         draft_head_ = lm_head_;
         draft_head_.q4.N = rows;
         return;
     }
-    STRIX_CHECK(lm_head_.bits == 8, fn, ": the LM head has ", lm_head_.bits, " bits, expected 8 (requantized) or 4 (used ",
-                "as loaded)");
+    STRIX_CHECK(lm_head_.bits == 8, fn, ": the LM head has ", lm_head_.bits, " bits, expected 8 (requantized) or 4 (used as loaded)");
 
-    // Read the Q8 rows back (row-major: the first `rows` rows are a prefix of each array).
     const Q8DeviceView &v = lm_head_.q8;
     STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is ",
                 "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
@@ -254,22 +275,48 @@ void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
     q8.q.resize((size_t)(rows * K));
     q8.scale.resize((size_t)(rows * (K / v.G)));
     q8.minv.resize(q8.scale.size());
-    STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q8.q.size(),
-                    " bytes of Q8 codes");
-    STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
-                    q8.scale.size(), " Q8 scales");
-    STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
-                    q8.minv.size(), " Q8 mins");
+
+    const int64_t scales_per_row = K / v.G;
+    if (is_contiguous_prefix) {
+        STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q8.q.size(),
+                        " bytes of Q8 codes");
+        STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q8.scale.size(), " Q8 scales");
+        STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q8.minv.size(), " Q8 mins");
+    } else {
+        std::vector<int8_t> all_q((size_t)(N * K));
+        std::vector<uint16_t> all_scale((size_t)(N * scales_per_row));
+        std::vector<uint16_t> all_minv(all_scale.size());
+        STRIX_HIP_CHECK(hipMemcpy(all_q.data(), v.q, all_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q8 codes");
+        STRIX_HIP_CHECK(hipMemcpy(all_scale.data(), v.scale, all_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 scales");
+        STRIX_HIP_CHECK(hipMemcpy(all_minv.data(), v.minv, all_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 mins");
+
+        for (int64_t r = 0; r < rows; ++r) {
+            const int32_t tid = draft_tokens[(size_t)r];
+            std::memcpy(q8.q.data() + r * K, all_q.data() + (size_t)tid * K, (size_t)K);
+            std::memcpy(q8.scale.data() + r * scales_per_row, all_scale.data() + (size_t)tid * scales_per_row, (size_t)scales_per_row * 2);
+            std::memcpy(q8.minv.data() + r * scales_per_row, all_minv.data() + (size_t)tid * scales_per_row, (size_t)scales_per_row * 2);
+        }
+    }
 
     const Q4Weight q4 = quantize_q4_from_q8(q8, G, threads);
     draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
     draft_q4_bytes_ = q4.bytes();
     draft_head_ = qweight(draft_q4_->view());
+    if (!is_contiguous_prefix) {
+        draft_tokens_ = draft_tokens;
+    }
     STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
                 draft_head_.K(), "], expected [", rows, ", ", K, "]");
 }
 
-int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab) {
+int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab,
+                                   const std::vector<int32_t> &draft_tokens) {
+    if (!draft_tokens.empty()) {
+        model.make_draft_head_q4(draft_tokens, /*G=*/64, /*threads=*/16);
+        return (int64_t)draft_tokens.size();
+    }
     const int64_t vocab = model.dims().vocab;
     STRIX_CHECK(mtp_vocab >= 0 && mtp_vocab <= vocab, "make_served_mtp_draft_head: mtp_vocab ", mtp_vocab, ", expected 0..",
                 vocab, " (0 = the whole vocabulary)");
@@ -3636,7 +3683,8 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     STRIX_CHECK(p.nan || (p.best >= 0 && p.best < mtp_vocab_), "Qwen4ExpSession::forward_mtp_top2: pick ", p.best,
                 " outside the draft vocabulary [0, ", mtp_vocab_, ")");
     mtp_done(seq, step);
-    return {p.best, p.best_v, p.second_v, p.nan != 0};
+    const int32_t picked_token = m_.has_draft_tokens() ? m_.draft_tokens()[(size_t)p.best] : p.best;
+    return {picked_token, p.best_v, p.second_v, p.nan != 0};
 }
 
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {

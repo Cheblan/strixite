@@ -39,6 +39,14 @@ public:
     int32_t byte_token(uint8_t b) const { return byte_id_[b]; }  // the single-byte token of b
     bool is_added(int32_t id) const { return id >= n_vocab_; }
 
+    // Builds a sparse draft vocabulary of target_size (e.g. 65,536) containing:
+    // 1. All added / special tokens (e.g. <|im_start|>, <|im_end|>)
+    // 2. All single-byte tokens (0..255)
+    // 3. All Cyrillic (Russian/Ukrainian/etc.) and Greek tokens across the entire vocabulary
+    // 4. Frequent tokens from the base vocabulary in BPE frequency order (ASCII, code, English, math, CJK)
+    // The returned vector of token IDs is sorted ascending and has size == min(target_size, total_vocab).
+    std::vector<int32_t> build_sparse_draft_vocab(int64_t target_size, int64_t total_vocab) const;
+
     // The pre-tokenizer's split of NFC-normalized code points into [begin, end) spans (exposed for tests).
     static std::vector<std::pair<size_t, size_t>> pretokenize(const std::vector<uint32_t> &cps);
 

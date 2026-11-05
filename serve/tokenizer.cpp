@@ -332,4 +332,69 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, const std::vector<
     return out;
 }
 
+std::vector<int32_t> Tokenizer::build_sparse_draft_vocab(int64_t target_size, int64_t total_vocab) const {
+    const int32_t N = size();
+    const int64_t max_vocab = total_vocab > 0 ? total_vocab : (int64_t)N;
+    const int64_t cap = std::min<int64_t>(target_size, max_vocab);
+    STRIX_CHECK(cap >= 1, "build_sparse_draft_vocab: target_size ", target_size, " must be >= 1");
+
+    std::vector<bool> in_vocab((size_t)max_vocab, false);
+    std::vector<int32_t> draft_tokens;
+    draft_tokens.reserve((size_t)cap);
+
+    auto add_token = [&](int32_t id) {
+        if (id >= 0 && id < max_vocab && !in_vocab[(size_t)id] && (int64_t)draft_tokens.size() < cap) {
+            in_vocab[(size_t)id] = true;
+            draft_tokens.push_back(id);
+        }
+    };
+
+    // 1. Added / special tokens (e.g. <|im_start|>, <|im_end|>)
+    for (int32_t id = n_vocab_; id < N; ++id) {
+        add_token(id);
+    }
+
+    // 2. Single-byte tokens
+    for (int b = 0; b < 256; ++b) {
+        add_token(byte_id_[b]);
+    }
+
+    // Helper to detect Cyrillic and Greek UTF-8 bytes
+    auto is_cyrillic_or_greek = [](std::string_view raw) {
+        const size_t len = raw.size();
+        for (size_t i = 0; i + 1 < len; ++i) {
+            const unsigned char b0 = (unsigned char)raw[i];
+            const unsigned char b1 = (unsigned char)raw[i + 1];
+            // Cyrillic U+0400..U+04FF (D0..D3 80..BF) and Cyrillic Supplement U+0500..U+052F (D4 80..AF)
+            if ((b0 == 0xD0 || b0 == 0xD1 || b0 == 0xD2 || b0 == 0xD3 || (b0 == 0xD4 && b1 <= 0xAF)) &&
+                (b1 >= 0x80 && b1 <= 0xBF)) {
+                return true;
+            }
+            // Greek U+0370..U+03FF (CD B0..BF, CE..CF 80..BF)
+            if (((b0 == 0xCD && b1 >= 0xB0 && b1 <= 0xBF) || ((b0 == 0xCE || b0 == 0xCF) && b1 >= 0x80 && b1 <= 0xBF))) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // 3. Cyrillic and Greek tokens across the whole vocabulary
+    for (int32_t id = 0; id < N; ++id) {
+        if ((int64_t)draft_tokens.size() >= cap) break;
+        if (!in_vocab[(size_t)id] && is_cyrillic_or_greek(bytes_[(size_t)id])) {
+            add_token(id);
+        }
+    }
+
+    // 4. Fill remaining capacity from sequential token IDs (BPE frequency order: English, code, punctuation, numbers, math, CJK)
+    for (int32_t id = 0; id < max_vocab; ++id) {
+        if ((int64_t)draft_tokens.size() >= cap) break;
+        add_token(id);
+    }
+
+    // Sort draft_tokens in ascending order of token ID for sequential memory access
+    std::sort(draft_tokens.begin(), draft_tokens.end());
+    return draft_tokens;
+}
+
 }  // namespace strix

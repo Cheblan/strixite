@@ -254,6 +254,9 @@ target_link_libraries(strix_serve_model PUBLIC strix_serve strix_model)
 add_executable(check_stream_calls tools/check_stream_calls.cpp)
 target_link_libraries(check_stream_calls PRIVATE strix_serve)
 
+add_executable(test_sparse_mtp_vocab tools/test_sparse_mtp_vocab.cpp)
+target_link_libraries(test_sparse_mtp_vocab PRIVATE strix_serve)
+
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
