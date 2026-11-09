@@ -263,6 +263,9 @@ target_link_libraries(test_split_invariance PRIVATE strix_serve_model)
 add_executable(test_vision_batchable_edge_cases tools/test_vision_batchable_edge_cases.cpp)
 target_link_libraries(test_vision_batchable_edge_cases PRIVATE strix_serve_model)
 
+add_executable(compare_slot_concurrency tools/compare_slot_concurrency.cpp)
+target_link_libraries(compare_slot_concurrency PRIVATE strix_serve_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
