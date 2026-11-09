@@ -4022,7 +4022,7 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_top2_batch(co
         const int64_t rope_p = mk_jobs_.pos3 == nullptr ? p + sq.rope_delta : p;
         uint8_t *kc = sq.k_cache_mtp.get(), *vc = sq.v_cache_mtp.get();
         const bool qsa_layer = p + 1 > D.dense_key_limit();
-        uint8_t *proj_b = at(proj_, b * D.astride);
+        uint8_t *proj_b = proj_.get() + (size_t)(b * D.astride) * e;
 
         const kernels::NormRopeJob nr[4] = {
             {proj_b, D.astride, 2 * hd, proj_b, D.astride, 2 * hd, D.hq, hd, l.q_norm},
