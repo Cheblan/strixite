@@ -717,7 +717,7 @@ private:
 
     LmBackend &be_;
     const Tokenizer &tok_;
-    const Options options_;
+    Options options_;
     PromptCache *cache_;
     const int64_t capacity_;
     const int32_t im_start_, im_end_, eot_;
