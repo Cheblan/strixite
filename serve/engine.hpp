@@ -570,7 +570,7 @@ public:
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         bool mtp_dynamic = false; // dynamically adjust MTP draft depth based on acceptance rate
-        int64_t mtp_draft_min = 2; // minimum draft depth in dynamic mode
+        int64_t mtp_draft_min = 4; // minimum draft depth in dynamic mode
         int64_t mtp_draft_max = 12; // maximum draft depth in dynamic mode
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
