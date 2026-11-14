@@ -734,7 +734,7 @@ public:
 
     // Runs ids at positions pos()..pos()+T-1, advances pos(), returns the last n_logits tokens' logits
     // [n_logits, vocab] FP32. If it throws, the session refuses further calls until reset().
-    static constexpr int64_t kMaxLogits = 32;
+    static constexpr int64_t kMaxLogits = 16;
     // Forwards of at least this many tokens run the MoE experts grouped by expert (each expert's weights read
     // once per tile, kernels/moe_grouped); shorter ones (decode, MTP verify) the per-slot kernels (grouped measured
     // slower there: +5 ms a 2-token verify). Swept on the served layout (prefill): T = 16 124 vs 99 t/s, 32 136 vs 131, 64 142 vs 154, 128 141 vs 166

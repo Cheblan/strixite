@@ -68,12 +68,12 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
                 " tokens, expected </think> first and only once, and room for it + <tool_call> in a backend chunk of ",
                 backend.max_chunk());
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
-    STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 31, "Engine: mtp_draft ", options_.mtp_draft,
-                ", expected 1..31");
+    STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
+                ", expected 1..15");
     STRIX_CHECK(options_.mtp_draft_min >= 1 && options_.mtp_draft_min <= options_.mtp_draft_max,
                 "Engine: mtp_draft_min must be <= mtp_draft_max");
-    STRIX_CHECK(options_.mtp_draft_max >= 1 && options_.mtp_draft_max <= 31,
-                "Engine: mtp_draft_max must be <= 31");
+    STRIX_CHECK(options_.mtp_draft_max >= 1 && options_.mtp_draft_max <= 15,
+                "Engine: mtp_draft_max must be <= 15");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
