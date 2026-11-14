@@ -569,6 +569,9 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        bool mtp_dynamic = false; // dynamically adjust MTP draft depth based on acceptance rate
+        int64_t mtp_draft_min = 2; // minimum draft depth in dynamic mode
+        int64_t mtp_draft_max = 10; // maximum draft depth in dynamic mode
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -635,6 +638,15 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    int64_t mtp_draft() const { return options_.mtp_draft; }
+    bool mtp_dynamic() const { return options_.mtp_dynamic; }
+    int64_t mtp_draft_min() const { return options_.mtp_draft_min; }
+    int64_t mtp_draft_max() const { return options_.mtp_draft_max; }
+    void set_mtp_margin(float m) { options_.mtp_margin = m; }
+    void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
+    void set_mtp_dynamic(bool d) { options_.mtp_dynamic = d; }
+    void set_mtp_draft_min(int64_t m) { options_.mtp_draft_min = m; }
+    void set_mtp_draft_max(int64_t m) { options_.mtp_draft_max = m; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }

@@ -767,6 +767,27 @@ void HttpServer::routes() {
         res.set_content(b.dump(), "application/json");
     });
 
+    auto handle_set_mtp = [this](const httplib::Request &req, httplib::Response &res) {
+        if (req.has_param("margin")) engine_.set_mtp_margin(std::stof(req.get_param_value("margin")));
+        if (req.has_param("draft")) engine_.set_mtp_draft(std::stoll(req.get_param_value("draft")));
+        if (req.has_param("dynamic")) {
+            const std::string v = req.get_param_value("dynamic");
+            engine_.set_mtp_dynamic(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("draft_min")) engine_.set_mtp_draft_min(std::stoll(req.get_param_value("draft_min")));
+        if (req.has_param("draft_max")) engine_.set_mtp_draft_max(std::stoll(req.get_param_value("draft_max")));
+        json::Value b = json::Value::object();
+        b.set("status", json::Value::string("ok"));
+        b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
+        b.set("mtp_draft", json::Value::integer(engine_.mtp_draft()));
+        b.set("mtp_dynamic", json::Value::boolean(engine_.mtp_dynamic()));
+        b.set("mtp_draft_min", json::Value::integer(engine_.mtp_draft_min()));
+        b.set("mtp_draft_max", json::Value::integer(engine_.mtp_draft_max()));
+        res.set_content(b.dump(), "application/json");
+    };
+    svr_->Get("/set_mtp", handle_set_mtp);
+    svr_->Post("/set_mtp", handle_set_mtp);
+
     svr_->Get("/metrics", [this](const httplib::Request &, httplib::Response &res) {
         const EngineStats s = engine_.stats();
         std::string m;

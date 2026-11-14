@@ -349,6 +349,9 @@ int run(int argc, char **argv) {
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
     eng_opts.mtp_draft = mtp_draft;
+    eng_opts.mtp_dynamic = settings.on("mtp-dynamic");
+    eng_opts.mtp_draft_min = settings.integer("mtp-draft-min");
+    eng_opts.mtp_draft_max = settings.integer("mtp-draft-max");
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;
     eng_opts.think_nudge_wording = nudge_wording;
