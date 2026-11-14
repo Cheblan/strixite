@@ -71,7 +71,7 @@ PROMPTS = [
     }
 ]
 
-def set_mtp_config(dynamic: bool, draft: int, draft_min: int = 2, draft_max: int = 10):
+def set_mtp_config(dynamic: bool, draft: int, draft_min: int = 2, draft_max: int = 16):
     params = {
         "dynamic": "1" if dynamic else "0",
         "draft": str(draft),
@@ -163,9 +163,9 @@ def main():
         print(f" {res['tokens']} tok in {res['time_s']:.2f}s ({res['tok_per_sec']:.2f} tok/s)")
         baseline_results.append(res)
     
-    # 3. Run Adaptive Dynamic MTP (2..10)
-    print("\n[3/4] Running Adaptive Dynamic MTP (draft_min=2, draft_max=10)...")
-    set_mtp_config(dynamic=True, draft=7, draft_min=2, draft_max=10)
+    # 3. Run Adaptive Dynamic MTP (2..16)
+    print("\n[3/4] Running Adaptive Dynamic MTP (draft_min=2, draft_max=16)...")
+    set_mtp_config(dynamic=True, draft=7, draft_min=2, draft_max=16)
     adaptive_results = []
     for idx, task in enumerate(PROMPTS):
         print(f"  Task {idx+1}/5: {task['domain']}...", end="", flush=True)
