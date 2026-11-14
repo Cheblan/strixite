@@ -245,8 +245,10 @@ Just as useful, and probably more honest:
 - **Zero-copy logits** (the GPU writing straight into host memory): +1.8% slower.
 - **Adaptive draft count**: code wants more drafts, prose fewer, but the confidence gate already captures most of it -
   not worth the complexity.
-- **Prompt-lookup drafting** (copying likely continuations from the context): measured on real agent traffic, too
-  little gain on top of the draft head.
+- **Prompt-lookup drafting**: naive, unconditional context drafting (PLD-first) actually makes generation 14-20% slower
+  because false-positive drafts force heavy MoE verification passes that get rejected. However, **neural-gated hybrid PLD**
+  (letting the draft head confirm token 0 before copying from context) saves DRAM bandwidth reading draft weights, giving
+  +7% to +10% speedup on structured outputs ([detailed experiments and memory bandwidth breakdown](speculative-decoding-experiments.md)).
 - **Non-uniform 4-bit codebooks and 2/3-bit experts**: lower weight error, but *worse* model accuracy - routing
   amplifies small errors.
 - **Symmetric int4**: lost accuracy at every group size.
