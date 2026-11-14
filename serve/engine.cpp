@@ -20,28 +20,28 @@ namespace strix {
 namespace {
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// Prompt Lookup Decoding (PLD): searches backwards in seq for an earlier occurrence of the n-gram
-// ending with (..., id, d). Returns the index of 'd' in seq (so seq[hit + 1] is the next token), or -1 if not found.
-int64_t pld_find_match(const std::vector<int32_t> &seq, int32_t id, int32_t d, int64_t n_match, int64_t max_lookback = 16384) {
+// Prompt Lookup Decoding (PLD-First): searches backwards in seq for an earlier occurrence of the n-gram
+// ending with (prefix..., id).
+// prefix has length (n_match - 1) immediately preceding 'id' at the end of seq.
+// Returns the index in seq where 'id' appears in the earlier match (so seq[hit + 1] is the next token),
+// or -1 if not found.
+int64_t pld_find_prefix_match(const std::vector<int32_t> &seq, int32_t id, int64_t n_match, int64_t max_lookback = 32768) {
     const int64_t sz = (int64_t)seq.size();
-    if (sz < 2) return -1;
-    if (n_match <= 2) {
+    const int64_t prefix_len = n_match - 1;
+    if (sz < prefix_len) return -1;
+    if (prefix_len == 0) {
         const int64_t floor_i = std::max<int64_t>(0, sz - 1 - max_lookback);
-        for (int64_t i = sz - 2; i >= floor_i; --i) {
-            if (seq[(size_t)i] == id && seq[(size_t)(i + 1)] == d) {
-                return i + 1;
-            }
+        for (int64_t i = sz - 1; i >= floor_i; --i) {
+            if (seq[(size_t)i] == id) return i;
         }
         return -1;
     }
-    const int64_t prefix_len = n_match - 2;
-    if (sz <= prefix_len + 1) return -1;
-    const int32_t *prefix = &seq[(size_t)(sz - 1 - prefix_len)];
-    const int64_t floor_i = std::max<int64_t>(0, sz - 1 - prefix_len - max_lookback);
-    for (int64_t i = sz - 2 - prefix_len; i >= floor_i; --i) {
-        if (seq[(size_t)(i + prefix_len)] == id && seq[(size_t)(i + prefix_len + 1)] == d) {
-            if (std::equal(prefix, prefix + prefix_len, &seq[(size_t)i])) {
-                return i + prefix_len + 1;
+    const int32_t *cur_prefix = &seq[(size_t)(sz - prefix_len)];
+    const int64_t floor_i = std::max<int64_t>(0, sz - prefix_len - max_lookback);
+    for (int64_t i = sz - 1 - prefix_len; i >= floor_i; --i) {
+        if (seq[(size_t)(i + prefix_len)] == id) {
+            if (std::equal(cur_prefix, cur_prefix + prefix_len, &seq[(size_t)i])) {
+                return i + prefix_len;
             }
         }
     }
@@ -1564,46 +1564,54 @@ void Engine::run(Job &job, Slot &sl) {
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
                 int64_t pld_drafted = 0;
                 bool pld_active = false;
-                for (int64_t step = 0; step < steps; ++step) {
-                    const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
-                    STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
-                    const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
-                    // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
-                    if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
-                    // A draft the response format refuses would be rejected anyway: don't verify it.
-                    if (so) {
-                        if (!so->allows(draft_at, d)) break;
-                        draft_at = so->after(draft_at, d);
-                    }
-                    ids.push_back(d);
-                    if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
 
-                    if (options_.pld && step == 0) {
-                        int64_t hit = pld_find_match(sl.seq, id, d, options_.pld_n);
-                        if (hit >= 0 && hit + 1 < (int64_t)sl.seq.size()) {
+                // PLD-First: check for context n-gram match BEFORE touching the GPU MTP head.
+                // If found, draft candidates directly from CPU RAM in 1 us, completely bypassing
+                // all GPU MTP forward passes and CPU-GPU synchronization stalls!
+                if (options_.pld) {
+                    int64_t hit = pld_find_prefix_match(sl.seq, id, options_.pld_n);
+                    if (hit >= 0 && hit + 1 < (int64_t)sl.seq.size()) {
+                        while ((int64_t)ids.size() - 1 < steps && pld_drafted < options_.pld_k && hit + 1 < (int64_t)sl.seq.size()) {
+                            int32_t cand = sl.seq[(size_t)(++hit)];
+                            if (cand == im_end_ || cand == eot_) break;
+                            if (cand == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
+                            if (so) {
+                                if (!so->allows(draft_at, cand)) break;
+                                draft_at = so->after(draft_at, cand);
+                            }
+                            ids.push_back(cand);
+                            ++pld_drafted;
+                            if ((int64_t)ids.size() - 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);
+                        }
+                        if (pld_drafted > 0) {
                             pld_active = true;
                             ++res.pld_rounds;
-                            while ((int64_t)ids.size() - 1 < steps && pld_drafted < options_.pld_k && hit + 1 < (int64_t)sl.seq.size()) {
-                                int32_t cand = sl.seq[(size_t)(++hit)];
-                                if (cand == im_end_ || cand == eot_) break;
-                                if (cand == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
-                                if (so) {
-                                    if (!so->allows(draft_at, cand)) break;
-                                    draft_at = so->after(draft_at, cand);
-                                }
-                                ids.push_back(cand);
-                                ++pld_drafted;
-                                if ((int64_t)ids.size() - 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);
-                            }
                             res.pld_drafted_tokens += pld_drafted;
-                            break;  // Draft chain filled from prompt lookup; skip subsequent GPU MTP forwards!
                         }
+                    }
+                }
+
+                // Fallback: run neural MTP head on GPU only when context lookup found no candidate
+                if (!pld_active) {
+                    for (int64_t step = 0; step < steps; ++step) {
+                        const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
+                        STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
+                        const int32_t d = t.best;
+                        if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                        // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
+                        if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
+                        // A draft the response format refuses would be rejected anyway: don't verify it.
+                        if (so) {
+                            if (!so->allows(draft_at, d)) break;
+                            draft_at = so->after(draft_at, d);
+                        }
+                        ids.push_back(d);
+                        if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                     }
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {
-                    res.mtp_drafted_tokens += k;
+                    if (!pld_active) res.mtp_drafted_tokens += k;
                     ++res.decode_forwards;
                     LogitRows ml = sl.be->forward_verify_rows(
                         ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
@@ -1617,7 +1625,9 @@ void Engine::run(Job &job, Slot &sl) {
                         guard(ml, j);
                         v = sampler.sample(ml, j);
                         if (v != ids[(size_t)j + 1]) break;
-                        ++res.mtp_accepted_tokens, ++res.completion_tokens;
+                        if (pld_active) ++res.pld_accepted_tokens;
+                        else ++res.mtp_accepted_tokens;
+                        ++res.completion_tokens;
                         if (so) so->feed(v);
                         const bool st = parser.feed(v, events);
                         watch_tok(v);
@@ -1636,9 +1646,6 @@ void Engine::run(Job &job, Slot &sl) {
                             cut = true;
                             break;
                         }
-                    }
-                    if (pld_active) {
-                        res.pld_accepted_tokens += std::max<int64_t>(0, std::min<int64_t>(j - 1, pld_drafted));
                     }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
                         sl.be->keep_verify_prefix(ids, j + 1);
