@@ -3715,7 +3715,7 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
 
 std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_chain(int seq, int32_t start_token, int64_t steps) {
     if (steps <= 0) return {};
-    const int64_t max_steps = std::min<int64_t>(steps, kMtpMaxDraft);
+    const int64_t max_steps = std::min<int64_t>(steps, kMaxLogits - 1);
     const size_t needed_bytes = (size_t)max_steps * sizeof(kernels::MtpPick);
     if (mtp_pick_.size() < needed_bytes) {
         mtp_pick_ = DeviceBuffer<uint8_t>(needed_bytes, "MTP pick chain");
