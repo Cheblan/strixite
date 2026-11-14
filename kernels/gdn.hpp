@@ -111,4 +111,13 @@ void delta_rule(const void *qkv, const float *beta, const float *g, const DeltaR
                 float *state_out, bool reset_state, void *out, Act act, hipStream_t stream,
                 DeltaRulePath path = DeltaRulePath::Auto, DrPrecision precision = DrPrecision::Exact);
 
+// Streamed fused delta rule + gated RMSNorm for single-token decode (T=1).
+// Fuses the recurrent state update, S^T q output, and gated RMSNorm into a single
+// streamed kernel, eliminating intermediate DRAM writes and kernel launch overhead.
+void delta_rule_rmsnorm_fused(const void *qkv, const float *beta, const float *g,
+                             const float *state_in, float *state_out,
+                             const void *z_gate, const float *gdn_norm, float eps,
+                             void *gnorm_out, int64_t Hk, int64_t Hv, int64_t conv_c,
+                             int64_t gz, int64_t z_stride, Act act, hipStream_t stream);
+
 }  // namespace strix::kernels

@@ -989,4 +989,160 @@ void delta_rule(const void *qkv, const float *beta, const float *g, const DeltaR
                            " Hv=", s.Hv);
 }
 
+// Streamed Fused Delta-Rule + Gated RMSNorm Kernel for single-token decode (T=1).
+// Grid: Hv blocks (one block per value head)
+// Block: 128 threads (4 waves of 32 threads)
+// Thread c in [0..127] handles column c of head h.
+template <typename T>
+__global__ void __launch_bounds__(128)
+    streamed_fused_delta_rmsnorm_kernel(const T *qkv,
+                                        const float *beta,
+                                        const float *g,
+                                        const float *state_in,
+                                        float *state_out,
+                                        const T *z_gate,
+                                        const float *gdn_norm,
+                                        float eps,
+                                        T *gnorm_out,
+                                        int64_t Hk,
+                                        int64_t Hv,
+                                        int64_t conv_c,
+                                        int64_t gz,
+                                        int64_t z_stride) {
+    constexpr int D = (int)kGdnHeadDim; // 128
+    const int h = blockIdx.x; // value head 0..Hv-1
+    const int kh = h / (Hv / Hk); // key head
+    const int c = threadIdx.x; // column 0..127
+    const int lane = c % warpSize;
+    const int wave = c / warpSize;
+
+    __shared__ float lds_q[D];
+    __shared__ float lds_k[D];
+    __shared__ float lds_qk_dot;
+    __shared__ float lds_ss[4];
+    __shared__ float lds_inv_rms;
+
+    // 1. Load and L2-normalize q and k of key head kh
+    int64_t q_off = (int64_t)kh * D + c;
+    int64_t k_off = (int64_t)Hk * D + (int64_t)kh * D + c;
+    float q_val = load(qkv, q_off);
+    float k_val = load(qkv, k_off);
+
+    // Compute sum of squares for q and k
+    float sq_q = q_val * q_val;
+    float sq_k = k_val * k_val;
+#pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+        sq_q += __shfl_xor(sq_q, off);
+        sq_k += __shfl_xor(sq_k, off);
+    }
+    if (lane == 0) lds_ss[wave] = sq_q;
+    __syncthreads();
+
+    float tot_q = lds_ss[0] + lds_ss[1] + lds_ss[2] + lds_ss[3];
+    constexpr float q_scale = 0.08838834764831845f; // rsqrtf(128.0f)
+    float qn = q_val * (rsqrtf(tot_q + 1e-6f) * q_scale);
+    lds_q[c] = qn;
+    __syncthreads();
+
+    if (lane == 0) lds_ss[wave] = sq_k;
+    __syncthreads();
+    float tot_k = lds_ss[0] + lds_ss[1] + lds_ss[2] + lds_ss[3];
+    float kn = k_val * rsqrtf(tot_k + 1e-6f);
+    lds_k[c] = kn;
+    __syncthreads();
+
+    // Compute scalar dot product <q, k>
+    float qk_prod = qn * kn;
+#pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) qk_prod += __shfl_xor(qk_prod, off);
+    if (lane == 0) lds_ss[wave] = qk_prod;
+    __syncthreads();
+    if (c == 0) {
+        lds_qk_dot = lds_ss[0] + lds_ss[1] + lds_ss[2] + lds_ss[3];
+    }
+    __syncthreads();
+
+    const float q_dot_k = lds_qk_dot;
+    const float decay = expf(g[h]);
+    const float b_val = beta[h];
+
+    // Load v_c
+    int64_t v_off = 2 * (int64_t)Hk * D + (int64_t)h * D + c;
+    float v_c = load(qkv, v_off);
+
+    // 2. Stream through column c of state matrix S:
+    // S_dot_k = sum_r S[r, c] * k[r]
+    // S_dot_q = sum_r S[r, c] * q[r]
+    float acc_k = 0.0f;
+    float acc_q = 0.0f;
+    const int64_t col_base = (int64_t)h * D * D + c;
+
+#pragma unroll 4
+    for (int r = 0; r < D; ++r) {
+        float s = state_in[col_base + r * D];
+        acc_k = fmaf(s, lds_k[r], acc_k);
+        acc_q = fmaf(s, lds_q[r], acc_q);
+    }
+
+    // 3. One-pass recurrence:
+    float kv_c = decay * acc_k;
+    float delta_c = b_val * (v_c - kv_c);
+    float core_f32 = decay * acc_q + delta_c * q_dot_k;
+    float core_c = bf16_bits_to_f32(f32_to_bf16_bits(core_f32));
+
+    // 4. Write back updated state S'[r, c] = decay * S[r, c] + k[r] * delta_c:
+#pragma unroll 4
+    for (int r = 0; r < D; ++r) {
+        float s = state_in[col_base + r * D];
+        float s_new = fmaf(lds_k[r], delta_c, decay * s);
+        state_out[col_base + r * D] = s_new;
+    }
+
+    // 5. Gated RMSNorm:
+    float sq_core = core_c * core_c;
+#pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1) sq_core += __shfl_xor(sq_core, off);
+    if (lane == 0) lds_ss[wave] = sq_core;
+    __syncthreads();
+
+    if (c == 0) {
+        float tot_core = lds_ss[0] + lds_ss[1] + lds_ss[2] + lds_ss[3];
+        lds_inv_rms = rsqrtf(tot_core / (float)D + eps);
+    }
+    __syncthreads();
+
+    // Final RMSNorm + Sigmoid Gate matching rmsnorm_gated
+    float inv_rms = lds_inv_rms;
+    float n = bf16_bits_to_f32(f32_to_bf16_bits(core_c * inv_rms)); // round_act<uint16_t>
+    float w = gdn_norm[c];
+    float z = load(z_gate, (int64_t)h * D + c);
+    float den = 1.0f + expf(-z);
+    float out_val = (w * n) * (1.0f / den);
+
+    store(gnorm_out, (int64_t)h * D + c, out_val);
+}
+
+void delta_rule_rmsnorm_fused(const void *qkv, const float *beta, const float *g,
+                             const float *state_in, float *state_out,
+                             const void *z_gate, const float *gdn_norm, float eps,
+                             void *gnorm_out, int64_t Hk, int64_t Hv, int64_t conv_c,
+                             int64_t gz, int64_t z_stride, Act act, hipStream_t stream) {
+    STRIX_CHECK(qkv && beta && g && state_in && state_out && z_gate && gdn_norm && gnorm_out,
+                "delta_rule_rmsnorm_fused: null pointer");
+    dim3 grid((unsigned)Hv), block(128);
+    if (act == Act::BF16) {
+        streamed_fused_delta_rmsnorm_kernel<uint16_t><<<grid, block, 0, stream>>>(
+            static_cast<const uint16_t *>(qkv), beta, g, state_in, state_out,
+            static_cast<const uint16_t *>(z_gate), gdn_norm, eps,
+            static_cast<uint16_t *>(gnorm_out), Hk, Hv, conv_c, gz, z_stride);
+    } else {
+        streamed_fused_delta_rmsnorm_kernel<float><<<grid, block, 0, stream>>>(
+            static_cast<const float *>(qkv), beta, g, state_in, state_out,
+            static_cast<const float *>(z_gate), gdn_norm, eps,
+            static_cast<float *>(gnorm_out), Hk, Hv, conv_c, gz, z_stride);
+    }
+    STRIX_HIP_CHECK_LAUNCH("delta_rule_rmsnorm_fused");
+}
+
 }  // namespace strix::kernels

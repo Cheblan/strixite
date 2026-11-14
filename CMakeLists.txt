@@ -257,6 +257,10 @@ target_link_libraries(check_stream_calls PRIVATE strix_serve)
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)
 
+add_executable(test_fused_gdn tools/test_fused_gdn.cpp)
+strix_hip_sources(test_fused_gdn tools/test_fused_gdn.cpp)
+target_link_libraries(test_fused_gdn PRIVATE strix_kernels)
+
 
 
 # The tutorials live in the public repo only; built when present.
