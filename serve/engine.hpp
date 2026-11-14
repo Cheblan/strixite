@@ -474,6 +474,7 @@ struct GenerationResult {
     std::string error_type;     // finish_reason == error: empty (a server error, HTTP 500) or kErrorKvBudget (503)
     int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t pld_rounds = 0, pld_drafted_tokens = 0, pld_accepted_tokens = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};  // rollbacks by drafts j accepted before the rejected one (last: j >= 3)
     double queue_ms = 0, prompt_ms = 0, decode_ms = 0;
     // From the submit to the end of the prefill (the first token's logits are ready) / to the response's end.
@@ -518,6 +519,7 @@ struct EngineStats {
     int64_t requests_ok = 0, requests_error = 0, requests_cancelled = 0;
     int64_t prompt_tokens = 0, cached_tokens = 0, prefill_tokens = 0, generated_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t pld_rounds = 0, pld_drafted_tokens = 0, pld_accepted_tokens = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};
     int64_t think_nudges = 0;  // thinking nudges fed
     int64_t think_end_blocked = 0;  // GenerationResult::think_end_blocked, summed
@@ -555,6 +557,9 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        bool pld = false;         // prompt-lookup drafting (PLD) beside the MTP head
+        int64_t pld_n = 3;        // matching n-gram length (including the draft token that opens the chain)
+        int64_t pld_k = 4;        // max draft continuation tokens from context lookup
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -622,8 +627,14 @@ public:
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
     int64_t mtp_draft() const { return options_.mtp_draft; }
+    bool pld() const { return options_.pld; }
+    int64_t pld_n() const { return options_.pld_n; }
+    int64_t pld_k() const { return options_.pld_k; }
     void set_mtp_margin(float m) { options_.mtp_margin = m; }
     void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
+    void set_pld(bool p) { options_.pld = p; }
+    void set_pld_n(int64_t n) { options_.pld_n = n; }
+    void set_pld_k(int64_t k) { options_.pld_k = k; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
