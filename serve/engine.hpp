@@ -621,6 +621,9 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    int64_t mtp_draft() const { return options_.mtp_draft; }
+    void set_mtp_margin(float m) { options_.mtp_margin = m; }
+    void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
