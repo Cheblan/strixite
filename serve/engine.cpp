@@ -98,6 +98,10 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
+    STRIX_CHECK(options_.mtp_draft_min >= 1 && options_.mtp_draft_min <= options_.mtp_draft_max,
+                "Engine: mtp_draft_min must be <= mtp_draft_max");
+    STRIX_CHECK(options_.mtp_draft_max >= 1 && options_.mtp_draft_max <= 15,
+                "Engine: mtp_draft_max must be <= 15");
     STRIX_CHECK(options_.pld_n >= 2 && options_.pld_n <= 16, "Engine: pld_n ", options_.pld_n, ", expected 2..16");
     STRIX_CHECK(options_.pld_k >= 1 && options_.pld_k <= 15, "Engine: pld_k ", options_.pld_k, ", expected 1..15");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
@@ -1437,6 +1441,8 @@ void Engine::run(Job &job, Slot &sl) {
         // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
         // forward of its own (strixite PR #1).
         int32_t carry = -1;
+        int64_t dynamic_draft = options_.mtp_draft;
+        int64_t draft_streak = 0;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1551,7 +1557,7 @@ void Engine::run(Job &job, Slot &sl) {
                 // Several slots decoding: at most as many drafts as let every slot's verify run fit one batched
                 // forward (max_verify_rows / decoding slots - 1: 2 slots 7, 3 slots 4, 4 slots 3). Past the budget the
                 // arbiter splits the batch in two forwards, and each slot's longer chain runs alone on the GPU.
-                int64_t draft_max = options_.mtp_draft;
+                int64_t draft_max = options_.mtp_dynamic ? dynamic_draft : options_.mtp_draft;
                 if (arbiter_) {
                     const int64_t n = std::max<int64_t>(1, arbiter_->decoding_count());
                     draft_max = std::min(draft_max, std::max<int64_t>(1, arbiter_->backend().max_verify_rows() / n - 1));
@@ -1645,6 +1651,20 @@ void Engine::run(Job &job, Slot &sl) {
                     }
                     if (pld_active) {
                         res.pld_accepted_tokens += std::max<int64_t>(0, std::min<int64_t>(j - 1, pld_drafted));
+                    }
+                    if (options_.mtp_dynamic) {
+                        if (j == k && k == steps) {
+                            ++draft_streak;
+                            const int64_t inc = (draft_streak >= 2) ? 2 : 1;
+                            dynamic_draft = std::min(options_.mtp_draft_max, dynamic_draft + inc);
+                        } else {
+                            draft_streak = 0;
+                            if (j <= 1 && k >= 3) {
+                                dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 2);
+                            } else if (j * 2 < k) {
+                                dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 1);
+                            }
+                        }
                     }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
                         sl.be->keep_verify_prefix(ids, j + 1);

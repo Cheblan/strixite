@@ -324,9 +324,10 @@ Parse all 10 trace log lines above into a Markdown table with columns: Timestamp
     }
 ]
 
-def set_engine_params(base_url, margin, draft, pld, pld_n=3, pld_k=6):
+def set_engine_params(base_url, margin=1.5, draft=7, pld=False, pld_n=3, pld_k=6, dynamic=False, draft_min=2, draft_max=12):
     pld_param = "1" if pld else "0"
-    url = f"{base_url}/set_mtp?margin={margin}&draft={draft}&pld={pld_param}&pld_n={pld_n}&pld_k={pld_k}"
+    dyn_param = "1" if dynamic else "0"
+    url = f"{base_url}/set_mtp?margin={margin}&draft={draft}&pld={pld_param}&pld_n={pld_n}&pld_k={pld_k}&dynamic={dyn_param}&draft_min={draft_min}&draft_max={draft_max}"
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
@@ -417,51 +418,51 @@ def main():
     out_file = "/home/cheblan/heavy_context_benchmark_results.json"
     
     print("===============================================================================================")
-    print("         HEAVY CONTEXT / REAL-WORLD CODE & CONFIG BENCHMARK: BASELINE vs HYBRID PLD")
+    print("      HEAVY CONTEXT / REAL-WORLD CODE BENCHMARK: STATIC MTP vs DYNAMIC ADAPTIVE MTP")
     print("===============================================================================================")
     sys.stdout.flush()
 
-    # 1. Baseline: MTP Draft 7, Margin 1.5, PLD OFF
-    print("\nSetting up Baseline: MTP Draft 7, Margin 1.5, PLD OFF...")
-    st = set_engine_params(base_url, margin=1.5, draft=7, pld=False)
+    # 1. Baseline: Static MTP Draft 7, Margin 1.5, Dynamic OFF, PLD OFF
+    print("\nSetting up Baseline: Static MTP Draft 7, Dynamic OFF, PLD OFF...")
+    st = set_engine_params(base_url, margin=1.5, draft=7, pld=False, dynamic=False)
     print(f"Server acknowledged: {st}")
-    baseline_summary = run_suite(base_url, pld_enabled=False, label="Baseline (MTP Draft 7, Margin 1.5, PLD OFF)", n_runs=2)
+    baseline_summary = run_suite(base_url, pld_enabled=False, label="Baseline (Static MTP Draft 7)", n_runs=2)
 
-    # 2. Hybrid PLD: MTP Draft 7, Margin 1.5, PLD ON (n=3, k=6)
-    print("\nSetting up Hybrid PLD: MTP Draft 7, Margin 1.5, PLD ON (n=3, k=6)...")
-    st = set_engine_params(base_url, margin=1.5, draft=7, pld=True, pld_n=3, pld_k=6)
+    # 2. Dynamic Adaptive MTP: initial=7, min=2, max=12, Margin 1.5, Dynamic ON, PLD OFF
+    print("\nSetting up Dynamic Adaptive MTP (min=2, max=12, initial=7, Dynamic ON)...")
+    st = set_engine_params(base_url, margin=1.5, draft=7, pld=False, dynamic=True, draft_min=2, draft_max=12)
     print(f"Server acknowledged: {st}")
-    pld_summary = run_suite(base_url, pld_enabled=True, label="Hybrid PLD (MTP Draft 7, Margin 1.5, PLD ON)", n_runs=2)
+    dyn_summary = run_suite(base_url, pld_enabled=False, label="Dynamic Adaptive MTP (Draft 2..12)", n_runs=2)
 
     # Comparison and Bit Identity Check
     print("\n\n" + "="*105)
-    print(f"{'Task / Domain':<50} | {'Baseline':<12} | {'Hybrid PLD':<14} | {'Speedup':<9} | {'Bit Identity'}")
+    print(f"{'Task / Domain':<50} | {'Static (7)':<12} | {'Dynamic (2..12)':<15} | {'Speedup':<9} | {'Bit Identity'}")
     print("-" * 105)
 
     base_avg_list = []
-    pld_avg_list = []
+    dyn_avg_list = []
 
     for p in BENCH_HEAVY_PROMPTS:
         name = p["name"]
         b = baseline_summary[name]
-        pl = pld_summary[name]
+        d = dyn_summary[name]
         b_speed = b["avg_tok_s"]
-        pl_speed = pl["avg_tok_s"]
-        delta = (pl_speed - b_speed) / b_speed * 100.0
+        d_speed = d["avg_tok_s"]
+        delta = (d_speed - b_speed) / b_speed * 100.0
         base_avg_list.append(b_speed)
-        pld_avg_list.append(pl_speed)
+        dyn_avg_list.append(d_speed)
         
-        # Check hash match between baseline and PLD
-        bit_exact = (b["hashes"][0] == pl["hashes"][0])
-        bit_str = "MATCH (Bit-Exact)" if bit_exact else f"MISMATCH ({b['hashes'][0][:8]} vs {pl['hashes'][0][:8]})"
+        # Check hash match between baseline and Dynamic MTP
+        bit_exact = (b["hashes"][0] == d["hashes"][0])
+        bit_str = "MATCH (Bit-Exact)" if bit_exact else f"MISMATCH ({b['hashes'][0][:8]} vs {d['hashes'][0][:8]})"
         
-        print(f"{name:<50} | {b_speed:5.2f} tok/s | {pl_speed:5.2f} tok/s  | {delta:+6.2f}% | {bit_str}")
+        print(f"{name:<50} | {b_speed:5.2f} tok/s | {d_speed:5.2f} tok/s   | {delta:+6.2f}% | {bit_str}")
 
     print("-" * 105)
     total_base = sum(base_avg_list) / len(base_avg_list)
-    total_pld = sum(pld_avg_list) / len(pld_avg_list)
-    total_delta = (total_pld - total_base) / total_base * 100.0
-    print(f"{'OVERALL AVERAGE':<50} | {total_base:5.2f} tok/s | {total_pld:5.2f} tok/s  | {total_delta:+6.2f}% |")
+    total_dyn = sum(dyn_avg_list) / len(dyn_avg_list)
+    total_delta = (total_dyn - total_base) / total_base * 100.0
+    print(f"{'OVERALL AVERAGE':<50} | {total_base:5.2f} tok/s | {total_dyn:5.2f} tok/s   | {total_delta:+6.2f}% |")
     print("=" * 105)
 
     # Save to JSON

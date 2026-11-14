@@ -706,6 +706,12 @@ void HttpServer::routes() {
     auto handle_set_mtp = [this](const httplib::Request &req, httplib::Response &res) {
         if (req.has_param("margin")) engine_.set_mtp_margin(std::stof(req.get_param_value("margin")));
         if (req.has_param("draft")) engine_.set_mtp_draft(std::stoll(req.get_param_value("draft")));
+        if (req.has_param("dynamic")) {
+            const std::string v = req.get_param_value("dynamic");
+            engine_.set_mtp_dynamic(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("draft_min")) engine_.set_mtp_draft_min(std::stoll(req.get_param_value("draft_min")));
+        if (req.has_param("draft_max")) engine_.set_mtp_draft_max(std::stoll(req.get_param_value("draft_max")));
         if (req.has_param("pld")) {
             const std::string v = req.get_param_value("pld");
             engine_.set_pld(v == "1" || v == "on" || v == "true");
@@ -716,6 +722,9 @@ void HttpServer::routes() {
         b.set("status", json::Value::string("ok"));
         b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
         b.set("mtp_draft", json::Value::integer(engine_.mtp_draft()));
+        b.set("mtp_dynamic", json::Value::boolean(engine_.mtp_dynamic()));
+        b.set("mtp_draft_min", json::Value::integer(engine_.mtp_draft_min()));
+        b.set("mtp_draft_max", json::Value::integer(engine_.mtp_draft_max()));
         b.set("pld", json::Value::boolean(engine_.pld()));
         b.set("pld_n", json::Value::integer(engine_.pld_n()));
         b.set("pld_k", json::Value::integer(engine_.pld_k()));

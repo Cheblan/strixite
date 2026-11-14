@@ -328,6 +328,9 @@ int run(int argc, char **argv) {
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
     eng_opts.mtp_draft = mtp_draft;
+    eng_opts.mtp_dynamic = settings.on("mtp-dynamic");
+    eng_opts.mtp_draft_min = settings.integer("mtp-draft-min");
+    eng_opts.mtp_draft_max = settings.integer("mtp-draft-max");
     eng_opts.pld = settings.on("pld");
     eng_opts.pld_n = settings.integer("pld-n");
     eng_opts.pld_k = settings.integer("pld-k");

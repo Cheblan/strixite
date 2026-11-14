@@ -571,6 +571,9 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        bool mtp_dynamic = false; // dynamically adjust MTP draft depth based on acceptance rate
+        int64_t mtp_draft_min = 2; // minimum draft depth in dynamic mode
+        int64_t mtp_draft_max = 12; // maximum draft depth in dynamic mode
         bool pld = false;         // prompt-lookup drafting (PLD) beside the MTP head
         int64_t pld_n = 3;        // matching n-gram length (including the draft token that opens the chain)
         int64_t pld_k = 4;        // max draft continuation tokens from context lookup
@@ -641,11 +644,17 @@ public:
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
     int64_t mtp_draft() const { return options_.mtp_draft; }
+    bool mtp_dynamic() const { return options_.mtp_dynamic; }
+    int64_t mtp_draft_min() const { return options_.mtp_draft_min; }
+    int64_t mtp_draft_max() const { return options_.mtp_draft_max; }
     bool pld() const { return options_.pld; }
     int64_t pld_n() const { return options_.pld_n; }
     int64_t pld_k() const { return options_.pld_k; }
     void set_mtp_margin(float m) { options_.mtp_margin = m; }
     void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
+    void set_mtp_dynamic(bool d) { options_.mtp_dynamic = d; }
+    void set_mtp_draft_min(int64_t m) { options_.mtp_draft_min = m; }
+    void set_mtp_draft_max(int64_t m) { options_.mtp_draft_max = m; }
     void set_pld(bool p) { options_.pld = p; }
     void set_pld_n(int64_t n) { options_.pld_n = n; }
     void set_pld_k(int64_t k) { options_.pld_k = k; }
