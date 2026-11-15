@@ -187,17 +187,24 @@ void run_breakdown(int64_t T) {
         qk_norm_rope_jobs(nr, 3, T, 1e-6f, 64, 0, inv_freq.get(), Act::BF16, stream);
     }, "qk_norm_rope_jobs (q, k, v RoPE)");
 
-    // attention_wmma
+    // attention_wmma (Exact vs Fast, and with Kv8View)
     AttentionShape as{T, 0, hq, hkv, hd, astride, 2 * hd};
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     size_t attn_ws_bytes = attention_wmma_workspace_bytes(as);
     DeviceBuffer<float> attn_ws(attn_ws_bytes / 4, "attn_ws");
     DeviceBuffer<uint16_t> attn_core((size_t)(T * hq * hd), "attn_core");
 
-    float ms_attn_core = time_kernel([&]() {
+    float ms_attn_exact = time_kernel([&]() {
         attention_wmma(attn_proj.get(), attn_proj.get() + hd, k_cache.get(), v_cache.get(),
-                       T, as, attn_scale, attn_core.get(), attn_ws.get(), attn_ws_bytes, Act::BF16, stream);
-    }, "attention_wmma (Softmax Attention)");
+                       T, as, attn_scale, attn_core.get(), attn_ws.get(), attn_ws_bytes, Act::BF16, stream, AttnPrecision::Exact);
+    }, "attention_wmma (BF16, Exact)");
+
+    float ms_attn_fast = time_kernel([&]() {
+        attention_wmma(attn_proj.get(), attn_proj.get() + hd, k_cache.get(), v_cache.get(),
+                       T, as, attn_scale, attn_core.get(), attn_ws.get(), attn_ws_bytes, Act::BF16, stream, AttnPrecision::Fast);
+    }, "attention_wmma (BF16, Fast)");
+
+    float ms_attn_core = ms_attn_fast;
 
     // attn_o: Q8 [2560, 6144, G=64]
     Q8Device w_attn_o = make_random_q8(d, hq * hd, 64, rng, "attn_o");
