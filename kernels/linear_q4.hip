@@ -321,6 +321,105 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// Specialized fully-unrolled kernel for M=1, K=2560, G=64 (MTP draft LM head and hidden-size projections).
+// 512 threads per block (16 waves of wave32) to maximize WGP occupancy and saturate LPDDR5X DRAM bus.
+template <typename TY, int THREADS>
+__global__ void __launch_bounds__(THREADS) linear_q4_k2560_g64_m1_kernel(
+    const uint16_t * __restrict__ x, const uint8_t * __restrict__ q, 
+    const uint16_t * __restrict__ scale, const uint16_t * __restrict__ minv, 
+    TY * __restrict__ y, int64_t N) {
+    
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize) + wave;
+
+    if (n >= N) return;
+
+    const uint4 *qrow = reinterpret_cast<const uint4 *>(q + n * (2560 / 2));
+    const uint16_t *srow = scale + n * (2560 / 64);
+    const uint16_t *mrow = minv + n * (2560 / 64);
+
+    float acc = 0.f;
+
+    // Iteration 0: k = lane * 32
+    {
+        int64_t k = lane * kChunk;
+        uint4 packed = qrow[k / kChunk];
+        uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        const float s = bf16_bits_to_f32(srow[k / 64]);
+        const float mn = bf16_bits_to_f32(mrow[k / 64]);
+        uint32_t cp[kChunk / 2];
+#pragma unroll
+        for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+        const uint4 *xp = reinterpret_cast<const uint4 *>(x + k);
+        float dot = 0.f, xsum = 0.f;
+#pragma unroll
+        for (int i = 0; i < kChunk / 8; ++i) {
+            const uint4 u = xp[i];
+            const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                dot = dot2(xw[j], cp[4 * i + j], dot);
+                xsum = dot2(xw[j], kOnePair, xsum);
+            }
+        }
+        acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+    }
+
+    // Iteration 1: k = 1024 + lane * 32
+    {
+        int64_t k = 1024 + lane * kChunk;
+        uint4 packed = qrow[k / kChunk];
+        uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        const float s = bf16_bits_to_f32(srow[k / 64]);
+        const float mn = bf16_bits_to_f32(mrow[k / 64]);
+        uint32_t cp[kChunk / 2];
+#pragma unroll
+        for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+        const uint4 *xp = reinterpret_cast<const uint4 *>(x + k);
+        float dot = 0.f, xsum = 0.f;
+#pragma unroll
+        for (int i = 0; i < kChunk / 8; ++i) {
+            const uint4 u = xp[i];
+            const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                dot = dot2(xw[j], cp[4 * i + j], dot);
+                xsum = dot2(xw[j], kOnePair, xsum);
+            }
+        }
+        acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+    }
+
+    // Iteration 2: k = 2048 + lane * 32 (only lanes 0..15 active)
+    if (lane < 16) {
+        int64_t k = 2048 + lane * kChunk;
+        uint4 packed = qrow[k / kChunk];
+        uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        const float s = bf16_bits_to_f32(srow[k / 64]);
+        const float mn = bf16_bits_to_f32(mrow[k / 64]);
+        uint32_t cp[kChunk / 2];
+#pragma unroll
+        for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+        const uint4 *xp = reinterpret_cast<const uint4 *>(x + k);
+        float dot = 0.f, xsum = 0.f;
+#pragma unroll
+        for (int i = 0; i < kChunk / 8; ++i) {
+            const uint4 u = xp[i];
+            const uint32_t xw[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                dot = dot2(xw[j], cp[4 * i + j], dot);
+                xsum = dot2(xw[j], kOnePair, xsum);
+            }
+        }
+        acc = fmaf(s, dot, fmaf(mn, xsum, acc));
+    }
+
+    for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
+    if (lane == 0) store(y, n, acc);
+}
+
 int device_warp_size() { return kernels::device_warp_size(kThreads); }
 
 template <typename TX, typename TY, int MR>
@@ -353,7 +452,19 @@ template <typename TX, typename TY>
 void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t stream) {
     // Rows of x per weight pass: as many as there are, up to kRowsPerPass - fewer accumulators for short M
     // (MTP verify, M = 2-5) keep the occupancy of the M = 1 kernel.
-    if (M == 1) launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
+    if (M == 1) {
+        if constexpr (std::is_same_v<TX, uint16_t>) {
+            if (w.K == 2560 && w.G == 64 && device_warp_size() == 32) {
+                constexpr int kBlockThreads = 512;
+                constexpr int kBlockWaves = kBlockThreads / 32;
+                dim3 grid((unsigned)((w.N + kBlockWaves - 1) / kBlockWaves), 1);
+                linear_q4_k2560_g64_m1_kernel<TY, kBlockThreads><<<grid, kBlockThreads, 0, stream>>>(
+                    x, w.q, w.scale, w.minv, y, w.N);
+                return;
+            }
+        }
+        launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
+    }
     else if (M == 2) launch_mr<TX, TY, 2>(x, w, y, M, split_k(w.K), stream);
     else if (M <= 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
     else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
