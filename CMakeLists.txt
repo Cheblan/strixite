@@ -269,6 +269,9 @@ target_link_libraries(compare_slot_concurrency PRIVATE strix_serve_model)
 add_executable(test_sidestream_prefill tools/test_sidestream_prefill.cpp)
 target_link_libraries(test_sidestream_prefill PRIVATE strix_model)
 
+add_executable(bench_dense_prefill tools/bench_dense_prefill.cpp)
+target_link_libraries(bench_dense_prefill PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
