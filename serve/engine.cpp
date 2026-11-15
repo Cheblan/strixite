@@ -1595,7 +1595,8 @@ void Engine::run(Job &job, Slot &sl) {
                         }
                     }
                     if (options_.mtp_dynamic) {
-                        if (j == k && k == steps) {
+                        const bool high_acceptance = (j == k) || (j >= 3 && j * 4 >= k * 3);
+                        if (high_acceptance) {
                             ++draft_streak;
                             const int64_t inc = (draft_streak >= 2) ? 2 : 1;
                             dynamic_draft = std::min(options_.mtp_draft_max, dynamic_draft + inc);
