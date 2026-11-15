@@ -59,6 +59,7 @@ def set_mtp(dynamic: bool, draft: int, draft_min: int, draft_max: int,
         "draft_min": str(draft_min),
         "draft_max": str(draft_max),
         "margin": f"{margin:.2f}",
+        "adaptive_margin": "0",
         "escalating_margin": "1" if escalating else "0",
         "margin_slope": f"{slope:.3f}",
     }
