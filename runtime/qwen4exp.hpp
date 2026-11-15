@@ -1079,6 +1079,7 @@ private:
     PinnedHostBuffer mask_host_;
     DeviceBuffer<uint32_t> mask_dev_;
     hipEvent_t mask_uploaded_ = nullptr;
+    hipEvent_t mtp_pick_event_ = nullptr;
     bool mask_upload_recorded_ = false;
     // A request's logit bias for the next forward (want_candidates): bias_n_ entries in bias_host_ (pinned), rows up to
     // bias_rows_end_, uploaded into bias_dev_ and added to the logits by that forward - gated like the masks.
