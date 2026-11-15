@@ -1019,6 +1019,9 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     STRIX_CHECK(max_tokens >= 1 && max_tokens <= capacity && max_tokens <= 16384, "Qwen4ExpSession: max_tokens = ",
                 max_tokens, ", expected 1..min(capacity = ", capacity, ", 16384)");
     STRIX_HIP_CHECK(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "Qwen4ExpSession: stream");
+    STRIX_HIP_CHECK(hipStreamCreateWithFlags(&side_stream_, hipStreamNonBlocking), "Qwen4ExpSession: side_stream");
+    STRIX_HIP_CHECK(hipEventCreateWithFlags(&side_fork_event_, hipEventDisableTiming), "Qwen4ExpSession: side_fork_event");
+    STRIX_HIP_CHECK(hipEventCreateWithFlags(&side_join_event_, hipEventDisableTiming), "Qwen4ExpSession: side_join_event");
     const size_t e = es(m_.act());
     const int64_t M = max_tokens, n4 = D.H * D.d, A = D.top_k + 1;
     cap_blocks_ = capacity / kernels::kQsaBlock + 1;
@@ -1068,7 +1071,11 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     x_ = act_buf(n4, "residual streams");
     u_ = act_buf(D.d, "sublayer input");
     y_ = act_buf(D.d, "sublayer output");
-    if (m_.shared_separate()) sh_y_ = act_buf(D.d, "shared expert output");
+    if (m_.shared_separate()) {
+        sh_y_ = act_buf(D.d, "shared expert output");
+        sh_gu_ = act_buf(2 * D.inter, "shared expert gate|up");
+        sh_hh_ = act_buf(D.inter, "shared expert swiglu");
+    }
     proj_ = act_buf(std::max(D.gstride, D.astride), "projection");
     qkv_ = act_buf(D.conv_c, "gdn q|k|v");
     STRIX_CHECK(D.gz == D.gv * kHD, "Qwen4ExpSession: GDN z width ", D.gz, " != ", D.gv, " value heads x ", kHD,
@@ -1194,6 +1201,12 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamSynchronize(stream_);  // no upload may still read a pinned buffer when it's freed
         (void)hipStreamDestroy(stream_);
     }
+    if (side_stream_) {
+        (void)hipStreamSynchronize(side_stream_);
+        (void)hipStreamDestroy(side_stream_);
+    }
+    if (side_fork_event_) (void)hipEventDestroy(side_fork_event_);
+    if (side_join_event_) (void)hipEventDestroy(side_join_event_);
     if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
     if (bias_uploaded_) (void)hipEventDestroy(bias_uploaded_);
 }
@@ -1592,6 +1605,7 @@ void Qwen4ExpSession::reset() {
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::reset");
     for (const auto &sq : seqs_)
         if (sq->copy_stream) STRIX_HIP_CHECK(hipStreamSynchronize(sq->copy_stream), "Qwen4ExpSession::reset: copy stream");
+    if (side_stream_) STRIX_HIP_CHECK(hipStreamSynchronize(side_stream_), "Qwen4ExpSession::reset: side_stream");
     // The kernels' error words are one-way flags (set by atomicCAS, never cleared by the readers or the
     // report that throws): left set, every later forward's read_back re-reports this stale error - the
     // engine resets after a failed request expecting a clean slate, so a reset must clear them (the
@@ -1625,6 +1639,7 @@ void Qwen4ExpSession::reset(int seq) {
     STRIX_CHECK(!seqs_[(size_t)seq]->verify_pending, "Qwen4ExpSession::reset: seq ", seq,
                 " has a verify pending - resolve it first (the other runs of its batch share the forward)");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::reset(seq)");
+    if (side_stream_) STRIX_HIP_CHECK(hipStreamSynchronize(side_stream_), "Qwen4ExpSession::reset(seq): side_stream");
     // As in reset(): a throwing reset (generation exhaustion) leaves the slot half-stepped - failed, not usable.
     kv_budget_for_reset(*seqs_[(size_t)seq]);  // the budget refusal touches nothing: not broken
     try {
@@ -2720,9 +2735,10 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     STRIX_TRACE_STAGE(stage);
     STRIX_TRACE_SET(stage, "embed");
     // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on.
-    auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
-        if (wmma && M >= kWmmaMinTokens) kernels::linear_qw_wmma(x, w, y, M, act, out_act, stream_);
-        else kernels::linear_qw(x, w, y, M, act, out_act, stream_);
+    auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act, hipStream_t s = nullptr) {
+        hipStream_t st = s ? s : stream_;
+        if (wmma && M >= kWmmaMinTokens) kernels::linear_qw_wmma(x, w, y, M, act, out_act, st);
+        else kernels::linear_qw(x, w, y, M, act, out_act, st);
     };
     const kernels::MoeMath moe_math = wmma ? kernels::MoeMath::WmmaBf16 : kernels::MoeMath::F32;
     // Expert slots per token: top-k + the shared expert's when it's stacked.
@@ -3251,17 +3267,26 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
         show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
-        // The shared expert as dense projections (its h through gu_ / hh_ before the routed experts reuse them).
-        auto shared_expert = [&] {
-            lin(u_.get(), l.shared_gate_up, gu_.get(), T, act);
-            kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
-            show(L + "shared_h", hh_.get(), D.inter, pt);
-            lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
+        // The shared expert as dense projections (its h through dedicated sh_gu_ / sh_hh_).
+        auto shared_expert = [&](hipStream_t s) {
+            lin(u_.get(), l.shared_gate_up, sh_gu_.get(), T, act, s);
+            kernels::swiglu(sh_gu_.get(), sh_hh_.get(), T, D.inter, act, s);
+            if (probe) {
+                STRIX_HIP_CHECK(hipStreamSynchronize(s), "before probe '", L + "shared_h", "'");
+                probe(L + "shared_h", sh_hh_.get(), T, D.inter, pt);
+            }
+            lin(sh_hh_.get(), l.shared_down, sh_y_.get(), T, act, s);
         };
         // Prefill (the grouped combine, then the injection's fused form): the shared expert's gated add rides in the
-        // combine's reduce (kernels::MoeSharedAdd, bit-identical to moe_shared_add after it), so it runs first.
+        // combine's reduce (kernels::MoeSharedAdd, bit-identical to moe_shared_add after it).
+        // Overlap shared_expert on side_stream_ concurrently with moe_group_routes and gather.
         const bool fold_shared = sep && fuse_inv && T >= kGroupedMinTokens;
-        if (fold_shared) shared_expert();
+        if (fold_shared) {
+            STRIX_HIP_CHECK(hipEventRecord(side_fork_event_, stream_), "shared fork record");
+            STRIX_HIP_CHECK(hipStreamWaitEvent(side_stream_, side_fork_event_, 0), "shared fork wait");
+            shared_expert(side_stream_);
+            STRIX_HIP_CHECK(hipEventRecord(side_join_event_, side_stream_), "shared join record");
+        }
         const kernels::MoeSharedAdd shared_add{sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1,
                                                (uint32_t)D.experts, router_err_.get()};
         bool h_f16 = false;
@@ -3286,6 +3311,9 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                                           T, A, gu_.get(), act, em, stream_);
                 kernels::swiglu(gu_.get(), hh_.get(), T * A, D.inter, act, stream_);
             }
+            if (fold_shared) {
+                STRIX_HIP_CHECK(hipStreamWaitEvent(stream_, side_join_event_, 0), "shared join wait");
+            }
             kernels::linear_qw_experts_combine_grouped(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(),
                                                        group_ws_.get(), group_ws_bytes_, group_partial_.get(), T, A,
                                                        y_.get(), act, em, stream_, fold_shared ? &shared_add : nullptr,
@@ -3297,7 +3325,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                                y_.get(), act, expert_err_.get(), stream_);
         }
         show(L + "experts_h", hh_.get(), A * D.inter, h_f16 ? ProbeType::F16 : pt);  // the routed experts' down input, T rows of A slots
-        if (sep && !fold_shared) shared_expert();  // then y += sigmoid(its gate logit) * its output
+        if (sep && !fold_shared) shared_expert(stream_);  // then y += sigmoid(its gate logit) * its output
         if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,

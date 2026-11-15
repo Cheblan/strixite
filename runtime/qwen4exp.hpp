@@ -958,6 +958,8 @@ private:
     std::vector<uint8_t> slot_busy_;
     std::function<void(int seq)> on_slot_evicted_;
     hipStream_t stream_ = nullptr;
+    hipStream_t side_stream_ = nullptr;
+    hipEvent_t side_fork_event_ = nullptr, side_join_event_ = nullptr;
     // KvFormat::Q8 (the states' k_cache / v_cache empty then): kv_new_ [max_tokens][2W] the forward's new
     // K | V rows before kv8_commit; kv8_err_ the fp16-overflow flag; per attention layer the 8-bit storage
     // (kernels/kv8.hpp, for kv8_cap_ rows: the capacity rounded up to whole groups) lives in the state.
@@ -983,7 +985,7 @@ private:
     DeviceBuffer<uint32_t> kv8_err_;
     // Workspaces [max_tokens, ...], activation dtype unless noted.
     DeviceBuffer<int32_t> ids_, route_ids_;
-    DeviceBuffer<uint8_t> x_, u_, y_, sh_y_, proj_, qkv_, core_, gnorm_, gu_, hh_, ple_e_, ple_kv_, ple_hist_buf_;
+    DeviceBuffer<uint8_t> x_, u_, y_, sh_y_, sh_gu_, sh_hh_, proj_, qkv_, core_, gnorm_, gu_, hh_, ple_e_, ple_kv_, ple_hist_buf_;
     DeviceBuffer<float> h_, w_in_, inv_, beta_, g_, router_logits_, route_coef_, ple_sigma_, attn_ws_, logits_;
     DeviceBuffer<uint32_t> expert_err_, router_err_;
     // MTP (with mtp_ on) workspaces [max_tokens, ...]: the embedding and its norm [d], the normed streams [H*d],
