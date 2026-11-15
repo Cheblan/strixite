@@ -775,12 +775,21 @@ void HttpServer::routes() {
             engine_.set_mtp_escalating_margin(v == "1" || v == "on" || v == "true");
         }
         if (req.has_param("margin_slope")) engine_.set_mtp_margin_slope(std::stof(req.get_param_value("margin_slope")));
+        if (req.has_param("hybrid_draft")) {
+            const std::string v = req.get_param_value("hybrid_draft");
+            engine_.set_hybrid_draft(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("pld_n")) engine_.set_pld_n(std::stoll(req.get_param_value("pld_n")));
+        if (req.has_param("pld_k")) engine_.set_pld_k(std::stoll(req.get_param_value("pld_k")));
         json::Value b = json::Value::object();
         b.set("status", json::Value::string("ok"));
         b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
         b.set("mtp_draft", json::Value::integer(engine_.mtp_draft()));
         b.set("mtp_escalating_margin", json::Value::boolean(engine_.mtp_escalating_margin()));
         b.set("mtp_margin_slope", json::Value::number(engine_.mtp_margin_slope()));
+        b.set("hybrid_draft", json::Value::boolean(engine_.hybrid_draft()));
+        b.set("pld_n", json::Value::integer(engine_.pld_n()));
+        b.set("pld_k", json::Value::integer(engine_.pld_k()));
         res.set_content(b.dump(), "application/json");
     };
     svr_->Get("/set_mtp", handle_set_mtp);
@@ -822,6 +831,9 @@ void HttpServer::routes() {
             const std::string l = "{accepted=\"" + std::to_string(i) + (i == kMtpMaxDraft - 1 ? "+" : "") + "\"}";
             sample("strix_mtp_rejections_total", l.c_str(), (double)s.mtp_reject_at[i]);
         }
+        metric("strix_pld_rounds_total", "counter", "Speculative rounds using context PLD drafts.", (double)s.pld_rounds);
+        metric("strix_pld_drafted_tokens_total", "counter", "Context PLD tokens drafted.", (double)s.pld_drafted_tokens);
+        metric("strix_pld_accepted_tokens_total", "counter", "Context PLD tokens accepted.", (double)s.pld_accepted_tokens);
         const BackendStats bs = engine_.backend_stats();
         metric("strix_ngram_rows_requested_total", "counter", "PLE n-gram rows requested by forwards.",
                (double)bs.ngram_rows_requested);
