@@ -281,6 +281,9 @@ target_link_libraries(bench_hc_prefill PRIVATE strix_model)
 add_executable(bench_layer_breakdown tools/bench_layer_breakdown.cpp)
 target_link_libraries(bench_layer_breakdown PRIVATE strix_model)
 
+add_executable(test_qsa_attn tools/test_qsa_attn.cpp)
+target_link_libraries(test_qsa_attn PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
