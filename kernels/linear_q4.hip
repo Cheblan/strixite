@@ -297,10 +297,42 @@ __global__ void __launch_bounds__(kThreads)
     if (ok && j < I) {  // no early return: every wave reaches reduce_row's barrier
         const T *xr = x + (int64_t)blockIdx.z * K;
         const int64_t rg = (int64_t)id * N + j, ru = rg + I;
-        vg = q4_row_partial<T, G, HB>(q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
-        vu = q4_row_partial<T, G, HB>(q + ru * qsplit_row_bytes<HB>(K), scale + ru * (K / G), minv + ru * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
+        const uint8_t *qrow_g = q + rg * qsplit_row_bytes<HB>(K);
+        const uint16_t *srow_g = scale + rg * (K / G);
+        const uint16_t *mrow_g = minv + rg * (K / G);
+
+        const uint8_t *qrow_u = q + ru * qsplit_row_bytes<HB>(K);
+        const uint16_t *srow_u = scale + ru * (K / G);
+        const uint16_t *mrow_u = minv + ru * (K / G);
+
+        const int64_t chunks = K / kChunk;
+        for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+            float xv[kChunk];
+            load_x32(xr, c * kChunk, xv);
+
+            uint4 packed_g = reinterpret_cast<const uint4 *>(qrow_g)[c];
+            uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+            const QHigh32<HB> hb_g = QHigh32<HB>::load(qrow_g, K, c * kChunk);
+            const float s_g = bf16_bits_to_f32(srow_g[c * kChunk / G]);
+            const float mn_g = bf16_bits_to_f32(mrow_g[c * kChunk / G]);
+
+            uint4 packed_u = reinterpret_cast<const uint4 *>(qrow_u)[c];
+            uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+            const QHigh32<HB> hb_u = QHigh32<HB>::load(qrow_u, K, c * kChunk);
+            const float s_u = bf16_bits_to_f32(srow_u[c * kChunk / G]);
+            const float mn_u = bf16_bits_to_f32(mrow_u[c * kChunk / G]);
+
+            float dot_g = 0.f, dot_u = 0.f, xsum = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i) {
+                const float xi = xv[i];
+                dot_g = fmaf(xi, (float)(((words_g[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_g.at(i)), dot_g);
+                dot_u = fmaf(xi, (float)(((words_u[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_u.at(i)), dot_u);
+                xsum += xi;
+            }
+            vg = fmaf(s_g, dot_g, fmaf(mn_g, xsum, vg));
+            vu = fmaf(s_u, dot_u, fmaf(mn_u, xsum, vu));
+        }
     }
     vg = reduce_row(vg, part_g, wave, ks, KS);
     vu = reduce_row(vu, part_u, wave, ks, KS);
