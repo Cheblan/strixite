@@ -70,6 +70,10 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.mtp_margin >= 0.0f, "Engine: mtp_margin ", options_.mtp_margin, ", expected >= 0");
     STRIX_CHECK(options_.mtp_draft >= 1 && options_.mtp_draft <= 15, "Engine: mtp_draft ", options_.mtp_draft,
                 ", expected 1..15");
+    STRIX_CHECK(options_.mtp_spec_adapt_w >= 1, "Engine: mtp_spec_adapt_w must be >= 1");
+    STRIX_CHECK(options_.mtp_spec_adapt_floor >= 0.0f && options_.mtp_spec_adapt_floor <= 1.0f,
+                "Engine: mtp_spec_adapt_floor must be in [0, 1]");
+    STRIX_CHECK(options_.mtp_spec_adapt_r >= 0, "Engine: mtp_spec_adapt_r must be >= 0");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
@@ -1398,6 +1402,10 @@ void Engine::run(Job &job, Slot &sl) {
         // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
         // forward of its own (strixite PR #1).
         int32_t carry = -1;
+        int64_t adapt_window_rounds = 0;
+        int64_t adapt_window_drafted = 0;
+        int64_t adapt_window_accepted = 0;
+        int64_t adapt_cooldown_tokens = 0;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1507,7 +1515,7 @@ void Engine::run(Job &job, Slot &sl) {
                 stats_.generated_tokens += res.completion_tokens - generated_counted;
                 generated_counted = res.completion_tokens;
             }
-            if (sl.be->has_mtp() && !stop_due()) {
+            if (sl.be->has_mtp() && !stop_due() && (!options_.mtp_spec_adapt || adapt_cooldown_tokens <= 0)) {
                 const int64_t room = req.max_tokens - res.completion_tokens;  // >= 1 here
                 // Several slots decoding: at most as many drafts as let every slot's verify run fit one batched
                 // forward (max_verify_rows / decoding slots - 1: 2 slots 7, 3 slots 4, 4 slots 3). Past the budget the
@@ -1574,6 +1582,27 @@ void Engine::run(Job &job, Slot &sl) {
                             break;
                         }
                     }
+                    if (options_.mtp_spec_adapt) {
+                        adapt_window_drafted += k;
+                        adapt_window_accepted += j;
+                        ++adapt_window_rounds;
+                        if (adapt_window_rounds >= options_.mtp_spec_adapt_w) {
+                            const float acc_rate = adapt_window_drafted > 0
+                                                       ? (float)adapt_window_accepted / (float)adapt_window_drafted
+                                                       : 0.0f;
+                            if (acc_rate < options_.mtp_spec_adapt_floor) {
+                                adapt_cooldown_tokens = options_.mtp_spec_adapt_r;
+                                ++res.mtp_adapt_cooldown_triggers;
+                                slog_row(LogLevel::Debug, "adapt",
+                                         "window acceptance %.1f%% < %.1f%%: disabling draft for %s tokens",
+                                         100.0f * acc_rate, 100.0f * options_.mtp_spec_adapt_floor,
+                                         fmt_n((long long)options_.mtp_spec_adapt_r).c_str());
+                            }
+                            adapt_window_rounds = 0;
+                            adapt_window_drafted = 0;
+                            adapt_window_accepted = 0;
+                        }
+                    }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
                         sl.be->keep_verify_prefix(ids, j + 1);
                         sl.seq.insert(sl.seq.end(), ids.begin(), ids.begin() + j + 1);
@@ -1634,6 +1663,10 @@ void Engine::run(Job &job, Slot &sl) {
                 }
             }
             ++res.decode_forwards;
+            if (options_.mtp_spec_adapt && adapt_cooldown_tokens > 0) {
+                --adapt_cooldown_tokens;
+                ++res.mtp_adapt_serial_tokens;
+            }
             if (arbiter_ && sl.be->has_mtp()) {
                 // Several slots: a step with no draft is a verify of id alone, so it joins the other slots' batch. As a
                 // plain forward it ran alone on the GPU and held their batch until it finished.

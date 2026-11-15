@@ -474,6 +474,7 @@ struct GenerationResult {
     std::string error_type;     // finish_reason == error: empty (a server error, HTTP 500) or kErrorKvBudget (503)
     int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
+    int64_t mtp_adapt_cooldown_triggers = 0, mtp_adapt_serial_tokens = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};  // rollbacks by drafts j accepted before the rejected one (last: j >= 3)
     double queue_ms = 0, prompt_ms = 0, decode_ms = 0;
     // From the submit to the end of the prefill (the first token's logits are ready) / to the response's end.
@@ -555,6 +556,14 @@ public:
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
+        // Halogen-style adaptive speculative drafting (HALOGEN_SPEC_ADAPT = W,floor,R):
+        // acceptance is measured over rolling windows of W drafting rounds. If acceptance rate
+        // falls below floor, drafting is switched off for R tokens (serial decode is faster
+        // than speculative drafting that suffers frequent rollbacks).
+        bool mtp_spec_adapt = true;
+        int64_t mtp_spec_adapt_w = 32;
+        float mtp_spec_adapt_floor = 0.35f;
+        int64_t mtp_spec_adapt_r = 64;
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -621,6 +630,10 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    bool mtp_spec_adapt() const { return options_.mtp_spec_adapt; }
+    int64_t mtp_spec_adapt_w() const { return options_.mtp_spec_adapt_w; }
+    float mtp_spec_adapt_floor() const { return options_.mtp_spec_adapt_floor; }
+    int64_t mtp_spec_adapt_r() const { return options_.mtp_spec_adapt_r; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }

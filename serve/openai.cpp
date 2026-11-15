@@ -466,6 +466,10 @@ json::Value strix_ext(const GenerationResult &r, bool clamped, const std::string
         s.set("mtp_drafted_tokens", json::Value::integer(r.mtp_drafted_tokens));
         s.set("mtp_accepted_tokens", json::Value::integer(r.mtp_accepted_tokens));
         s.set("mtp_acceptance_rate", json::Value::number(100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens));
+        if (r.mtp_adapt_cooldown_triggers > 0) {
+            s.set("mtp_adapt_cooldown_triggers", json::Value::integer(r.mtp_adapt_cooldown_triggers));
+            s.set("mtp_adapt_serial_tokens", json::Value::integer(r.mtp_adapt_serial_tokens));
+        }
     }
     return s;
 }
