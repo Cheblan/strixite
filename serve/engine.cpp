@@ -1420,6 +1420,9 @@ void Engine::run(Job &job, Slot &sl) {
         int64_t dynamic_draft = std::clamp(options_.mtp_draft, options_.mtp_draft_min, options_.mtp_draft_max);
         int64_t draft_streak = 0;
         float dynamic_margin = options_.mtp_margin;
+        int64_t stuck_at_min_count = 0;
+        bool is_probe = false;
+        int64_t probed_depth = 0;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1535,6 +1538,18 @@ void Engine::run(Job &job, Slot &sl) {
                 // forward (max_verify_rows / decoding slots - 1: 2 slots 7, 3 slots 4, 4 slots 3). Past the budget the
                 // arbiter splits the batch in two forwards, and each slot's longer chain runs alone on the GPU.
                 int64_t draft_max = options_.mtp_dynamic ? dynamic_draft : options_.mtp_draft;
+                if (options_.mtp_dynamic && options_.mtp_phase_aware && parser.in_reasoning()) {
+                    draft_max = std::min(draft_max, options_.mtp_think_draft_max);
+                }
+                if (options_.mtp_dynamic && options_.mtp_probe && dynamic_draft == options_.mtp_draft_min) {
+                    if (++stuck_at_min_count >= options_.mtp_probe_interval) {
+                        draft_max = std::min(options_.mtp_draft_max, options_.mtp_probe_depth);
+                        is_probe = true;
+                        probed_depth = draft_max;
+                    }
+                } else {
+                    stuck_at_min_count = 0;
+                }
                 if (arbiter_) {
                     const int64_t n = std::max<int64_t>(1, arbiter_->decoding_count());
                     draft_max = std::min(draft_max, std::max<int64_t>(1, arbiter_->backend().max_verify_rows() / n - 1));
@@ -1545,6 +1560,7 @@ void Engine::run(Job &job, Slot &sl) {
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 sl.be->prefetch_ple(ids, 0);
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
+                float confidence_budget = 0.0f;
                 for (int64_t step = 0; step < steps; ++step) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
@@ -1553,7 +1569,22 @@ void Engine::run(Job &job, Slot &sl) {
                     if (options_.mtp_escalating_margin) {
                         required_margin += (float)step * options_.mtp_margin_slope;
                     }
-                    if (t.best_v - t.second_v < required_margin || d == im_end_ || d == eot_) break;
+                    const float delta = t.best_v - t.second_v;
+                    if (options_.mtp_confidence_budget) {
+                        if (delta >= required_margin) {
+                            confidence_budget = std::min(options_.mtp_budget_cap, confidence_budget + (delta - required_margin) * 0.5f);
+                        } else {
+                            const float deficit = required_margin - delta;
+                            if (confidence_budget >= deficit) {
+                                confidence_budget -= deficit;
+                            } else {
+                                break;
+                            }
+                        }
+                    } else {
+                        if (delta < required_margin) break;
+                    }
+                    if (d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
@@ -1600,7 +1631,17 @@ void Engine::run(Job &job, Slot &sl) {
                             break;
                         }
                     }
-                    if (options_.mtp_dynamic) {
+                    if (is_probe) {
+                        stuck_at_min_count = 0;
+                        is_probe = false;
+                        if (j == k && k == steps) {
+                            dynamic_draft = probed_depth;
+                            draft_streak = 1;
+                        } else {
+                            dynamic_draft = options_.mtp_draft_min;
+                            draft_streak = 0;
+                        }
+                    } else if (options_.mtp_dynamic) {
                         if (j == k && k == steps) {
                             ++draft_streak;
                             const int64_t inc = (draft_streak >= 2) ? 2 : 1;

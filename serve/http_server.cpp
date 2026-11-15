@@ -785,6 +785,22 @@ void HttpServer::routes() {
             engine_.set_mtp_escalating_margin(v == "1" || v == "on" || v == "true");
         }
         if (req.has_param("margin_slope")) engine_.set_mtp_margin_slope(std::stof(req.get_param_value("margin_slope")));
+        if (req.has_param("phase_aware")) {
+            const std::string v = req.get_param_value("phase_aware");
+            engine_.set_mtp_phase_aware(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("think_draft_max")) engine_.set_mtp_think_draft_max(std::stoll(req.get_param_value("think_draft_max")));
+        if (req.has_param("probe")) {
+            const std::string v = req.get_param_value("probe");
+            engine_.set_mtp_probe(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("probe_interval")) engine_.set_mtp_probe_interval(std::stoll(req.get_param_value("probe_interval")));
+        if (req.has_param("probe_depth")) engine_.set_mtp_probe_depth(std::stoll(req.get_param_value("probe_depth")));
+        if (req.has_param("confidence_budget")) {
+            const std::string v = req.get_param_value("confidence_budget");
+            engine_.set_mtp_confidence_budget(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("budget_cap")) engine_.set_mtp_budget_cap(std::stof(req.get_param_value("budget_cap")));
         json::Value b = json::Value::object();
         b.set("status", json::Value::string("ok"));
         b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
@@ -795,6 +811,13 @@ void HttpServer::routes() {
         b.set("mtp_adaptive_margin", json::Value::boolean(engine_.mtp_adaptive_margin()));
         b.set("mtp_escalating_margin", json::Value::boolean(engine_.mtp_escalating_margin()));
         b.set("mtp_margin_slope", json::Value::number(engine_.mtp_margin_slope()));
+        b.set("mtp_phase_aware", json::Value::boolean(engine_.mtp_phase_aware()));
+        b.set("mtp_think_draft_max", json::Value::integer(engine_.mtp_think_draft_max()));
+        b.set("mtp_probe", json::Value::boolean(engine_.mtp_probe()));
+        b.set("mtp_probe_interval", json::Value::integer(engine_.mtp_probe_interval()));
+        b.set("mtp_probe_depth", json::Value::integer(engine_.mtp_probe_depth()));
+        b.set("mtp_confidence_budget", json::Value::boolean(engine_.mtp_confidence_budget()));
+        b.set("mtp_budget_cap", json::Value::number(engine_.mtp_budget_cap()));
         res.set_content(b.dump(), "application/json");
     };
     svr_->Get("/set_mtp", handle_set_mtp);
