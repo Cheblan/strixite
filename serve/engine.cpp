@@ -1417,7 +1417,7 @@ void Engine::run(Job &job, Slot &sl) {
         // forward of its own (strixite PR #1).
         int32_t carry = -1;
         int64_t dynamic_draft = std::clamp(options_.mtp_draft, options_.mtp_draft_min, options_.mtp_draft_max);
-        float ema_acc = 0.75f;
+        int64_t draft_streak = 0;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1595,15 +1595,17 @@ void Engine::run(Job &job, Slot &sl) {
                         }
                     }
                     if (options_.mtp_dynamic) {
-                        const float round_rate = k > 0 ? (float)j / (float)k : 0.0f;
-                        ema_acc = 0.7f * ema_acc + 0.3f * round_rate;
-                        if (ema_acc >= 0.85f && (j == k || j >= 3)) {
-                            dynamic_draft = std::min(options_.mtp_draft_max, dynamic_draft + 1);
-                        } else if (j == 0 && k >= 4) {
-                            dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 2);
-                            ema_acc = std::min(ema_acc, 0.40f);
-                        } else if (ema_acc <= 0.45f) {
-                            dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 1);
+                        if (j == k && k == steps) {
+                            ++draft_streak;
+                            const int64_t inc = (draft_streak >= 2) ? 2 : 1;
+                            dynamic_draft = std::min(options_.mtp_draft_max, dynamic_draft + inc);
+                        } else {
+                            draft_streak = 0;
+                            if (j <= 1 && k >= 3) {
+                                dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 2);
+                            } else if (j * 2 < k) {
+                                dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 1);
+                            }
                         }
                     }
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
