@@ -190,7 +190,7 @@ void run_breakdown(int64_t T) {
     // attention_wmma
     AttentionShape as{T, 0, hq, hkv, hd, astride, 2 * hd};
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-    size_t attn_ws_bytes = (size_t)T * hq * hd * sizeof(float);
+    size_t attn_ws_bytes = attention_wmma_workspace_bytes(as);
     DeviceBuffer<float> attn_ws(attn_ws_bytes / 4, "attn_ws");
     DeviceBuffer<uint16_t> attn_core((size_t)(T * hq * hd), "attn_core");
 
