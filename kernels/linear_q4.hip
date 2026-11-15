@@ -211,23 +211,86 @@ __device__ inline float reduce_row(float v, float *part, int wave, int ks, int K
     return t;
 }
 
+constexpr int kMaxSortSlots = 128;
+
+// Stably sorts active expert slots by expert_id so workgroups stream DRAM monotonically
+// and duplicate expert requests across tokens hit in the 32 MB Infinity Cache (MALL).
+__global__ void __launch_bounds__(64)
+    sort_expert_slots_kernel(const int32_t *ids, int S, int32_t *sorted_slots) {
+    __shared__ int32_t s_order[kMaxSortSlots];
+    __shared__ int32_t s_ids[kMaxSortSlots];
+
+    const int tid = threadIdx.x;
+
+    for (int i = tid; i < kMaxSortSlots; i += 64) {
+        if (i < S) {
+            s_order[i] = i;
+            s_ids[i] = ids[i];
+        } else {
+            s_order[i] = i;
+            s_ids[i] = INT_MAX;
+        }
+    }
+    __syncthreads();
+
+    // Odd-even transposition sort across S elements
+    for (int step = 0; step < S; ++step) {
+        if ((step & 1) == 0) {
+            int idx = tid * 2;
+            if (idx + 1 < S) {
+                int id_a = s_ids[idx];
+                int id_b = s_ids[idx + 1];
+                int ord_a = s_order[idx];
+                int ord_b = s_order[idx + 1];
+                if (id_a > id_b || (id_a == id_b && ord_a > ord_b)) {
+                    s_ids[idx] = id_b;
+                    s_ids[idx + 1] = id_a;
+                    s_order[idx] = ord_b;
+                    s_order[idx + 1] = ord_a;
+                }
+            }
+        } else {
+            int idx = tid * 2 + 1;
+            if (idx + 1 < S) {
+                int id_a = s_ids[idx];
+                int id_b = s_ids[idx + 1];
+                int ord_a = s_order[idx];
+                int ord_b = s_order[idx + 1];
+                if (id_a > id_b || (id_a == id_b && ord_a > ord_b)) {
+                    s_ids[idx] = id_b;
+                    s_ids[idx + 1] = id_a;
+                    s_order[idx] = ord_b;
+                    s_order[idx + 1] = ord_a;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < S; i += 64) {
+        sorted_slots[i] = s_order[i];
+    }
+}
+
 // Gather: y[m, a, :] = x[m, :] * W[ids[m, a]]^T  (grid: rows, a, m).
 template <typename T, int G, int HB>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_gather_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                                     const int32_t *ids, int64_t E, int64_t A, T *y, int64_t N, int64_t K, int KS,
-                                    uint32_t *err) {
+                                    uint32_t *err, const int32_t *sorted_slots = nullptr) {
     __shared__ float part[kThreads / 32];
     const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
     const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
-    const int64_t slot = (int64_t)blockIdx.z * A + blockIdx.y;
+    const int64_t s_idx = (int64_t)blockIdx.z * A + blockIdx.y;
+    const int64_t slot = (sorted_slots != nullptr) ? (int64_t)sorted_slots[s_idx] : s_idx;
+    const int64_t m = slot / A;
     const int32_t id = ids[slot];
     const bool ok = id >= 0 && id < E;
     float v = 0.f;
     if (ok && n < N) {  // no early return: every wave reaches reduce_row's barrier
         const int64_t row = (int64_t)id * N + n;
         v = q4_row_partial<T, G, HB>(q + row * qsplit_row_bytes<HB>(K), scale + row * (K / G), minv + row * (K / G),
-                                     x + (int64_t)blockIdx.z * K, K / kChunk, ks, KS, lane, K);
+                                     x + m * K, K / kChunk, ks, KS, lane, K);
     }
     v = reduce_row(v, part, wave, ks, KS);
     if (lane == 0 && ks == 0 && n < N) {
@@ -249,16 +312,18 @@ template <typename T, int G, int HB>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_gather_swiglu_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                                            const int32_t *ids, int64_t E, int64_t A, T *y, int64_t N, int64_t K,
-                                           int KS, uint32_t *err) {
+                                           int KS, uint32_t *err, const int32_t *sorted_slots = nullptr) {
     __shared__ float part_g[kThreads / 32], part_u[kThreads / 32];
     const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
     const int64_t I = N / 2, j = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
-    const int64_t slot = (int64_t)blockIdx.z * A + blockIdx.y;
+    const int64_t s_idx = (int64_t)blockIdx.z * A + blockIdx.y;
+    const int64_t slot = (sorted_slots != nullptr) ? (int64_t)sorted_slots[s_idx] : s_idx;
+    const int64_t m = slot / A;
     const int32_t id = ids[slot];
     const bool ok = id >= 0 && id < E;
     float vg = 0.f, vu = 0.f;
     if (ok && j < I) {  // no early return: every wave reaches reduce_row's barrier
-        const T *xr = x + (int64_t)blockIdx.z * K;
+        const T *xr = x + m * K;
         const int64_t rg = (int64_t)id * N + j, ru = rg + I;
         vg = q4_row_partial<T, G, HB>(q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G), xr,
                                       K / kChunk, ks, KS, lane, K);
@@ -362,7 +427,8 @@ void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t st
 
 template <typename T, int HB>
 void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t *ids, const float *coef, int64_t M,
-                    int64_t A, T *y, uint32_t *err, hipStream_t stream, bool swiglu) {
+                    int64_t A, T *y, uint32_t *err, hipStream_t stream, bool swiglu,
+                    const int32_t *sorted_slots = nullptr) {
     const int64_t N = w.N / E;
     const bool combine = coef != nullptr;
     // Split by the contiguous row length (K), as for the dense kernel: combine's
@@ -381,13 +447,13 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
 #define STRIX_Q4_EXPERTS(G)                                                                                         \
     if (swiglu)                                                                                                     \
         linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
-            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                                \
+            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err, sorted_slots);                                 \
     else if (combine)                                                                                               \
         linear_q4_experts_combine_kernel<T, G, HB><<<dim3(bx, (unsigned)M), block, 0, stream>>>(                    \
             x, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err);                                          \
     else                                                                                                            \
         linear_q4_experts_gather_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>(        \
-            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);
+            x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err, sorted_slots);
     switch (w.G) {
         case 32: STRIX_Q4_EXPERTS(32) break;
         case 64: STRIX_Q4_EXPERTS(64) break;
@@ -419,7 +485,7 @@ void check_no_overlap(const char *fn, const void *in, int64_t in_bytes, const vo
 // swiglu (gathers only): W holds [gate | up] rows per expert and y gets h = silu(gate) * up, [M, A, N/2].
 void linear_q4_experts(const char *fn, const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                        const float *coef, int64_t M, int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
-                       int hb = 0, bool swiglu = false) {
+                       int hb = 0, bool swiglu = false, int32_t *sorted_slots = nullptr) {
     STRIX_CHECK(x != nullptr && y != nullptr && ids != nullptr && err != nullptr, fn, ": null pointer (x=", x,
                 ", y=", y, ", ids=", (const void *)ids, ", err=", (const void *)err, ")");
     check_weight_view(fn, w);
@@ -437,14 +503,21 @@ void linear_q4_experts(const char *fn, const void *x, const Q4DeviceView &w, int
     STRIX_CHECK(!swiglu || N % 2 == 0, fn, ": SwiGLU gather needs an even row count per expert ([gate | up]), got ",
                 N);
     check_no_overlap(fn, x, (combine ? M * A : M) * w.K * es, y, (combine ? M : M * A) * (swiglu ? N / 2 : N) * es);
+
+    if (sorted_slots != nullptr && !combine && M * A > 1 && M * A <= kMaxSortSlots) {
+        sort_expert_slots_kernel<<<1, 64, 0, stream>>>(ids, (int)(M * A), sorted_slots);
+    } else {
+        sorted_slots = nullptr;
+    }
+
     auto go = [&](auto hbc) {
         constexpr int HB = decltype(hbc)::value;
         if (act == Act::F32)
             launch_experts<float, HB>(static_cast<const float *>(x), w, E, ids, coef, M, A, static_cast<float *>(y),
-                                      err, stream, swiglu);
+                                      err, stream, swiglu, sorted_slots);
         else
             launch_experts<uint16_t, HB>(static_cast<const uint16_t *>(x), w, E, ids, coef, M, A,
-                                         static_cast<uint16_t *>(y), err, stream, swiglu);
+                                         static_cast<uint16_t *>(y), err, stream, swiglu, sorted_slots);
     };
     if (hb == 1) go(std::integral_constant<int, 1>{});
     else go(std::integral_constant<int, 0>{});
@@ -491,19 +564,24 @@ void linear_q4(const void *x, const Q4DeviceView &w, void *y, int64_t M, Act act
 namespace strix::kernels {
 
 void linear_q4_experts_gather(const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream) {
-    linear_q4_experts("linear_q4_experts_gather", x, w, E, ids, nullptr, M, A, y, act, err, stream);
+                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
+                              int32_t *sorted_slots) {
+    linear_q4_experts("linear_q4_experts_gather", x, w, E, ids, nullptr, M, A, y, act, err, stream, 0, false,
+                      sorted_slots);
 }
 
 void linear_q4_experts_gather_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream) {
-    linear_q4_experts("linear_q4_experts_gather_swiglu", x, w, E, ids, nullptr, M, A, h, act, err, stream, 0, true);
+                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream,
+                                     int32_t *sorted_slots) {
+    linear_q4_experts("linear_q4_experts_gather_swiglu", x, w, E, ids, nullptr, M, A, h, act, err, stream, 0, true,
+                      sorted_slots);
 }
 
 void linear_q5_experts_gather_swiglu(const void *x, const Q5DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream) {
+                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream,
+                                     int32_t *sorted_slots) {
     linear_q4_experts("linear_q5_experts_gather_swiglu", x, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ids, nullptr, M,
-                      A, h, act, err, stream, 1, true);
+                      A, h, act, err, stream, 1, true, sorted_slots);
 }
 
 void linear_q4_experts_combine(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
@@ -514,9 +592,10 @@ void linear_q4_experts_combine(const void *h, const Q4DeviceView &w, int64_t E, 
 }
 
 void linear_q5_experts_gather(const void *x, const Q5DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream) {
+                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
+                              int32_t *sorted_slots) {
     linear_q4_experts("linear_q5_experts_gather", x, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ids, nullptr, M, A, y,
-                      act, err, stream, 1);
+                      act, err, stream, 1, false, sorted_slots);
 }
 
 void linear_q5_experts_combine(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,

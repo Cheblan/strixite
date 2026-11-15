@@ -1084,6 +1084,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     g_ = DeviceBuffer<float>((size_t)(M * D.gv), "gdn g");
     router_logits_ = DeviceBuffer<float>((size_t)(M * (D.experts + 1)), "router logits");
     route_ids_ = DeviceBuffer<int32_t>((size_t)(M * A), "expert ids");
+    sorted_slots_ = DeviceBuffer<int32_t>((size_t)(M * A), "MoE sorted slots");
     route_coef_ = DeviceBuffer<float>((size_t)(M * A), "expert coefficients");
     logits_ = DeviceBuffer<float>((size_t)(std::min(M, kMaxLogits) * D.vocab), "logits");
     readback_ = PinnedHostBuffer(kReadbackLogitsAt + logits_.size() * 4, "forward read-back (errors + logits)");
@@ -3292,7 +3293,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                                        h_f16);
         } else {
             kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(),
-                                                     act, expert_err_.get(), stream_);
+                                                     act, expert_err_.get(), stream_, sorted_slots_.get());
             kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A,
                                                y_.get(), act, expert_err_.get(), stream_);
         }
@@ -3942,7 +3943,7 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
                         route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
     const int64_t Estack = D.experts + (sep ? 0 : 1);
     kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(), act,
-                                             expert_err_.get(), stream_);
+                                             expert_err_.get(), stream_, sorted_slots_.get());
     kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A, y_.get(),
                                        act, expert_err_.get(), stream_);
     if (sep) {
@@ -4104,7 +4105,7 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_top2_batch(co
                         route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
     const int64_t Estack = D.experts + (sep ? 0 : 1);
     kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), B, A, hh_.get(), act,
-                                             expert_err_.get(), stream_);
+                                             expert_err_.get(), stream_, sorted_slots_.get());
     kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), B, A, y_.get(),
                                        act, expert_err_.get(), stream_);
     if (sep) {

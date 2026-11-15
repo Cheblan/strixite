@@ -982,7 +982,7 @@ private:
     DeviceBuffer<uint8_t> kv8_stage_;
     DeviceBuffer<uint32_t> kv8_err_;
     // Workspaces [max_tokens, ...], activation dtype unless noted.
-    DeviceBuffer<int32_t> ids_, route_ids_;
+    DeviceBuffer<int32_t> ids_, route_ids_, sorted_slots_;
     DeviceBuffer<uint8_t> x_, u_, y_, sh_y_, proj_, qkv_, core_, gnorm_, gu_, hh_, ple_e_, ple_kv_, ple_hist_buf_;
     DeviceBuffer<float> h_, w_in_, inv_, beta_, g_, router_logits_, route_coef_, ple_sigma_, attn_ws_, logits_;
     DeviceBuffer<uint32_t> expert_err_, router_err_;

@@ -40,22 +40,26 @@ void linear_q4(const void *x, const Q4DeviceView &w, void *y, int64_t M, Act act
 // err[1] = the id, err[2] = its slot (m * A + a), and that output is NaN;
 // check_expert_error() turns it into an exception (it synchronizes).
 void linear_q4_experts_gather(const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream);
+                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
+                              int32_t *sorted_slots = nullptr);
 void linear_q4_experts_combine(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                                const float *coef, int64_t M, int64_t A, void *y, Act act, uint32_t *err,
                                hipStream_t stream);
 // The same with Q5 experts (formats/q5.hpp rows: K % 128 == 0) - one kernel template with the Q4 ones.
 void linear_q5_experts_gather(const void *x, const Q5DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream);
+                              int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
+                              int32_t *sorted_slots = nullptr);
 void linear_q5_experts_combine(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
                                const float *coef, int64_t M, int64_t A, void *y, Act act, uint32_t *err,
                                hipStream_t stream);
 // Gather with the SwiGLU in its epilogue: w's expert rows are the merged [gate (I) | up (I)] projection (N = 2I per
 // expert) and h [M, A, I] = silu(gate) * up - bit-identical to the gather into [M, A, 2I] then kernels::swiglu.
 void linear_q4_experts_gather_swiglu(const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream);
+                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream,
+                                     int32_t *sorted_slots = nullptr);
 void linear_q5_experts_gather_swiglu(const void *x, const Q5DeviceView &w, int64_t E, const int32_t *ids, int64_t M,
-                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream);
+                                     int64_t A, void *h, Act act, uint32_t *err, hipStream_t stream,
+                                     int32_t *sorted_slots = nullptr);
 void check_expert_error(const uint32_t *err, const char *what);
 // The same check on the 3 words already on the host (read back with the forward's one sync).
 void report_expert_error(const uint32_t e[3], const char *what);

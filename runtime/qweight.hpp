@@ -73,10 +73,11 @@ inline void linear_qw_wmma(const void *x, const QWeightView &w, void *y, int64_t
 
 // MoE experts stacked [E*N, K] in Q4 or Q5 (the expert kernels' formats; kernels/linear_q4.hpp, moe_grouped.hpp).
 inline void linear_qw_experts_gather(const void *x, const QWeightView &w, int64_t E, const int32_t *ids, int64_t M,
-                                     int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream) {
+                                     int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
+                                     int32_t *sorted_slots = nullptr) {
     switch (w.bits) {
-        case 4: linear_q4_experts_gather(x, w.q4, E, ids, M, A, y, act, err, stream); return;
-        case 5: linear_q5_experts_gather(x, w.q5, E, ids, M, A, y, act, err, stream); return;
+        case 4: linear_q4_experts_gather(x, w.q4, E, ids, M, A, y, act, err, stream, sorted_slots); return;
+        case 5: linear_q5_experts_gather(x, w.q5, E, ids, M, A, y, act, err, stream, sorted_slots); return;
         default: STRIX_FAIL("linear_qw_experts_gather: experts have ", w.bits, " bits, expected 4 or 5");
     }
 }
@@ -84,10 +85,10 @@ inline void linear_qw_experts_gather(const void *x, const QWeightView &w, int64_
 // gather then kernels::swiglu).
 inline void linear_qw_experts_gather_swiglu(const void *x, const QWeightView &w, int64_t E, const int32_t *ids,
                                             int64_t M, int64_t A, void *h, Act act, uint32_t *err,
-                                            hipStream_t stream) {
+                                            hipStream_t stream, int32_t *sorted_slots = nullptr) {
     switch (w.bits) {
-        case 4: linear_q4_experts_gather_swiglu(x, w.q4, E, ids, M, A, h, act, err, stream); return;
-        case 5: linear_q5_experts_gather_swiglu(x, w.q5, E, ids, M, A, h, act, err, stream); return;
+        case 4: linear_q4_experts_gather_swiglu(x, w.q4, E, ids, M, A, h, act, err, stream, sorted_slots); return;
+        case 5: linear_q5_experts_gather_swiglu(x, w.q5, E, ids, M, A, h, act, err, stream, sorted_slots); return;
         default: STRIX_FAIL("linear_qw_experts_gather_swiglu: experts have ", w.bits, " bits, expected 4 or 5");
     }
 }
