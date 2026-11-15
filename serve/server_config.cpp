@@ -244,6 +244,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "and a retryable 408 goes out; per-read inactivity, not total upload time (httplib's default was 5 s, too "
          "short for multi-MB histories over weak Wi-Fi - strixite #15)"},
         {"capacity", K::Int, 4096, 1 << 20, "524288", "positions per session (at most 262144 x rope-yarn-factor)"},
+        {"total-capacity", K::Int, 0, 1 << 24, "0", "total capacity across all slots"},
+        {"kv-precommit", K::OnOff, 0, 0, "off", "precommit kv cache"},
         {"total-slots", K::Int, 1, 8, "2",
          "conversations served at once, each its own state at the full capacity (one slot's state is ~8 GiB at 512k "
          "with 8-bit K/V); requests past them wait in arrival order. Startup refuses a count the memory doesn't hold, "
@@ -308,6 +310,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         // deploy/strix-server.conf).
         {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-escalating-margin", K::OnOff, 0, 0, "off", "MTP: escalating logit margin"},
+        {"mtp-margin-slope", K::Number, 0, 10, "0.08", "MTP: escalating margin slope"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},
