@@ -332,6 +332,7 @@ int run(int argc, char **argv) {
     eng_opts.mtp_spec_adapt_w = settings.integer("mtp-spec-adapt-w");
     eng_opts.mtp_spec_adapt_floor = (float)settings.number("mtp-spec-adapt-floor");
     eng_opts.mtp_spec_adapt_r = settings.integer("mtp-spec-adapt-r");
+    eng_opts.mtp_gate_p = (float)settings.number("mtp-gate-p");
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;
     eng_opts.think_nudge_wording = nudge_wording;
@@ -352,6 +353,9 @@ int run(int argc, char **argv) {
     if (use_mtp && eng_opts.mtp_spec_adapt) {
         slog(LogLevel::Info, "startup: MTP spec adapt on: window %lld rounds, floor %.2f, cooldown %lld tokens",
              (long long)eng_opts.mtp_spec_adapt_w, eng_opts.mtp_spec_adapt_floor, (long long)eng_opts.mtp_spec_adapt_r);
+    }
+    if (use_mtp && eng_opts.mtp_gate_p > 0.0f) {
+        slog(LogLevel::Info, "startup: MTP probability gate on: p >= %.2f", eng_opts.mtp_gate_p);
     }
     slog(LogLevel::Info, "startup: thinking %s for requests that don't say", cfg.thinking_default ? "on" : "off");
     if (!capture_dir.empty()) {

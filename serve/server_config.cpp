@@ -310,6 +310,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         // deploy/strix-server.conf).
         {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-gate-p", K::Number, 0, 1, "0.90",
+         "MTP: Halogen-style probability gate: draft only while top-1 probability is at least this; 0 = off"},
         {"mtp-escalating-margin", K::OnOff, 0, 0, "off", "MTP: escalating logit margin"},
         {"mtp-margin-slope", K::Number, 0, 10, "0.08", "MTP: escalating margin slope"},
         {"mtp-spec-adapt", K::OnOff, 0, 0, "on",

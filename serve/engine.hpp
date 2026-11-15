@@ -564,6 +564,7 @@ public:
         int64_t mtp_spec_adapt_w = 32;
         float mtp_spec_adapt_floor = 0.35f;
         int64_t mtp_spec_adapt_r = 64;
+        float mtp_gate_p = 0.90f; // Halogen-style probability gate (0.0 = off): first draft under p ends chain
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -630,6 +631,7 @@ public:
     const LmBackend &backend() const { return be_; }
     const PromptCache *prompt_cache() const { return cache_; }
     float mtp_margin() const { return options_.mtp_margin; }
+    float mtp_gate_p() const { return options_.mtp_gate_p; }
     bool mtp_spec_adapt() const { return options_.mtp_spec_adapt; }
     int64_t mtp_spec_adapt_w() const { return options_.mtp_spec_adapt_w; }
     float mtp_spec_adapt_floor() const { return options_.mtp_spec_adapt_floor; }

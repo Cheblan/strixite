@@ -74,6 +74,8 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
     STRIX_CHECK(options_.mtp_spec_adapt_floor >= 0.0f && options_.mtp_spec_adapt_floor <= 1.0f,
                 "Engine: mtp_spec_adapt_floor must be in [0, 1]");
     STRIX_CHECK(options_.mtp_spec_adapt_r >= 0, "Engine: mtp_spec_adapt_r must be >= 0");
+    STRIX_CHECK(options_.mtp_gate_p >= 0.0f && options_.mtp_gate_p < 1.0f,
+                "Engine: mtp_gate_p must be in [0, 1)");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
@@ -1535,7 +1537,7 @@ void Engine::run(Job &job, Slot &sl) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    if (d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
@@ -1543,8 +1545,14 @@ void Engine::run(Job &job, Slot &sl) {
                         if (!so->allows(draft_at, d)) break;
                         draft_at = so->after(draft_at, d);
                     }
+                    const float margin = t.best_v - t.second_v;
+                    if (margin < options_.mtp_margin) break;
                     ids.push_back(d);
                     if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
+                    if (options_.mtp_gate_p > 0.0f) {
+                        const float p = 1.0f / (1.0f + expf(-margin));
+                        if (p < options_.mtp_gate_p) break;
+                    }
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {
