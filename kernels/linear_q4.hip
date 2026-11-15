@@ -41,15 +41,21 @@ __device__ inline void load_x32(const float *x, int64_t off, float (&v)[kChunk])
 }
 __device__ inline void load_x32(const uint16_t *x, int64_t off, float (&v)[kChunk]) {
     const uint4 *p = reinterpret_cast<const uint4 *>(x + off);
+    uint4 u0 = p[0], u1 = p[1], u2 = p[2], u3 = p[3];
+    uint32_t w4_0[4] = {u0.x, u0.y, u0.z, u0.w};
+    uint32_t w4_1[4] = {u1.x, u1.y, u1.z, u1.w};
+    uint32_t w4_2[4] = {u2.x, u2.y, u2.z, u2.w};
+    uint32_t w4_3[4] = {u3.x, u3.y, u3.z, u3.w};
 #pragma unroll
-    for (int i = 0; i < kChunk / 8; ++i) {
-        uint4 u = p[i];
-        uint32_t w4[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            v[8 * i + 2 * j] = __uint_as_float(w4[j] << 16);
-            v[8 * i + 2 * j + 1] = __uint_as_float(w4[j] & 0xffff0000u);
-        }
+    for (int j = 0; j < 4; ++j) {
+        v[2 * j]         = __uint_as_float(w4_0[j] << 16);
+        v[2 * j + 1]     = __uint_as_float(w4_0[j] & 0xffff0000u);
+        v[8 + 2 * j]     = __uint_as_float(w4_1[j] << 16);
+        v[8 + 2 * j + 1] = __uint_as_float(w4_1[j] & 0xffff0000u);
+        v[16 + 2 * j]    = __uint_as_float(w4_2[j] << 16);
+        v[16 + 2 * j + 1]= __uint_as_float(w4_2[j] & 0xffff0000u);
+        v[24 + 2 * j]    = __uint_as_float(w4_3[j] << 16);
+        v[24 + 2 * j + 1]= __uint_as_float(w4_3[j] & 0xffff0000u);
     }
 }
 
@@ -278,46 +284,133 @@ __global__ void __launch_bounds__(kThreads)
 // Combine: y[m, :] = sum_a coef[m, a] * h[m, a, :] * W[ids[m, a]]^T - one
 // output row is a single A*K-long reduction; lanes walk its chunks flattened
 // across experts, so short expert rows (K=640 is 20 chunks) still fill a wave.
+// 4-row wave unroll: each wave computes 4 consecutive output rows n0..n0+3,
+// sharing xv and xsum across all 4 rows, reducing memory traffic by 4x.
 template <typename T, int G, int HB>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_combine_kernel(const T *h, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                                      const int32_t *ids, const float *coef, int64_t E, int64_t A, T *y, int64_t N,
                                      int64_t K, int KS, uint32_t *err) {
-    __shared__ float part[kThreads / 32];
+    __shared__ float part[4][kThreads / 32];
+    __shared__ int32_t s_ids[64];
+    __shared__ float s_coef[64];
+
     const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
-    const int64_t n = (int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS;
+    const int64_t n0 = ((int64_t)blockIdx.x * (blockDim.x / warpSize / KS) + wave / KS) * 4;
     const int64_t m = blockIdx.y;
-    const uint32_t kc = (uint32_t)(K / kChunk);  // chunks per expert row (32-bit: A*kc < 2^32, checked on launch)
+    const uint32_t kc = (uint32_t)(K / kChunk);  // chunks per expert row
+
+    for (int a = threadIdx.x; a < A; a += blockDim.x) {
+        s_ids[a] = ids[m * A + a];
+        s_coef[a] = coef[m * A + a];
+    }
+    __syncthreads();
+
     bool ok = true;
-    for (int64_t a = 0; a < A; ++a) ok = ok && ids[m * A + a] >= 0 && ids[m * A + a] < E;
-    float acc = 0.f;
-    if (ok && n < N) {
-        for (uint32_t c = (uint32_t)(ks * warpSize + lane); c < (uint32_t)A * kc; c += (uint32_t)(KS * warpSize)) {
-            const uint32_t a = c / kc, cc = c % kc;
-            const int64_t row = (int64_t)ids[m * A + a] * N + n;
-            const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
-            uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
-            uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-            const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
-            const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);
-            const float mn = bf16_bits_to_f32(minv[row * (K / G) + (int64_t)cc * kChunk / G]);
+    for (int64_t a = 0; a < A; ++a) ok = ok && s_ids[a] >= 0 && s_ids[a] < E;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    if (ok && n0 < N) {
+        const uint32_t step = (uint32_t)(KS * warpSize);
+        uint32_t c = (uint32_t)(ks * warpSize + lane);
+        uint32_t a = c / kc;
+        uint32_t cc = c % kc;
+        const uint32_t limit = (uint32_t)A * kc;
+
+        while (c < limit) {
             float xv[kChunk];
             load_x32(h, (m * A + a) * K + (int64_t)cc * kChunk, xv);
-            float dot = 0.f, xsum = 0.f;
+
+            // Row 0
+            const int64_t row0 = (int64_t)s_ids[a] * N + n0;
+            const uint8_t *qrow0 = q + row0 * qsplit_row_bytes<HB>(K);
+            uint4 packed0 = reinterpret_cast<const uint4 *>(qrow0)[cc];
+            uint32_t words0[4] = {packed0.x, packed0.y, packed0.z, packed0.w};
+            const QHigh32<HB> hb0 = QHigh32<HB>::load(qrow0, K, (int64_t)cc * kChunk);
+            const float s0 = bf16_bits_to_f32(scale[row0 * (K / G) + (int64_t)cc * kChunk / G]);
+            const float mn0 = bf16_bits_to_f32(minv[row0 * (K / G) + (int64_t)cc * kChunk / G]);
+
+            float dot0 = 0.f, xsum = 0.f;
 #pragma unroll
             for (int i = 0; i < kChunk; ++i) {
-                dot = fmaf(xv[i], (float)(((words[i / 8] >> (4 * (i % 8))) & 0xFu) | hb.at(i)), dot);
+                dot0 = fmaf(xv[i], (float)(((words0[i / 8] >> (4 * (i % 8))) & 0xFu) | hb0.at(i)), dot0);
                 xsum += xv[i];
             }
-            acc = fmaf(coef[m * A + a], fmaf(s, dot, mn * xsum), acc);
+            acc0 = fmaf(s_coef[a], fmaf(s0, dot0, mn0 * xsum), acc0);
+
+            // Row 1
+            if (n0 + 1 < N) {
+                const int64_t row1 = row0 + 1;
+                const uint8_t *qrow1 = q + row1 * qsplit_row_bytes<HB>(K);
+                uint4 packed1 = reinterpret_cast<const uint4 *>(qrow1)[cc];
+                uint32_t words1[4] = {packed1.x, packed1.y, packed1.z, packed1.w};
+                const QHigh32<HB> hb1 = QHigh32<HB>::load(qrow1, K, (int64_t)cc * kChunk);
+                const float s1 = bf16_bits_to_f32(scale[row1 * (K / G) + (int64_t)cc * kChunk / G]);
+                const float mn1 = bf16_bits_to_f32(minv[row1 * (K / G) + (int64_t)cc * kChunk / G]);
+                float dot1 = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    dot1 = fmaf(xv[i], (float)(((words1[i / 8] >> (4 * (i % 8))) & 0xFu) | hb1.at(i)), dot1);
+                }
+                acc1 = fmaf(s_coef[a], fmaf(s1, dot1, mn1 * xsum), acc1);
+            }
+
+            // Row 2
+            if (n0 + 2 < N) {
+                const int64_t row2 = row0 + 2;
+                const uint8_t *qrow2 = q + row2 * qsplit_row_bytes<HB>(K);
+                uint4 packed2 = reinterpret_cast<const uint4 *>(qrow2)[cc];
+                uint32_t words2[4] = {packed2.x, packed2.y, packed2.z, packed2.w};
+                const QHigh32<HB> hb2 = QHigh32<HB>::load(qrow2, K, (int64_t)cc * kChunk);
+                const float s2 = bf16_bits_to_f32(scale[row2 * (K / G) + (int64_t)cc * kChunk / G]);
+                const float mn2 = bf16_bits_to_f32(minv[row2 * (K / G) + (int64_t)cc * kChunk / G]);
+                float dot2 = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    dot2 = fmaf(xv[i], (float)(((words2[i / 8] >> (4 * (i % 8))) & 0xFu) | hb2.at(i)), dot2);
+                }
+                acc2 = fmaf(s_coef[a], fmaf(s2, dot2, mn2 * xsum), acc2);
+            }
+
+            // Row 3
+            if (n0 + 3 < N) {
+                const int64_t row3 = row0 + 3;
+                const uint8_t *qrow3 = q + row3 * qsplit_row_bytes<HB>(K);
+                uint4 packed3 = reinterpret_cast<const uint4 *>(qrow3)[cc];
+                uint32_t words3[4] = {packed3.x, packed3.y, packed3.z, packed3.w};
+                const QHigh32<HB> hb3 = QHigh32<HB>::load(qrow3, K, (int64_t)cc * kChunk);
+                const float s3 = bf16_bits_to_f32(scale[row3 * (K / G) + (int64_t)cc * kChunk / G]);
+                const float mn3 = bf16_bits_to_f32(minv[row3 * (K / G) + (int64_t)cc * kChunk / G]);
+                float dot3 = 0.f;
+#pragma unroll
+                for (int i = 0; i < kChunk; ++i) {
+                    dot3 = fmaf(xv[i], (float)(((words3[i / 8] >> (4 * (i % 8))) & 0xFu) | hb3.at(i)), dot3);
+                }
+                acc3 = fmaf(s_coef[a], fmaf(s3, dot3, mn3 * xsum), acc3);
+            }
+
+            c += step;
+            cc += step;
+            while (cc >= kc && c < limit) {
+                cc -= kc;
+                ++a;
+            }
         }
     }
-    acc = reduce_row(acc, part, wave, ks, KS);
-    if (lane == 0 && ks == 0 && n < N) {
-        if (!ok && n == 0)
+
+    acc0 = reduce_row(acc0, part[0], wave, ks, KS);
+    acc1 = reduce_row(acc1, part[1], wave, ks, KS);
+    acc2 = reduce_row(acc2, part[2], wave, ks, KS);
+    acc3 = reduce_row(acc3, part[3], wave, ks, KS);
+
+    if (lane == 0 && ks == 0) {
+        if (!ok && n0 == 0)
             for (int64_t a = 0; a < A; ++a)
-                if (!expert_id_ok(ids[m * A + a], E, err, m * A + a)) break;
-        store(y, m * N + n, ok ? acc : __int_as_float(0x7fc00000));
+                if (!expert_id_ok(s_ids[a], E, err, m * A + a)) break;
+        if (n0 < N) store(y, m * N + n0, ok ? acc0 : __int_as_float(0x7fc00000));
+        if (n0 + 1 < N) store(y, m * N + n0 + 1, ok ? acc1 : __int_as_float(0x7fc00000));
+        if (n0 + 2 < N) store(y, m * N + n0 + 2, ok ? acc2 : __int_as_float(0x7fc00000));
+        if (n0 + 3 < N) store(y, m * N + n0 + 3, ok ? acc3 : __int_as_float(0x7fc00000));
     }
 }
 
@@ -377,13 +470,15 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
                 " x K / ", kChunk, " = ", A * (w.K / kChunk), " chunks, expected < 2^32 (a 32-bit index)");
     const int64_t out_rows = swiglu ? N / 2 : N;  // swiglu: a wave per (gate, up) row pair
     const unsigned bx = (unsigned)((out_rows + rows_per_block - 1) / rows_per_block);
+    const int64_t rows_per_block_combine = rows_per_block * 4;
+    const unsigned bx_combine = (unsigned)((N + rows_per_block_combine - 1) / rows_per_block_combine);
     dim3 block(kThreads);
 #define STRIX_Q4_EXPERTS(G)                                                                                         \
     if (swiglu)                                                                                                     \
         linear_q4_experts_gather_swiglu_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>( \
             x, w.q, w.scale, w.minv, ids, E, A, y, N, w.K, KS, err);                                                \
     else if (combine)                                                                                               \
-        linear_q4_experts_combine_kernel<T, G, HB><<<dim3(bx, (unsigned)M), block, 0, stream>>>(                    \
+        linear_q4_experts_combine_kernel<T, G, HB><<<dim3(bx_combine, (unsigned)M), block, 0, stream>>>(            \
             x, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err);                                          \
     else                                                                                                            \
         linear_q4_experts_gather_kernel<T, G, HB><<<dim3(bx, (unsigned)A, (unsigned)M), block, 0, stream>>>(        \
