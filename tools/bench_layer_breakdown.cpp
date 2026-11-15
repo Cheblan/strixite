@@ -159,16 +159,16 @@ void run_breakdown(int64_t T) {
     // 2. Attention Layer (12 layers)
     // --------------------------------------------------------------------------
     std::printf("--- 2. Attention Layer Breakdown (12 layers) ---\n");
-    const int64_t astride = 13312; // [13312 x 2560]
+    const int64_t hq = 24, hkv = 2, hd = 256;
+    const int64_t astride = 13952; // [13952 x 2560]
     Q8Device w_attn_qkv = make_random_q8(astride, d, 64, rng, "attn_qkv");
     DeviceBuffer<uint16_t> attn_proj((size_t)(T * astride), "attn_proj");
 
     float ms_attn_qkv = time_kernel([&]() {
         linear_q8_wmma(x_u.get(), w_attn_qkv.view(), attn_proj.get(), T, Act::BF16, Act::BF16, stream);
-    }, "attn_qkv (linear_q8_wmma [13312x2560])");
+    }, "attn_qkv (linear_q8_wmma [13952x2560])");
 
     // qk_norm_rope_jobs
-    const int64_t hq = 16, hkv = 8, hd = 128;
     std::vector<float> host_q_norm(hd, 1.0f), host_k_norm(hd, 1.0f);
     DeviceBuffer<float> q_norm = DeviceBuffer<float>::from_host(host_q_norm, "q_norm");
     DeviceBuffer<float> k_norm = DeviceBuffer<float>::from_host(host_k_norm, "k_norm");
@@ -184,13 +184,13 @@ void run_breakdown(int64_t T) {
     };
 
     float ms_qk_norm_rope = time_kernel([&]() {
-        qk_norm_rope_jobs(nr, 3, T, 1e-6f, 128, 0, inv_freq.get(), Act::BF16, stream);
+        qk_norm_rope_jobs(nr, 3, T, 1e-6f, 64, 0, inv_freq.get(), Act::BF16, stream);
     }, "qk_norm_rope_jobs (q, k, v RoPE)");
 
     // attention_wmma
     AttentionShape as{T, 0, hq, hkv, hd, astride, 2 * hd};
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-    size_t attn_ws_bytes = (size_t)T * hq * 128 * sizeof(float);
+    size_t attn_ws_bytes = (size_t)T * hq * hd * sizeof(float);
     DeviceBuffer<float> attn_ws(attn_ws_bytes / 4, "attn_ws");
     DeviceBuffer<uint16_t> attn_core((size_t)(T * hq * hd), "attn_core");
 
@@ -199,11 +199,11 @@ void run_breakdown(int64_t T) {
                        T, as, attn_scale, attn_core.get(), attn_ws.get(), attn_ws_bytes, Act::BF16, stream);
     }, "attention_wmma (Softmax Attention)");
 
-    // attn_o: Q8 [2560, 2048, G=64]
+    // attn_o: Q8 [2560, 6144, G=64]
     Q8Device w_attn_o = make_random_q8(d, hq * hd, 64, rng, "attn_o");
     float ms_attn_o = time_kernel([&]() {
         linear_q8_wmma(attn_core.get(), w_attn_o.view(), y_buf.get(), T, Act::BF16, Act::BF16, stream);
-    }, "attn_o (linear_q8_wmma [2560x2048])");
+    }, "attn_o (linear_q8_wmma [2560x6144])");
 
     float ms_attn_total = ms_attn_qkv + ms_qk_norm_rope + ms_attn_core + ms_attn_o;
     std::printf("  TOTAL Attention Layer (single layer)  : %7.3f ms\n", ms_attn_total);
