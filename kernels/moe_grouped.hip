@@ -920,9 +920,11 @@ template <typename T> __device__ inline float as_stored(float v) {
     if constexpr (sizeof(T) == 2) return bf16_bits_to_f32(f32_to_bf16_bits(v));
     else return v;
 }
+constexpr int kCombineReduceThreads = 64;
+
 // SH: the shared expert's gated add folded in (MoeSharedAdd): y = stored(sum) + g s, moe_shared_add's arithmetic.
 template <typename T, int V, bool SH>
-__global__ void __launch_bounds__(kThreads)
+__global__ void __launch_bounds__(kCombineReduceThreads)
     combine_reduce_kernel(const float *partial, const int32_t *ids, const float *coef, int64_t M, int64_t A,
                           int64_t E, int64_t N, T *y, bool pbf16, const T *s, const float *gate_logit, int64_t gate_ld,
                           uint32_t gate_index, uint32_t *err) {
@@ -1204,7 +1206,7 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
     // 8 columns a thread when they are whole 16-byte runs (partial, y and s rows: N % 8 == 0, 16-byte aligned bases).
     const bool vec = N % 8 == 0 && reinterpret_cast<uintptr_t>(partial) % 16 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0 &&
                      (shared == nullptr || reinterpret_cast<uintptr_t>(shared->s) % 16 == 0);
-    const unsigned blocks = (unsigned)((M * N / (vec ? 8 : 1) + kThreads - 1) / kThreads);
+    const unsigned blocks = (unsigned)((M * N / (vec ? 8 : 1) + kCombineReduceThreads - 1) / kCombineReduceThreads);
     auto reduce = [&](auto *yt) {
         using T = std::remove_pointer_t<decltype(yt)>;
         const T *s = shared ? static_cast<const T *>(shared->s) : nullptr;
@@ -1213,7 +1215,7 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
         const uint32_t gi = shared ? shared->gate_index : 0;
         uint32_t *err = shared ? shared->err : nullptr;
         auto go = [&](auto v_c, auto sh_c) {
-            combine_reduce_kernel<T, decltype(v_c)::value, decltype(sh_c)::value><<<blocks, kThreads, 0, stream>>>(
+            combine_reduce_kernel<T, decltype(v_c)::value, decltype(sh_c)::value><<<blocks, kCombineReduceThreads, 0, stream>>>(
                 partial, ids, coef, M, A, E, N, yt, pbf16, s, gl, gld, gi, err);
         };
         using V1 = std::integral_constant<int, 1>;
