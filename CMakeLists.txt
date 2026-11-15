@@ -284,6 +284,10 @@ target_link_libraries(bench_layer_breakdown PRIVATE strix_model)
 add_executable(test_qsa_attn tools/test_qsa_attn.cpp)
 target_link_libraries(test_qsa_attn PRIVATE strix_model)
 
+add_executable(test_hc_down_opt)
+strix_hip_sources(test_hc_down_opt tools/test_hc_down_opt.hip)
+target_link_libraries(test_hc_down_opt PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
