@@ -138,7 +138,7 @@ def run_query(task):
 
 def main():
     print("=" * 80)
-    print("BENCHMARK: Static MTP (draft=7) vs Softened Adaptive MTP (draft=4..12)")
+    print("BENCHMARK: Static MTP (draft=7) vs EMA-Smoothed Adaptive MTP (draft=4..12)")
     print(f"Server Target: {BASE_URL}")
     print("=" * 80)
 
@@ -163,8 +163,8 @@ def main():
         print(f" {res['tokens']} tok in {res['time_s']:.2f}s ({res['tok_per_sec']:.2f} tok/s)")
         baseline_results.append(res)
     
-    # 3. Run Adaptive Dynamic MTP (4..12, softened growth)
-    print("\n[3/4] Running Adaptive Dynamic MTP (draft_min=4, draft_max=12, softened growth)...")
+    # 3. Run Adaptive Dynamic MTP (4..12, EMA smoothing)
+    print("\n[3/4] Running Adaptive Dynamic MTP (draft_min=4, draft_max=12, EMA smoothing)...")
     set_mtp_config(dynamic=True, draft=7, draft_min=4, draft_max=12)
     adaptive_results = []
     for idx, task in enumerate(PROMPTS):
