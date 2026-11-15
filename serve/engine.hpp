@@ -572,16 +572,8 @@ public:
         bool mtp_dynamic = false; // dynamically adjust MTP draft depth based on acceptance rate
         int64_t mtp_draft_min = 4; // minimum draft depth in dynamic mode
         int64_t mtp_draft_max = 12; // maximum draft depth in dynamic mode
-        bool mtp_adaptive_margin = false;   // dynamically adjust MTP logit margin based on acceptance rate
-        bool mtp_escalating_margin = false; // escalate MTP margin with draft depth
+        bool mtp_escalating_margin = true; // escalate MTP margin with draft depth
         float mtp_margin_slope = 0.08f;     // margin increase per draft step in escalating mode
-        bool mtp_phase_aware = false;       // restrict draft range during thinking phase
-        int64_t mtp_think_draft_max = 6;    // max draft depth during reasoning
-        bool mtp_probe = false;             // optimistic probe when stuck at draft_min
-        int64_t mtp_probe_interval = 4;     // steps at min draft before probing
-        int64_t mtp_probe_depth = 7;        // depth of optimistic probe
-        bool mtp_confidence_budget = false; // cumulative confidence deficit budget
-        float mtp_budget_cap = 1.5f;        // max accumulated confidence surplus
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -655,28 +647,15 @@ public:
     bool mtp_adaptive_margin() const { return options_.mtp_adaptive_margin; }
     bool mtp_escalating_margin() const { return options_.mtp_escalating_margin; }
     float mtp_margin_slope() const { return options_.mtp_margin_slope; }
-    bool mtp_phase_aware() const { return options_.mtp_phase_aware; }
-    int64_t mtp_think_draft_max() const { return options_.mtp_think_draft_max; }
-    bool mtp_probe() const { return options_.mtp_probe; }
-    int64_t mtp_probe_interval() const { return options_.mtp_probe_interval; }
-    int64_t mtp_probe_depth() const { return options_.mtp_probe_depth; }
-    bool mtp_confidence_budget() const { return options_.mtp_confidence_budget; }
-    float mtp_budget_cap() const { return options_.mtp_budget_cap; }
+    bool mtp_escalating_margin() const { return options_.mtp_escalating_margin; }
+    float mtp_margin_slope() const { return options_.mtp_margin_slope; }
     void set_mtp_margin(float m) { options_.mtp_margin = m; }
     void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
     void set_mtp_dynamic(bool d) { options_.mtp_dynamic = d; }
     void set_mtp_draft_min(int64_t m) { options_.mtp_draft_min = m; }
     void set_mtp_draft_max(int64_t m) { options_.mtp_draft_max = m; }
-    void set_mtp_adaptive_margin(bool m) { options_.mtp_adaptive_margin = m; }
     void set_mtp_escalating_margin(bool m) { options_.mtp_escalating_margin = m; }
     void set_mtp_margin_slope(float s) { options_.mtp_margin_slope = s; }
-    void set_mtp_phase_aware(bool p) { options_.mtp_phase_aware = p; }
-    void set_mtp_think_draft_max(int64_t m) { options_.mtp_think_draft_max = m; }
-    void set_mtp_probe(bool p) { options_.mtp_probe = p; }
-    void set_mtp_probe_interval(int64_t n) { options_.mtp_probe_interval = n; }
-    void set_mtp_probe_depth(int64_t d) { options_.mtp_probe_depth = d; }
-    void set_mtp_confidence_budget(bool b) { options_.mtp_confidence_budget = b; }
-    void set_mtp_budget_cap(float c) { options_.mtp_budget_cap = c; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
