@@ -180,7 +180,7 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
                                        int64_t chunks, int ks, int KS, int lane, int64_t K = 0) {
     float acc = 0.f;
     for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
-        uint4 packed = reinterpret_cast<const uint4 *>(qrow)[c];
+        uint4 packed = nt_load_uint4(reinterpret_cast<const uint4 *>(qrow) + c);
         uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
         const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, c * kChunk);
         const float s = bf16_bits_to_f32(srow[c * kChunk / G]);
@@ -296,7 +296,7 @@ __global__ void __launch_bounds__(kThreads)
             const uint32_t a = c / kc, cc = c % kc;
             const int64_t row = (int64_t)ids[m * A + a] * N + n;
             const uint8_t *qrow = q + row * qsplit_row_bytes<HB>(K);
-            uint4 packed = reinterpret_cast<const uint4 *>(qrow)[cc];
+            uint4 packed = nt_load_uint4(reinterpret_cast<const uint4 *>(qrow) + cc);
             uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const QHigh32<HB> hb = QHigh32<HB>::load(qrow, K, (int64_t)cc * kChunk);
             const float s = bf16_bits_to_f32(scale[row * (K / G) + (int64_t)cc * kChunk / G]);

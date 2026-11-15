@@ -10,6 +10,17 @@
 
 namespace strix::kernels {
 
+typedef unsigned int v4u __attribute__((vector_size(16)));
+
+__device__ inline uint4 nt_load_uint4(const void *ptr) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    v4u v = __builtin_nontemporal_load(reinterpret_cast<const v4u *>(ptr));
+    return *reinterpret_cast<const uint4 *>(&v);
+#else
+    return *reinterpret_cast<const uint4 *>(ptr);
+#endif
+}
+
 template <int HB>
 __host__ __device__ constexpr int64_t qsplit_row_bytes(int64_t K) {
     static_assert(HB == 0 || HB == 1, "Q4 (HB 0) or Q5 (HB 1)");

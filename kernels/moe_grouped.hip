@@ -230,7 +230,7 @@ __global__ void __launch_bounds__(kThreads)
         const uint4 *qrow = reinterpret_cast<const uint4 *>(rowb);
         const uint16_t *srow = scale + row * (K / G), *mrow = minv + row * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
-            const uint4 packed = qrow[k / kChunk];
+            const uint4 packed = nt_load_uint4(qrow + k / kChunk);
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const QHigh32<HB> hb = QHigh32<HB>::load(rowb, K, k);
             const float s = bf16_bits_to_f32(srow[k / G]), mn = bf16_bits_to_f32(mrow[k / G]);
@@ -424,7 +424,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     uint4 cq;
     uint16_t fs[kWinLoads], fm[kWinLoads];
     auto wfetch = [&](int64_t k0) {
-        cq = *reinterpret_cast<const uint4 *>(cptr + k0 / 2);
+        cq = nt_load_uint4(cptr + k0 / 2);
         const int64_t g0 = k0 / G;
         if (k0 % G == 0 && g0 % kWin == 0)
 #pragma unroll
@@ -756,7 +756,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     uint32_t xb[kXPasses][4];           // 8 BF16 x values a pass
     const auto fetch = [&](int64_t k0) {
         if (wrow >= 0) {
-            qc = *reinterpret_cast<const uint4 *>(q + wrow * (K / 2) + k0 / 2);
+            qc = nt_load_uint4(q + wrow * (K / 2) + k0 / 2);
             if (k0 % G == 0) sb = scale[wrow * groups + k0 / G], mb = minv[wrow * groups + k0 / G];
         }
 #pragma unroll
