@@ -278,6 +278,9 @@ target_link_libraries(bench_moe_breakdown PRIVATE strix_model)
 add_executable(bench_hc_prefill tools/bench_hc_prefill.cpp)
 target_link_libraries(bench_hc_prefill PRIVATE strix_model)
 
+add_executable(bench_layer_breakdown tools/bench_layer_breakdown.cpp)
+target_link_libraries(bench_layer_breakdown PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
