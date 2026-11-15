@@ -572,6 +572,9 @@ public:
         bool mtp_dynamic = false; // dynamically adjust MTP draft depth based on acceptance rate
         int64_t mtp_draft_min = 4; // minimum draft depth in dynamic mode
         int64_t mtp_draft_max = 12; // maximum draft depth in dynamic mode
+        bool mtp_adaptive_margin = false;   // dynamically adjust MTP logit margin based on acceptance rate
+        bool mtp_escalating_margin = false; // escalate MTP margin with draft depth
+        float mtp_margin_slope = 0.08f;     // margin increase per draft step in escalating mode
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
         std::string capture_dir;
@@ -642,11 +645,17 @@ public:
     bool mtp_dynamic() const { return options_.mtp_dynamic; }
     int64_t mtp_draft_min() const { return options_.mtp_draft_min; }
     int64_t mtp_draft_max() const { return options_.mtp_draft_max; }
+    bool mtp_adaptive_margin() const { return options_.mtp_adaptive_margin; }
+    bool mtp_escalating_margin() const { return options_.mtp_escalating_margin; }
+    float mtp_margin_slope() const { return options_.mtp_margin_slope; }
     void set_mtp_margin(float m) { options_.mtp_margin = m; }
     void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
     void set_mtp_dynamic(bool d) { options_.mtp_dynamic = d; }
     void set_mtp_draft_min(int64_t m) { options_.mtp_draft_min = m; }
     void set_mtp_draft_max(int64_t m) { options_.mtp_draft_max = m; }
+    void set_mtp_adaptive_margin(bool m) { options_.mtp_adaptive_margin = m; }
+    void set_mtp_escalating_margin(bool m) { options_.mtp_escalating_margin = m; }
+    void set_mtp_margin_slope(float s) { options_.mtp_margin_slope = s; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }

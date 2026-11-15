@@ -74,6 +74,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
                 "Engine: mtp_draft_min must be <= mtp_draft_max");
     STRIX_CHECK(options_.mtp_draft_max >= 1 && options_.mtp_draft_max <= 15,
                 "Engine: mtp_draft_max must be <= 15");
+    STRIX_CHECK(options_.mtp_margin_slope >= 0.0f, "Engine: mtp_margin_slope must be >= 0");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
     (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
@@ -1418,6 +1419,7 @@ void Engine::run(Job &job, Slot &sl) {
         int32_t carry = -1;
         int64_t dynamic_draft = std::clamp(options_.mtp_draft, options_.mtp_draft_min, options_.mtp_draft_max);
         int64_t draft_streak = 0;
+        float dynamic_margin = options_.mtp_margin;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1547,7 +1549,11 @@ void Engine::run(Job &job, Slot &sl) {
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
-                    if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    float required_margin = options_.mtp_adaptive_margin ? dynamic_margin : options_.mtp_margin;
+                    if (options_.mtp_escalating_margin) {
+                        required_margin += (float)step * options_.mtp_margin_slope;
+                    }
+                    if (t.best_v - t.second_v < required_margin || d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
@@ -1605,6 +1611,22 @@ void Engine::run(Job &job, Slot &sl) {
                                 dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 2);
                             } else if (j * 2 < k) {
                                 dynamic_draft = std::max(options_.mtp_draft_min, dynamic_draft - 1);
+                            }
+                        }
+                    }
+                    if (options_.mtp_adaptive_margin) {
+                        constexpr float kMinMargin = 1.0f;
+                        constexpr float kMaxMargin = 2.5f;
+                        if (j == k && k == steps) {
+                            const float dec = (draft_streak >= 2) ? 0.20f : 0.10f;
+                            dynamic_margin = std::max(kMinMargin, dynamic_margin - dec);
+                        } else {
+                            if (j <= 1 && k >= 3) {
+                                dynamic_margin = std::min(kMaxMargin, dynamic_margin + 0.35f);
+                            } else if (j * 2 < k) {
+                                dynamic_margin = std::min(kMaxMargin, dynamic_margin + 0.20f);
+                            } else if (j == k && k < steps) {
+                                dynamic_margin = std::max(kMinMargin, dynamic_margin - 0.05f);
                             }
                         }
                     }

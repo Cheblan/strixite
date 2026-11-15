@@ -776,6 +776,15 @@ void HttpServer::routes() {
         }
         if (req.has_param("draft_min")) engine_.set_mtp_draft_min(std::stoll(req.get_param_value("draft_min")));
         if (req.has_param("draft_max")) engine_.set_mtp_draft_max(std::stoll(req.get_param_value("draft_max")));
+        if (req.has_param("adaptive_margin")) {
+            const std::string v = req.get_param_value("adaptive_margin");
+            engine_.set_mtp_adaptive_margin(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("escalating_margin")) {
+            const std::string v = req.get_param_value("escalating_margin");
+            engine_.set_mtp_escalating_margin(v == "1" || v == "on" || v == "true");
+        }
+        if (req.has_param("margin_slope")) engine_.set_mtp_margin_slope(std::stof(req.get_param_value("margin_slope")));
         json::Value b = json::Value::object();
         b.set("status", json::Value::string("ok"));
         b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
@@ -783,6 +792,9 @@ void HttpServer::routes() {
         b.set("mtp_dynamic", json::Value::boolean(engine_.mtp_dynamic()));
         b.set("mtp_draft_min", json::Value::integer(engine_.mtp_draft_min()));
         b.set("mtp_draft_max", json::Value::integer(engine_.mtp_draft_max()));
+        b.set("mtp_adaptive_margin", json::Value::boolean(engine_.mtp_adaptive_margin()));
+        b.set("mtp_escalating_margin", json::Value::boolean(engine_.mtp_escalating_margin()));
+        b.set("mtp_margin_slope", json::Value::number(engine_.mtp_margin_slope()));
         res.set_content(b.dump(), "application/json");
     };
     svr_->Get("/set_mtp", handle_set_mtp);
