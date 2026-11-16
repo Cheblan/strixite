@@ -223,12 +223,16 @@ __global__ void __launch_bounds__(kWmmaThreads)
     wmma_f32x8 acc[2][2] = {};
     __syncthreads();
     // F16: h rounded once to F16, the codes dequantized to F16 while staged;
-    // software-pipelined (kernels/wmma_gemm.hpp).
-    WmmaXTileF32ToF16<BM> xt;
-    UpCodes<BITS, G> wt;
-    xt.fetch(h, hoff, rows_x, 0);
-    wt.fetch(q, scale, minv, N, r, d, j0, 0);
-    for (int64_t k0 = 0; k0 < r; k0 += kWmmaKC) {
+    // software-pipelined two steps deep with double register sets (xa, xb and wa, wb).
+    WmmaXTileF32ToF16<BM> xa, xb;
+    UpCodes<BITS, G> wa, wb;
+    xa.fetch(h, hoff, rows_x, 0);
+    wa.fetch(q, scale, minv, N, r, d, j0, 0);
+    if (kWmmaKC < r) {
+        xb.fetch(h, hoff, rows_x, kWmmaKC);
+        wb.fetch(q, scale, minv, N, r, d, j0, kWmmaKC);
+    }
+    auto step = [&](WmmaXTileF32ToF16<BM> &xt, UpCodes<BITS, G> &wt, int64_t k0) {
         if (wt.win) {  // uniform: depends on k0 only
             wt.stage_window(sw, mw);
             __syncthreads();
@@ -236,12 +240,16 @@ __global__ void __launch_bounds__(kWmmaThreads)
         xt.stage_f16(xs);
         wt.stage_f16(ws, sw, mw, k0);
         __syncthreads();
-        if (k0 + kWmmaKC < r) {
-            xt.fetch(h, hoff, rows_x, k0 + kWmmaKC);
-            wt.fetch(q, scale, minv, N, r, d, j0, k0 + kWmmaKC);
+        if (k0 + 2 * kWmmaKC < r) {
+            xt.fetch(h, hoff, rows_x, k0 + 2 * kWmmaKC);
+            wt.fetch(q, scale, minv, N, r, d, j0, k0 + 2 * kWmmaKC);
         }
         wmma_step_f16<2, 2>(xs, ws, wm * 32, wn * 32, acc);
         __syncthreads();
+    };
+    for (int64_t k0 = 0; k0 < r; k0 += 2 * kWmmaKC) {
+        step(xa, wa, k0);
+        if (k0 + kWmmaKC < r) step(xb, wb, k0 + kWmmaKC);
     }
     const int s = wn;  // this wave's columns are stream s
 #pragma unroll

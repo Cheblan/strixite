@@ -288,6 +288,14 @@ add_executable(test_hc_down_opt)
 strix_hip_sources(test_hc_down_opt tools/test_hc_down_opt.hip)
 target_link_libraries(test_hc_down_opt PRIVATE strix_model)
 
+add_executable(test_hc_inject_opt)
+strix_hip_sources(test_hc_inject_opt tools/test_hc_inject_opt.hip)
+target_link_libraries(test_hc_inject_opt PRIVATE strix_model)
+
+add_executable(test_hc_up_opt)
+strix_hip_sources(test_hc_up_opt tools/test_hc_up_opt.hip)
+target_link_libraries(test_hc_up_opt PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
