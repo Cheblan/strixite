@@ -82,24 +82,54 @@ __global__ void __launch_bounds__(kWmmaThreads)
     const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
     wmma_f32x8 acc[TM][2] = {};
     __syncthreads();
-    WmmaXTile<TX, BMT, G, false> xt;
-    WT wt;
-    xt.fetch(x, xoff, rows_x, 0);
-    wt.fetch(q, scale, minv, n0, rows_w, K, 0);
-    for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
-        if (wt.win) {  // uniform: depends on k0 only
-            wt.stage_window(sw, mw);
+    if constexpr (BITS == 4) {
+        WmmaXTile<TX, BMT, G, false> xa, xb;
+        WT wa, wb;
+        xa.fetch(x, xoff, rows_x, 0);
+        wa.fetch(q, scale, minv, n0, rows_w, K, 0);
+        if (kWmmaKC < K) {
+            xb.fetch(x, xoff, rows_x, kWmmaKC);
+            wb.fetch(q, scale, minv, n0, rows_w, K, kWmmaKC);
+        }
+        auto step = [&](WmmaXTile<TX, BMT, G, false> &cur_x, WT &cur_w, int64_t k0) {
+            if (cur_w.win) {
+                cur_w.stage_window(sw, mw);
+                __syncthreads();
+            }
+            cur_x.stage_f16(xs);
+            cur_w.stage_f16(ws, sw, mw, k0);
+            __syncthreads();
+            if (k0 + 2 * kWmmaKC < K) {
+                cur_x.fetch(x, xoff, rows_x, k0 + 2 * kWmmaKC);
+                cur_w.fetch(q, scale, minv, n0, rows_w, K, k0 + 2 * kWmmaKC);
+            }
+            wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
+            __syncthreads();
+        };
+        for (int64_t k0 = 0; k0 < K; k0 += 2 * kWmmaKC) {
+            step(xa, wa, k0);
+            if (k0 + kWmmaKC < K) step(xb, wb, k0 + kWmmaKC);
+        }
+    } else {
+        WmmaXTile<TX, BMT, G, false> xt;
+        WT wt;
+        xt.fetch(x, xoff, rows_x, 0);
+        wt.fetch(q, scale, minv, n0, rows_w, K, 0);
+        for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
+            if (wt.win) {  // uniform: depends on k0 only
+                wt.stage_window(sw, mw);
+                __syncthreads();
+            }
+            xt.stage_f16(xs);
+            wt.stage_f16(ws, sw, mw, k0);
+            __syncthreads();
+            if (k0 + kWmmaKC < K) {
+                xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
+                wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
+            }
+            wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
             __syncthreads();
         }
-        xt.stage_f16(xs);
-        wt.stage_f16(ws, sw, mw, k0);
-        __syncthreads();
-        if (k0 + kWmmaKC < K) {
-            xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
-            wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
-        }
-        wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
-        __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < TM; ++i)

@@ -296,6 +296,18 @@ add_executable(test_hc_up_opt)
 strix_hip_sources(test_hc_up_opt tools/test_hc_up_opt.hip)
 target_link_libraries(test_hc_up_opt PRIVATE strix_model)
 
+add_executable(test_combine_timing)
+strix_hip_sources(test_combine_timing tools/test_combine_timing.hip)
+target_link_libraries(test_combine_timing PRIVATE strix_model)
+
+add_executable(test_moe_combine_pipe2)
+strix_hip_sources(test_moe_combine_pipe2 tools/test_moe_combine_pipe2.hip)
+target_link_libraries(test_moe_combine_pipe2 PRIVATE strix_model)
+
+add_executable(test_linear_wmma_opt)
+strix_hip_sources(test_linear_wmma_opt tools/test_linear_wmma_opt.hip)
+target_link_libraries(test_linear_wmma_opt PRIVATE strix_model)
+
 
 
 # The tutorials live in the public repo only; built when present.
