@@ -114,9 +114,8 @@ public:
     void export_snapshot(int slot, HostBuffer &out, int64_t from = 0) override { export_snapshot(0, slot, out, from); }
     uint64_t snapshot_bytes(int slot, int64_t from = 0) const override { return snapshot_bytes(0, slot, from); }
     void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) override { import_state(0, state, n, from); }
-    // The paged seam: this backend's K/V is VMM-paged, so a snapshot's state can go
-    // out as pages instead of a host copy. Available when the session has a parked budget (kv-generations >= 2).
-    bool paged_states() const override { return !is_precommitted() && session_->kv_layout().generations > 1; }
+    // Pure static contiguous flat KV cache: no VMM paging or parking.
+    bool paged_states() const override { return false; }
     void precommit() { session_->precommit(); }
     bool is_precommitted() const { return session_->is_precommitted(); }
     void set_total_capacity(int64_t tokens) { session_->set_total_capacity(tokens); }
@@ -127,11 +126,8 @@ public:
         resume_paged(0, small, paged, n);
     }
     void release_parked(int64_t parked_id) override { session_->release_parked(parked_id); }
-    // Room for one more park of THIS slot: the shared parked budget (park_kv's first, atomic refusal) and the
-    // next generation of this slot's cursor - a park advances it like a reset does. The save path's route
-    // question; both counters are the gauges' own (strix_parked_generation_used, the per-slot kv gauges).
-    bool park_budget_left() const override { return park_budget_left(0); }
-    bool small_states() const override { return true; }
+    bool park_budget_left() const override { return false; }
+    bool small_states() const override { return false; }
     uint64_t small_snapshot_bytes(int slot) const override { return small_snapshot_bytes(0, slot); }
     void export_small_snapshot(int slot, HostBuffer &out) override { export_small_snapshot(0, slot, out); }
     void resume_small(const HostBuffer &small, int64_t n) override { resume_small(0, small, n); }
@@ -139,8 +135,8 @@ public:
     void export_small_snapshot(int seq, int slot, HostBuffer &out) override;
     void resume_small(int seq, const HostBuffer &small, int64_t n) override;
     bool park_budget_left(int seq) const override {
-        return paged_states() && session_->parked_generations_used() < session_->parked_generation_capacity() &&
-               session_->kv_generation(seq) + 1 < session_->kv_layout().generations;
+        (void)seq;
+        return false;
     }
     // Per conversation: its own state and snapshot slots.
     void reset(int seq) override { session_->reset(seq); }

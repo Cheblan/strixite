@@ -482,37 +482,32 @@ Qwen4ExpDims qwen4exp_dims_from_file(const StrixwFile &f) {
 // and the parked-page region in one address range, so a parked conversation's pages can be mapped into another
 // slot without a copy - the hand-off is only correct inside one reservation on gfx1151.
 Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp,
-                                   KvFormat kv, VmmReservation &kv_res, const KvReservationLayout &layout,
-                                   int64_t slot, PrefillMath prefill_math) : mtp(mtp) {
+                                   KvFormat kv, int64_t slot, PrefillMath prefill_math) : mtp(mtp) {
+    (void)chain_rows;
+    (void)slot;
+    (void)prefill_math;
     const Qwen4ExpDims &D = model.dims();
     const size_t e = es(model.act());
     const int64_t W = D.hkv * D.hd;
     const bool q8 = kv == KvFormat::Q8;
-    // Attach one of this slot's paged arrays at its page-aligned carve within the shared reservation. The name is
-    // both buffers' and layout's; the capacity comes from the spec, so sizes can't drift between the two. With
-    // generations (kv_generations >= 2) the array gets its generation cursor: the slot region holds that many
-    // generations of the carve, a reset walks the cursor forward (paged_buffer.hpp's one-use addresses).
-    auto attach = [&](const std::string &name) {
-        size_t i = 0;
-        while (i < layout.specs.size() && layout.specs[i].name != name) ++i;
-        STRIX_CHECK(i < layout.specs.size(), "Qwen4ExpSeqState: the K/V layout has no array '", name, "' for slot ",
-                    slot, " - the reservation's layout and the state's buffers drifted apart (specs: ",
-                    layout.specs.size(), " arrays)");
-        PagedDeviceBuffer b(kv_res, layout.array_offset(slot, i), layout.specs[i].bytes, name);
-        if (layout.generations > 1) b.enable_generations(layout.slot_bytes, (uint32_t)layout.generations);
-        return b;
-    };
+    const int64_t cap_blocks = capacity / kernels::kQsaBlock + 1;
+    const int64_t kv8_cap = (capacity + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
+
     for (int64_t i = 0; i < D.layers; ++i) {
         const std::string tag = "layer " + std::to_string(i);
         const bool attn = D.is_attention[(size_t)i];
-        k_cache.emplace_back(attn && !q8 ? attach("K cache " + tag) : PagedDeviceBuffer());
-        v_cache.emplace_back(attn && !q8 ? attach("V cache " + tag) : PagedDeviceBuffer());
-        kv8_store.emplace_back(attn && q8 ? attach("8-bit K/V " + tag) : PagedDeviceBuffer());
+        k_cache.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "K cache " + tag)
+                                         : DeviceBuffer<uint8_t>());
+        v_cache.emplace_back(attn && !q8 ? DeviceBuffer<uint8_t>((size_t)(capacity * W) * e, "V cache " + tag)
+                                         : DeviceBuffer<uint8_t>());
+        kv8_store.emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_bytes(kv8_cap, W), "8-bit K/V " + tag)
+                                          : DeviceBuffer<uint8_t>());
         for (int k = 0; k < 2; ++k)
             kv8_tail[k].emplace_back(attn && q8 ? DeviceBuffer<uint8_t>(kernels::kv8_tail_bytes(W, model.act()),
                                                                       "K/V tail " + std::to_string(k) + " " + tag)
                                                  : DeviceBuffer<uint8_t>());
-        block_keys.emplace_back(attn ? attach("block keys " + tag) : PagedDeviceBuffer());
+        block_keys.emplace_back(attn ? DeviceBuffer<uint8_t>((size_t)(cap_blocks * D.idx_d) * e, "block keys " + tag)
+                                     : DeviceBuffer<uint8_t>());
         for (int k = 0; k < 2; ++k)
             tail[k].emplace_back(attn ? DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "indexer tail " + tag)
                                        : DeviceBuffer<uint8_t>());
@@ -529,9 +524,9 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
     if (mtp) {  // the head's K/V / keys / tails, the trunk's streams, and the chain's own buffers
         const int64_t n4 = D.H * D.d;
         this->mtp_prev = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP previous streams");
-        k_cache_mtp = attach("MTP K cache");
-        v_cache_mtp = attach("MTP V cache");
-        block_keys_mtp = attach("MTP block keys");
+        k_cache_mtp = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP K cache");
+        v_cache_mtp = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP V cache");
+        block_keys_mtp = DeviceBuffer<uint8_t>((size_t)(cap_blocks * D.idx_d) * e, "MTP block keys");
         for (int k = 0; k < 2; ++k)
             tail_mtp[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
         // mtp_x's twin (the per-slot workspace): a chain step swaps the two, so the step before's output is
@@ -648,434 +643,80 @@ uint64_t Qwen4ExpSession::mem_available_bytes() {
     return found ? (uint64_t)kib * 1024 : 0;
 }
 
-void Qwen4ExpSession::for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::function<void(PagedDeviceBuffer &,
-                                const std::vector<PagedDeviceBuffer::Range> &)> &f) const {
-    STRIX_CHECK(end >= 0 && end <= capacity_, "Qwen4ExpSession::for_paged: end = ", end, ", expected 0..", capacity_);
-    const Qwen4ExpDims &D = m_.dims();
-    const size_t e = es(m_.act());
-    const int64_t W = D.hkv * D.hd;
-    // Block keys: blocks [0, end / kQsaBlock] (the block holding row end - 1, and the one a forward of rows up to end
-    // starts); the 8-bit K/V: whole groups up to end (a group's rows land in the store when it completes).
-    const int64_t blocks = end == 0 ? 0 : std::min(cap_blocks_, end / kernels::kQsaBlock + 1);
-    // K / V rows: kOverReadRows past end too - the attention kernels load whole key tiles (16-64 rows) and mask the
-    // rows past the query's position afterwards, so a tile ending past end must not reach an unmapped page.
-    constexpr int64_t kOverReadRows = 64;
-    const int64_t kv_end = end == 0 ? 0 : std::min(capacity_, end + kOverReadRows);
-    const int64_t g_end = std::min(kv8_cap_, (kv_end + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group);
-    const PagedDeviceBuffer::Range kv{0, (size_t)(kv_end * W) * e};
-    std::vector<PagedDeviceBuffer::Range> keys;  // the block keys' 8-dimension chunks (kernels/qsa.hpp layout)
-    for (const auto &[off, bytes] : kernels::qsa_block_keys_used_ranges(cap_blocks_, D.idx_d, e, blocks))
-        keys.push_back({off, bytes});
-    for (size_t i = 0; i < sq.block_keys.size(); ++i) {
-        if (sq.k_cache[i].capacity()) f(sq.k_cache[i], {kv});
-        if (sq.v_cache[i].capacity()) f(sq.v_cache[i], {kv});
-        if (sq.block_keys[i].capacity()) f(sq.block_keys[i], keys);
-        if (sq.kv8_store[i].capacity()) {
-            std::vector<PagedDeviceBuffer::Range> r;
-            for (const auto &[off, bytes] : kernels::kv8_used_ranges(kv8_cap_, W, g_end)) r.push_back({off, bytes});
-            f(sq.kv8_store[i], r);
-        }
-    }
-    if (sq.k_cache_mtp.capacity()) {
-        const PagedDeviceBuffer::Range mkv{0, (size_t)(kv_end * D.hkv * D.hd) * e};
-        f(sq.k_cache_mtp, {mkv});
-        f(sq.v_cache_mtp, {mkv});
-        f(sq.block_keys_mtp, keys);
-    }
-}
-
 void Qwen4ExpSession::precommit() {
     for (size_t k = 0; k < seqs_.size(); ++k) {
-        ensure_rows(*seqs_[k], capacity_);
+        seqs_[k]->ensured_rows = capacity_;
     }
     precommitted_rows_ = capacity_;
 }
 
 void Qwen4ExpSession::ensure_rows(Qwen4ExpSeqState &sq, int64_t end) {
-    if (total_capacity_ > 0) {
-        int64_t total_tokens = 0;
-        for (const auto &s : seqs_) {
-            total_tokens += (s.get() == &sq ? end : s->ensured_rows);
-        }
-        if (total_tokens > total_capacity_) {
-            // Evict/reclaim memory only from IDLE slots (!slot_busy_[k])
-            for (size_t k = 0; k < seqs_.size(); ++k) {
-                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
-                    seqs_[k]->ensured_rows > precommitted_rows_) {
-                    reset_seq_state(*seqs_[k]);
-                    if (on_slot_evicted_) on_slot_evicted_((int)k);
-                    total_tokens = 0;
-                    for (const auto &s : seqs_) {
-                        total_tokens += (s.get() == &sq ? end : s->ensured_rows);
-                    }
-                    if (total_tokens <= total_capacity_) break;
-                }
-            }
-        }
-        STRIX_CHECK(total_tokens <= total_capacity_,
-                    "Qwen4ExpSession: total tokens across all active slots would reach ", total_tokens,
-                    ", exceeding total-capacity ", total_capacity_);
-    }
-    uint64_t missing = 0;
-    for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { missing += b.missing_bytes(r); });
-    if (missing == 0) {
-        sq.ensured_rows = std::max(sq.ensured_rows, end);
-        return;
-    }
-    for (;;) {
-        try {
-            if (kv_budget_) {
-                kv_budget_(missing);  // throws to refuse (nothing mapped yet)
-            } else {
-                const uint64_t avail = mem_available_bytes();
-                STRIX_CHECK(avail >= kSlotFloorBytes + missing, "Qwen4ExpSession: the K/V for positions [0, ", end, ") needs ",
-                            missing >> 20, " MiB more, MemAvailable ", avail >> 20, " MiB would leave less than the ",
-                            kSlotFloorBytes >> 30, " GiB floor");
-            }
-            break;
-        } catch (const std::exception &) {
-            // Memory budget refused: try evicting an idle slot to free physical memory
-            bool evicted = false;
-            for (size_t k = 0; k < seqs_.size(); ++k) {
-                if (seqs_[k].get() != &sq && (k >= slot_busy_.size() || !slot_busy_[k]) &&
-                    seqs_[k]->ensured_rows > precommitted_rows_) {
-                    reset_seq_state(*seqs_[k]);
-                    if (on_slot_evicted_) on_slot_evicted_((int)k);
-                    evicted = true;
-                    break;
-                }
-            }
-            if (!evicted) throw;
-        }
-    }
-    for_paged(sq, end, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) { b.ensure(r); });
     sq.ensured_rows = std::max(sq.ensured_rows, end);
 }
 
 uint64_t Qwen4ExpSession::kv_full_bytes() const {
+    const Qwen4ExpDims &D = m_.dims();
+    const size_t e = es(m_.act());
+    const int64_t W = D.hkv * D.hd;
+    const int64_t cap_blocks = capacity_ / kernels::kQsaBlock + 1;
+    const int64_t kv8_cap = (capacity_ + kernels::kKv8Group - 1) / kernels::kKv8Group * kernels::kKv8Group;
     uint64_t n = 0;
-    for_paged(*seqs_.front(), capacity_, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &r) {
-        n += b.touched_bytes(r);
-    });
+    for (int64_t i = 0; i < D.layers; ++i) {
+        if (!D.is_attention[(size_t)i]) continue;
+        if (kv_format_ == KvFormat::Q8) {
+            n += kernels::kv8_bytes(kv8_cap, W);
+        } else {
+            n += (size_t)(capacity_ * W) * e * 2;
+        }
+        n += (size_t)(cap_blocks * D.idx_d) * e;
+    }
+    if (mtp_) {
+        n += (size_t)(capacity_ * D.hkv * D.hd) * e * 2;
+        n += (size_t)(cap_blocks * D.idx_d) * e;
+    }
     return n;
 }
 
 uint64_t Qwen4ExpSession::kv_mapped_bytes(int seq) const {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::kv_mapped_bytes: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    uint64_t n = 0;
-    for_paged(*seqs_[(size_t)seq], 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) { n += b.size(); });
-    return n;
-}
-
-int64_t Qwen4ExpSession::kv_generation(int seq) const {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::kv_generation: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    int64_t gen = -1;
-    for_paged(*seqs_[(size_t)seq], 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) {
-        if (b.generations_enabled()) gen = (int64_t)b.generation();  // one value across the slot's arrays
-    });
-    return gen;
-}
-
-bool Qwen4ExpSession::kv_generation_fresh(int seq) const {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::kv_generation_fresh: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    bool fresh = true;
-    for_paged(*seqs_[(size_t)seq], 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) {
-        if (b.generations_enabled() && !b.generation_fresh()) fresh = false;
-    });
-    return fresh;
+    (void)seq;
+    return kv_full_bytes();
 }
 
 namespace {
-// One slot array's base within its region (a slot generation or a parked generation - the parked region is a
-// run of slot-sized carves, so the intra-region offsets are the layout's). Found by name: the name is the
-// buffer's and the spec's, and the ParkedKv record carries names.
-size_t kv_array_within(const KvReservationLayout &L, const std::string &name) {
-    for (size_t i = 0; i < L.specs.size(); ++i)
-        if (L.specs[i].name == name) return L.array_offsets[i];
-    STRIX_CHECK(false, "the K/V layout has no array '", name, "' - a parked record and the layout drifted apart");
-    return 0;  // unreachable
-}
-// The layout's index of the array with this name (state_paged_ranges names arrays by spec index).
 int64_t kv_spec_index(const KvReservationLayout &L, const std::string &name) {
     for (size_t i = 0; i < L.specs.size(); ++i)
         if (L.specs[i].name == name) return (int64_t)i;
-    STRIX_CHECK(false, "the K/V layout has no array '", name, "' - the state's paged ranges and the layout "
-                "drifted apart");
-    return -1;  // unreachable
-}
-// The slot's live paged array parked under this name (the for_paged set; a resume pairs record to buffer).
-PagedDeviceBuffer &kv_paged_by_name(Qwen4ExpSeqState &sq, const std::string &name, const char *fn) {
-    PagedDeviceBuffer *found = nullptr;
-    std::vector<PagedDeviceBuffer *> all;
-    for (auto *v : {&sq.k_cache, &sq.v_cache, &sq.kv8_store, &sq.block_keys})
-        for (PagedDeviceBuffer &b : *v) all.push_back(&b);
-    if (sq.mtp) {  // without the head these are default-constructed (no capacity, no reservation)
-        all.push_back(&sq.k_cache_mtp);
-        all.push_back(&sq.v_cache_mtp);
-        all.push_back(&sq.block_keys_mtp);
-    }
-    for (PagedDeviceBuffer *b : all)
-        if (b->capacity() > 0 && b->name() == name) { found = b; break; }
-    STRIX_CHECK(found != nullptr, "Qwen4ExpSession::", fn, ": the slot has no paged array '", name,
-                "' to pair the parked pages with - the layout and the state's buffers drifted apart");
-    return *found;
+    STRIX_CHECK(false, "the K/V layout has no array '", name, "' - the state's paged ranges and the layout drifted apart");
+    return -1;
 }
 }  // namespace
 
-// Parked ids carry a process-wide session epoch in their high bits: a parked generation number is per-session,
-// so after a session rebuild (none in serving today, but the design allows one) an id of the old session could
-// otherwise name a LIVE record of the new one and resume the wrong conversation. With the epoch, a stale id
-// refuses by name. The low bits are the parked generation itself, which is never refunded - so an id is unique
-// for the process's life, which is what makes it safe to hand out to the cache.
-namespace {
-std::atomic<uint64_t> g_parked_epoch{0};
-constexpr int kParkedEpochShift = 20;                        // 1 Mi parked generations per session (budget: 1024)
-constexpr int64_t kParkedGenBits = (1ll << kParkedEpochShift) - 1;
-}  // namespace
-
-// The live record behind a parked id (see park_kv): the loud refusal for one from another or an earlier
-// session, for a generation never taken or whose park failed, or that was already resumed or evicted - a
-// parked conversation is handed back exactly once.
 const ParkedKv &Qwen4ExpSession::parked(int64_t parked_id) const {
-    STRIX_CHECK(uint64_t(parked_id >> kParkedEpochShift) == parked_epoch_,
-                "Qwen4ExpSession::parked: parked id ", parked_id, " is not from this session (its epoch is ",
-                parked_id >> kParkedEpochShift, ", this session is ", parked_epoch_, ") - a parked record belongs "
-                "to the session that carved its pages, and after a session rebuild every id of the old one is "
-                "dead (hazards \"VMM\")");
-    const int64_t gen = parked_id & kParkedGenBits;
-    STRIX_CHECK(gen >= 0 && gen < (int64_t)parked_by_gen_.size(), "Qwen4ExpSession::parked: parked generation ",
-                gen, " of id ", parked_id, ", expected 0..", (int64_t)parked_by_gen_.size() - 1);
-    const ParkedKv &kv = parked_by_gen_[(size_t)gen];
-    STRIX_CHECK(kv.live(), "Qwen4ExpSession::parked: parked id ", parked_id, " is not a live parked record - it "
-                "was never taken, its park failed, or it was already resumed or evicted (a parked conversation "
-                "is handed back exactly once)");
-    return kv;
+    (void)parked_id;
+    static ParkedKv empty;
+    return empty;
 }
 
 int64_t Qwen4ExpSession::park_kv(int seq, std::string tally_category) {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::park_kv: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    STRIX_CHECK(kv_layout_.generations > 1, "Qwen4ExpSession::park_kv: parking needs kv-generations >= 2 (the "
-                "parked pages ride the generation budgets, and a kv_generations = 1 session hands its pages to "
-                "nobody); this session has ", kv_layout_.generations);
-    STRIX_CHECK(!broken_, "Qwen4ExpSession::park_kv: seq ", seq, ": an earlier call failed midway - reset() first");
-    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
-    STRIX_CHECK(!sq.verify_pending, "Qwen4ExpSession::park_kv: seq ", seq, " has a verify pending - resolve it "
-                "first (its rows live in the pages this would park)");
-    STRIX_CHECK(!tally_category.empty(), "Qwen4ExpSession::park_kv: empty tally category - the parked bytes are "
-                "charged to the entry's category at hand-off");
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::park_kv: stream");
-    // Refuse BEFORE touching anything (the exhaustion-before-teardown rule):
-    // the shared parked budget first, then the slot's next generation, then something worth parking at all.
-    STRIX_CHECK_KV_BUDGET(parked_used_ < kv_layout_.parked_generations,
-                "Qwen4ExpSession::park_kv: parked generations exhausted - ", parked_used_, " parks of the ",
-                kv_layout_.parked_generations, " the reservation holds (the shared parked budget: every park "
-                "spends one parked generation and neither resume nor eviction refunds it - a clean "
-                "refusal, only a restart reclaims; the gauge is strix_parked_generation_used)");
-    const int64_t gen = kv_generation(seq);
-    STRIX_CHECK_KV_BUDGET(gen + 1 < kv_layout_.generations, "Qwen4ExpSession::park_kv: seq ", seq, " is at K/V generation ",
-                gen, " of ", kv_layout_.generations, " - parking advances the cursor like a reset does, and "
-                "generation ", gen + 1, " is the exhaustion refusal");
-    const uint64_t mapped = kv_mapped_bytes(seq);
-    STRIX_CHECK(mapped > 0, "Qwen4ExpSession::park_kv: seq ", seq, " has no K/V pages mapped - nothing to park");
-    const int64_t p = parked_used_++;  // spent when taken: a park that fails part-way spent it too (its
-                                        // addresses, like every released generation's, never come back)
-    ParkedKv out;
-    out.reservation = kv_res_.get();
-    out.parked_gen = p;
-    out.source_seq = seq;
-    out.tally_category = std::move(tally_category);
-    char *res_base = static_cast<char *>(kv_res_->base());
-    size_t mapped_arrays = 0;  // arrays whose parked-side mapping is up (map_pages is all-or-nothing per array)
-    try {
-        for_paged(sq, 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) {
-            out.arrays.push_back({b.name(), b.park_and_next_generation()});
-        });
-        for (const ParkedArrayKv &a : out.arrays) out.bytes += a.pages.size() * kv_res_->page_bytes();
-        STRIX_CHECK(out.bytes == mapped, "Qwen4ExpSession::park_kv: parked ", out.bytes, " bytes of handles "
-                    "against ", mapped, " mapped - the page bookkeeping drifted");
-        for (const ParkedArrayKv &a : out.arrays) {
-            // host access for the parked mapping (probe check 2: CPU read needs host; the flag's ~4.2 us/page
-            // is paid at park, off the request path - the design pass' choice, revisitable by measurement).
-            map_pages(res_base + kv_layout_.parked_gen_offset(p) + kv_array_within(kv_layout_, a.name),
-                      kv_res_->page_bytes(), a.pages, /*host_access=*/true, "parked " + a.name);
-            ++mapped_arrays;
-        }
-        // The charge moves to the entry's category only once the pages really live in the parked region (the
-        // arrays' own names lost it page by page inside park_and_next_generation).
-        GpuMemoryTally::add(out.tally_category, (int64_t)out.bytes);
-    } catch (...) {
-        // The park failed: the conversation's pages are released (their RAM back; a page that would not
-        // release stays charged - it really is still held), the slot half-advanced - broken, like a throwing
-        // reset: the request fails clean, there is never a copy-out of the K/V to save it.
-        int64_t freed = 0;
-        for (size_t k = 0; k < out.arrays.size(); ++k) {
-            const std::vector<PageHandle> &pgs = out.arrays[k].pages;
-            if (k < mapped_arrays) {  // parked-side mapping is up: unmap it, then release
-                int64_t done = 0;
-                try {
-                    unmap_pages(res_base + kv_layout_.parked_gen_offset(p) +
-                                    kv_array_within(kv_layout_, out.arrays[k].name),
-                                kv_res_->page_bytes(), pgs, /*release=*/true, "park unwind " + out.arrays[k].name,
-                                &done);
-                } catch (...) {
-                    freed += done;
-                    continue;
-                }
-                freed += done;
-            } else {  // never mapped into the parked region: the handle alone holds the page
-                for (const PageHandle &ph : pgs)
-                    if (hipMemRelease(ph.handle) == hipSuccess) freed += (int64_t)kv_res_->page_bytes();
-            }
-        }
-        if (freed != (int64_t)out.bytes)
-            slog(LogLevel::Warning, "kv-parking: slot %d park failed, %zu of %zu page-bytes did not release "
-                 "(held until the process ends)", seq, (out.bytes - (size_t)freed) / kv_res_->page_bytes(),
-                 out.bytes / kv_res_->page_bytes());
-        broken_ = true;
-        throw;
-    }
-    slog(LogLevel::Debug, "kv-parking: slot %d parked its K/V into parked generation %lld of %lld (%zu pages, "
-         "%.1f MiB kept by handle; resuming or evicting spends that generation either way)",
-         seq, (long long)p, (long long)kv_layout_.parked_generations, out.bytes / kv_res_->page_bytes(),
-         out.bytes / 1048576.0);
-    parked_by_gen_[(size_t)p] = std::move(out);  // the session keeps the record; the caller holds its id
-    // The whole paged K/V of this slot is out of it now, so no snapshot saved from it can be restored any
-    // more: can_restore reasons about rewinds (rows rewritten at or below its position), and a park is a rewind
-    // to nothing - the rows are gone until the record comes back (and resume_parked pushes its own rewind).
-    // Without this a restore after a park would rebuild the small parts and read the slot's new, empty pages
-    // as the conversation's K/V: the silent wrong memory hazards "VMM" is about.
-    sq.rewind_to.push_back(0);  // (the slot's cursor stands at a fresh generation now - kv_generation_fresh)
-    return (int64_t(parked_epoch_) << kParkedEpochShift) | p;
+    (void)seq; (void)tally_category;
+    STRIX_CHECK(false, "Qwen4ExpSession::park_kv: VMM parking not supported in pure static KV mode");
+    return -1;
 }
 
 int64_t Qwen4ExpSession::park_and_cold(int seq, std::string tally_category) {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::park_and_cold: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    const int64_t id = park_kv(seq, std::move(tally_category));  // refuses (and touches nothing) before tearing down
-    // The slot back to a cold state - the same steps a single-seq reset takes, and the same failure rule: a
-    // teardown that throws half way is a broken session, not a slot with a half-cleared state. The page release
-    // inside it is skipped because the park left the slot at a fresh generation, so no generation is spent twice.
-    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
-    try {
-        reset_seq_state(sq);
-    } catch (...) {
-        broken_ = true;
-        // The id never reaches the caller: release the record here, or its pages stay held until the process
-        // ends (release_parked does not need an unbroken session - eviction must always be possible).
-        try {
-            release_parked(id);
-        } catch (const std::exception &ex) {
-            slog(LogLevel::Error, "kv-parking: releasing parked id %lld after a failed cold reset failed too: %s",
-                 (long long)id, ex.what());
-        }
-        throw;
-    }
-    slog(LogLevel::Debug, "kv-parking: parked id %lld left slot %d cold (position 0, its snapshots dead)",
-         (long long)id, seq);
-    return id;
+    (void)seq; (void)tally_category;
+    STRIX_CHECK(false, "Qwen4ExpSession::park_and_cold: VMM parking not supported in pure static KV mode");
+    return -1;
 }
 
 void Qwen4ExpSession::resume_parked(int seq, int64_t parked_id) {
-    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::resume_parked: seq ", seq, ", expected 0..",
-                n_slots() - 1);
-    STRIX_CHECK(!broken_, "Qwen4ExpSession::resume_parked: seq ", seq, ": an earlier call failed midway - reset() first");
-    // The id checks itself: never taken, a failed park, or already resumed or evicted all refuse here.
-    parked(parked_id);  // the id checks itself: never taken, a failed park, already resumed or evicted
-    // Pages only ever map back into the reservation they were carved from (hazards "VMM", probe: a
-    // second-reservation read gets wrong memory) - parked() proved this record belongs to this session and is live.
-    ParkedKv &parked = parked_by_gen_[(size_t)(parked_id & kParkedGenBits)];
-    STRIX_CHECK(kv_layout_.generations > 1, "Qwen4ExpSession::resume_parked: this session has no generations - "
-                "nothing was ever parkable in it");
-    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
-    STRIX_CHECK(!sq.verify_pending, "Qwen4ExpSession::resume_parked: seq ", seq, " has a verify pending - resolve it "
-                "first (the slot's pages are mid-batch)");
-    // Where the kept handles go: a slot whose current generation was never used (a park just left it, or a
-    // reset with nothing to map since) takes them right there - no generation spent, which is what keeps a
-    // switch at one generation (the park's) instead of two. A slot whose generation holds a conversation
-    // releases it and advances first, like a reset. Refuse BEFORE touching: the record stays resumable.
-    const bool advance = !kv_generation_fresh(seq);
-    const int64_t gen = kv_generation(seq);
-    STRIX_CHECK_KV_BUDGET(!advance || gen + 1 < kv_layout_.generations, "Qwen4ExpSession::resume_parked: seq ", seq,
-                " is at K/V generation ", gen, " of ", kv_layout_.generations, " and holds a conversation - "
-                "resuming releases it and advances the cursor like a reset does, and generation ", gen + 1,
-                " is the exhaustion refusal (only a restart reclaims)");
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::resume_parked: stream");
-    const int64_t p = parked.parked_gen;
-    char *res_base = static_cast<char *>(kv_res_->base());
-    for (const ParkedArrayKv &a : parked.arrays)  // pair every array before the first step (a mismatch then
-        (void)kv_paged_by_name(sq, a.name, "resume_parked");  // leaves the slot and the record untouched)
-    size_t adopted = 0;
-    bool advancing = advance;
-    try {
-        if (advance)
-            for_paged(sq, 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) {
-                b.release_and_next_generation();  // the conversation the slot runs now is over (the caller
-            });                                   // decided it): its pages go the way a reset's do
-        advancing = false;
-        for (const ParkedArrayKv &a : parked.arrays) {
-            kv_paged_by_name(sq, a.name, "resume_parked").adopt_pages(a.pages);  // device access; the record still
-            ++adopted;                                                      // names the handles
-        }
-    } catch (...) {
-        if (advancing) broken_ = true;  // stepped part-way through the slot's buffers: only reset() / restart sorts that out
-        else  // hand the adopted arrays' pages back (the handles stay in the record, whose parked-side mapping
-              // is still up: the conversation is intact, the slot's cursor is one generation further and empty)
-            for (size_t k = 0; k < adopted; ++k)
-                kv_paged_by_name(sq, parked.arrays[k].name, "resume_parked").discard_current_pages();
-        throw;
-    }
-    // The slot owns the pages now (its cursor and buffers carry them forward): the parked-side mapping comes
-    // down, handles kept. A failure here leaves the pages mapped twice - the record must not live on.
-    try {
-        for (const ParkedArrayKv &a : parked.arrays)
-            unmap_pages(res_base + kv_layout_.parked_gen_offset(p) + kv_array_within(kv_layout_, a.name),
-                        kv_res_->page_bytes(), a.pages, /*release=*/false, "resumed " + a.name);
-    } catch (...) {
-        broken_ = true;  // the slot reads the same pages the parked region still maps: trust nothing after
-        throw;
-    }
-    GpuMemoryTally::add(parked.tally_category, -(int64_t)parked.bytes);  // the buffers' names took the charge (adopt_pages)
-    slog(LogLevel::Debug, "kv-parking: slot %d resumed its K/V from parked generation %lld of %lld (%zu pages, "
-         "%.1f MiB; that generation stays spent)", seq, (long long)p, (long long)kv_layout_.parked_generations,
-         parked.bytes / kv_res_->page_bytes(), parked.bytes / 1048576.0);
-    parked = ParkedKv();
+    (void)seq; (void)parked_id;
+    STRIX_CHECK(false, "Qwen4ExpSession::resume_parked: VMM parking not supported in pure static KV mode");
 }
 
 void Qwen4ExpSession::release_parked(int64_t parked_id) {
-    parked(parked_id);  // the id checks itself: never taken, a failed park, already resumed or evicted
-    ParkedKv &parked = parked_by_gen_[(size_t)(parked_id & kParkedGenBits)];  // this session's own record, live: unmap + release
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::release_parked: stream");
-    const int64_t p = parked.parked_gen;
-    const std::string category = parked.tally_category;
-    char *res_base = static_cast<char *>(kv_res_->base());
-    int64_t freed = 0;
-    bool failed = false;
-    for (const ParkedArrayKv &a : parked.arrays) {  // every page gets its attempt first (a half-torn-down
-        int64_t done = 0;                            // eviction is still an eviction: the record dies either way)
-        try {
-            unmap_pages(res_base + kv_layout_.parked_gen_offset(p) + kv_array_within(kv_layout_, a.name),
-                        kv_res_->page_bytes(), a.pages, /*release=*/true, "evicted " + a.name, &done);
-        } catch (...) {
-            failed = true;
-        }
-        freed += done;
-    }
-    GpuMemoryTally::add(category, -freed);  // pages that failed to release stay charged - their RAM really is still held
-    const size_t pages = parked.bytes / kv_res_->page_bytes();
-    const size_t freed_pages = (size_t)freed / kv_res_->page_bytes();
-    const int64_t src = parked.source_seq;
-    const double total_mib = parked.bytes / 1048576.0;
-    parked = ParkedKv();  // spent either way: the parked generation's addresses never come back
-    slog(LogLevel::Debug, "kv-parking: evicted parked generation %lld of %lld (slot %d's): %.1f of %.1f MiB "
-         "back to RAM", (long long)p, (long long)kv_layout_.parked_generations, (int)src, freed / 1048576.0,
-         total_mib);
-    STRIX_CHECK(!failed, "Qwen4ExpSession::release_parked: parked generation ", p, " (slot ", src,
-                "'s) had pages that would not unmap or release - ", pages - freed_pages,
-                " pages stay held until the process ends (counted under '", category, "')");
+    (void)parked_id;
+    STRIX_CHECK(false, "Qwen4ExpSession::release_parked: VMM parking not supported in pure static KV mode");
 }
 
 Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
@@ -1114,33 +755,13 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     // generations of the arrays: a reset releases the finished conversation's pages and the next maps fresh ones
     // at addresses this process never used (paged_buffer.hpp; the kv-generations budget of the VA policy).
     // Auto (the served default): the most generations up to kKvGenerationDefault that fit under the ceiling.
-    const int64_t fit = kv_generations_that_fit(D, e, capacity, mtp, kv, n_slots, Qwen4ExpSeqState::kPageBytes,
-                                                std::max(kKvGenerationDefault, kv_generations));
-    if (kv_generations == kKvGenerationsAuto) {
-        STRIX_CHECK(fit >= 2, "Qwen4ExpSession: kv-generations auto: not even 2 K/V generations of ", n_slots,
-                    " slots at capacity ", capacity, " fit under the ", kKvReservationVaCeiling >> 40,
-                    " TiB address-space ceiling (", fit, " fit) - lower total-slots or capacity");
-        kv_generations = fit;  // at most kKvGenerationDefault: fit's at_most for auto
-    }
-    kv_layout_ = kv_reservation_layout(D, e, capacity, mtp, kv, n_slots, Qwen4ExpSeqState::kPageBytes,
-                                       kv_generations, kv_generations == 1 ? 1 : kv_generations);
-    STRIX_CHECK(kv_layout_.total_bytes <= kKvReservationVaCeiling,
-                "Qwen4ExpSession: kv-generations ", kv_generations, " needs ", kv_layout_.total_bytes >> 30,
-                " GiB of address space (", n_slots, " slots x ", kv_generations, " generations + ",
-                kv_layout_.parked_generations, " parked generations of ", kv_layout_.slot_bytes >> 20,
-                " MiB), past the ", kKvReservationVaCeiling >> 40,
-                " TiB safety ceiling; at most ", fit, " fit with ", n_slots, " slots at capacity ", capacity,
-                " - set kv-generations = 0 (auto) or at most ", fit, ", or lower total-slots or capacity");
-    // The parked records, indexed by parked generation (= their id), sized with the budget so an id is in range
-    // exactly when it could ever have been taken. Empty arrays cost ~120 B each: 1024 parks = 120 KiB.
-    parked_epoch_ = g_parked_epoch.fetch_add(1);  // every id this session hands out carries it (see parked())
-    parked_by_gen_.assign((size_t)kv_layout_.parked_generations, ParkedKv());
-    kv_res_ = std::make_unique<VmmReservation>(kv_layout_.total_bytes, Qwen4ExpSeqState::kPageBytes, "K/V reservation");
+    (void)kv_generations;
+    kv_layout_ = kv_reservation_layout(D, e, capacity, mtp, kv, n_slots, 2 << 20, 1, 1);
     const uint64_t avail0 = mem_available_bytes();
-    seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
+    seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv,
                                                         /*slot=*/0, prefill_math_));
     const uint64_t avail1 = mem_available_bytes();
-    const uint64_t slot_cost = avail0 > avail1 ? avail0 - avail1 : 0;  // what one slot's state took from RAM
+    const uint64_t slot_cost = avail0 > avail1 ? avail0 - avail1 : kv_full_bytes();
     auto act_buf = [&](int64_t per_token, const std::string &name) {
         return DeviceBuffer<uint8_t>((size_t)(M * per_token) * e, name);
     };
@@ -1261,7 +882,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
                     " MiB (slot 0's state at capacity ", capacity, " took that), MemAvailable ", avail >> 20,
                     " MiB would leave less than the ", kSlotFloorBytes >> 30, " GiB floor after it - ", k,
                     " slot(s) fit: lower total-slots (or the capacity)");
-        seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv, *kv_res_, kv_layout_,
+        seqs_.push_back(std::make_unique<Qwen4ExpSeqState>(m_, capacity, max_tokens, mtp, kv,
                                                             /*slot=*/k, prefill_math_));
     }
     slot_busy_.assign(seqs_.size(), 0);
@@ -1682,11 +1303,6 @@ void Qwen4ExpSession::reset() {
     if (kv_format_ == KvFormat::Q8)
         STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero 8-bit K/V error");
     // Every state (the slots) back to position 0; the error words / position upload machinery above are per-forward.
-    // A reset that throws (a generation-exhausted refusal) leaves some slots stepped and some not: mark the
-    // session broken so no later forward runs on that inconsistency (the generation's pages are released).
-    // A budget refusal (KvBudgetExhausted) is checked for every slot before any slot resets, and touches nothing:
-    // the session stays as it was, not broken.
-    for (size_t k = 0; k < seqs_.size(); ++k) kv_budget_for_reset(*seqs_[k]);
     try {
         for (size_t k = 0; k < seqs_.size(); ++k) reset_seq_state(*seqs_[k]);
     } catch (...) {
@@ -1705,8 +1321,6 @@ void Qwen4ExpSession::reset(int seq) {
     STRIX_CHECK(!seqs_[(size_t)seq]->verify_pending, "Qwen4ExpSession::reset: seq ", seq,
                 " has a verify pending - resolve it first (the other runs of its batch share the forward)");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::reset(seq)");
-    // As in reset(): a throwing reset (generation exhaustion) leaves the slot half-stepped - failed, not usable.
-    kv_budget_for_reset(*seqs_[(size_t)seq]);  // the budget refusal touches nothing: not broken
     try {
         reset_seq_state(*seqs_[(size_t)seq]);
     } catch (...) {
@@ -1721,77 +1335,25 @@ int Qwen4ExpSession::seq_index(const Qwen4ExpSeqState &s) const {
     STRIX_FAIL("Qwen4ExpSession::seq_index: the state is not one of this session's ", seqs_.size(), " slots");
 }
 
-// A reset of a slot whose generation was used releases it and advances the cursor; past the last generation that
-// is the budget refusal. Every buffer of the slot advances together, so the slot's cursor is the whole question,
-// and asking it touches nothing: refused here, the slot still holds its conversation - which is what lets the
-// engine keep serving that conversation (KvBudgetExhausted) instead of resetting into a broken session.
-void Qwen4ExpSession::kv_budget_for_reset(const Qwen4ExpSeqState &s) const {
-    if (is_precommitted()) return;
-    const int slot = seq_index(s);
-    if (kv_layout_.generations <= 1 || kv_generation_fresh(slot)) return;
-    const int64_t gen = kv_generation(slot);
-    STRIX_CHECK_KV_BUDGET(gen + 1 < kv_layout_.generations, "Qwen4ExpSession: seq ", slot, " is at K/V generation ",
-                          gen, " of ", kv_layout_.generations, " and holds a conversation - a reset releases it and "
-                          "advances the cursor, and generation ", gen + 1, " is the kv-generations exhaustion refusal "
-                          "(one-use addresses: only a restart reclaims)");
-}
-
 void Qwen4ExpSession::reset_seq_state(Qwen4ExpSeqState &s) {
-    // Paged K/V: with one generation (kv-generations = 1) the slot keeps its pages - the next conversation
-    // reuses them (runtime/paged_buffer.hpp - no page is released while the buffer lives). With generations the
-    // reset instead releases this conversation's pages and advances the cursor, so the next forward maps new
-    // handles at addresses this process has never mapped - the one-use addresses:
-    // release-then-remap at one address is the silent wrong read. Exhausting the budget refuses cleanly.
-    // A generation nothing was ever mapped in (a park just left the slot there, or nothing ran since the last
-    // reset) has nothing to release, and its addresses are still unused: the reset stays in it.
-    bool fresh = true;
-    for_paged(s, 0, [&](PagedDeviceBuffer &b, const std::vector<PagedDeviceBuffer::Range> &) {
-        if (b.generations_enabled() && !b.generation_fresh()) fresh = false;
-    });
-    const int slot = seq_index(s);
-    kv_budget_for_reset(s);  // the budget refusal first, before any buffer steps (the per-buffer check is a drift guard)
-    if (kv_layout_.generations > 1 && !fresh && !is_precommitted()) {
-        uint32_t gen_now = 0, gen_cap = 0;  // every buffer of the slot advances together; the log names the slot
-        auto advance = [&](PagedDeviceBuffer &b) {
-            if (b.capacity() == 0) return;  // the other layer kind's default-constructed buffer
-            STRIX_CHECK(b.generations_enabled(), "Qwen4ExpSession: the K/V layout has generations but buffer '",
-                        b.name(), "' was attached without a generation cursor - layout and state drifted apart");
-            b.release_and_next_generation();
-            gen_now = b.generation(), gen_cap = b.generation_capacity();
-        };
-        for (PagedDeviceBuffer &b : s.k_cache) advance(b);
-        for (PagedDeviceBuffer &b : s.v_cache) advance(b);
-        for (PagedDeviceBuffer &b : s.kv8_store) advance(b);
-        for (PagedDeviceBuffer &b : s.block_keys) advance(b);
-        if (mtp_) {  // without the head these are default-constructed, no reservation behind them
-            advance(s.k_cache_mtp);
-            advance(s.v_cache_mtp);
-            advance(s.block_keys_mtp);
-        }
-        slog(LogLevel::Debug, "kv-generations: slot %d released its K/V generation, now at generation %u of %u "
-             "(one-use addresses; reaching %u refuses the next switch - only a restart reclaims)",
-             slot, gen_now, gen_cap, gen_cap);
-    }
     s.ensured_rows = precommitted_rows_;
-    {
-        s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;  // GDN states reset on the first call (reset_state); KV overwritten
-        s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;
-        s.rope_delta = 0, s.history_ever_interleaved = false, s.verify_delta_before = 0, s.verify_ever_before = false,
-            s.verify_hist_start_before = 0;
-        s.pos3_start = 0;
-        s.pos3_host.clear(), s.pending3.clear(), s.verify_hist_before.clear();
-        s.imported_at = -1;
-        if (mtp_) {  // position 0's MTP row pairs its token with no trunk state: zeros
-            STRIX_HIP_CHECK(hipMemset(s.mtp_prev.get(), 0, s.mtp_prev.size()), "Qwen4ExpSession: zero MTP previous streams");
-            if (s.mtp_ws.verify_done_event)
-                STRIX_HIP_CHECK(hipEventRecord(s.mtp_ws.verify_done_event, stream_), "record verify_done_event on reset");
-        }
-        if (m_.dims().ple_layer >= 0) {
-            STRIX_HIP_CHECK(hipMemset(s.ple_state.get(), 0, s.ple_state.size()), "Qwen4ExpSession: zero PLE state");
-            s.ple_hist = PleHistory::fresh(m_.ngram_rows().hash_params());
-        }
-        s.rewind_to.push_back(0);
+    s.pos = 0, s.tail_cur = 0, s.mtp_tail_cur = 0, s.mtp_chain_step = -1, s.verify_pending = false;
+    s.verify_rows = 0, s.verify_carry = 0, s.verify_row_base = 0, s.verify_ple_wbase = 0;
+    s.rope_delta = 0, s.history_ever_interleaved = false, s.verify_delta_before = 0, s.verify_ever_before = false,
+        s.verify_hist_start_before = 0;
+    s.pos3_start = 0;
+    s.pos3_host.clear(), s.pending3.clear(), s.verify_hist_before.clear();
+    s.imported_at = -1;
+    if (mtp_) {  // position 0's MTP row pairs its token with no trunk state: zeros
+        STRIX_HIP_CHECK(hipMemset(s.mtp_prev.get(), 0, s.mtp_prev.size()), "Qwen4ExpSession: zero MTP previous streams");
+        if (s.mtp_ws.verify_done_event)
+            STRIX_HIP_CHECK(hipEventRecord(s.mtp_ws.verify_done_event, stream_), "record verify_done_event on reset");
     }
+    if (m_.dims().ple_layer >= 0) {
+        STRIX_HIP_CHECK(hipMemset(s.ple_state.get(), 0, s.ple_state.size()), "Qwen4ExpSession: zero PLE state");
+        s.ple_hist = PleHistory::fresh(m_.ngram_rows().hash_params());
+    }
+    s.rewind_to.push_back(0);
 }
 
 int64_t Qwen4ExpSession::pos(int seq) const {
@@ -2032,7 +1594,7 @@ void Qwen4ExpSession::kv8_copy(const Qwen4ExpSeqState &sq, uint8_t *&cur, size_t
                                std::vector<std::pair<uint8_t *, size_t>> *unused, hipStream_t stream, bool paged) {
     const Qwen4ExpDims &D = m_.dims();
     const int64_t W = D.hkv * D.hd, G = kernels::kKv8Group, cap = kv8_cap_, ga = from / G, gb = n / G;
-    STRIX_CHECK(layer < sq.kv8_store.size() && sq.kv8_store[layer].capacity() >= kernels::kv8_bytes(cap, W),
+    STRIX_CHECK(layer < sq.kv8_store.size() && sq.kv8_store[layer].size() >= kernels::kv8_bytes(cap, W),
                 "Qwen4ExpSession::kv8_copy: layer ", layer, " has no 8-bit K/V storage");
     STRIX_CHECK(tail.size() == kernels::kv8_tail_bytes(W, m_.act()), "Qwen4ExpSession::kv8_copy: tail of ",
                 tail.size(), " bytes, expected ", kernels::kv8_tail_bytes(W, m_.act()));
@@ -2132,32 +1694,9 @@ size_t Qwen4ExpSession::small_state_bytes(int64_t n) const {
 
 const uint8_t *Qwen4ExpSession::parked_host(const ParkedKv &parked, int64_t spec, size_t array_off,
                                             size_t bytes) const {
-    STRIX_CHECK(parked.reservation != nullptr, "Qwen4ExpSession::parked_host: empty parked K/V record");
-    STRIX_CHECK(parked.reservation == kv_res_.get(), "Qwen4ExpSession::parked_host: this parked K/V belongs to "
-                "another session's reservation - only its owner can read it back");
-    STRIX_CHECK(spec >= 0 && spec < (int64_t)kv_layout_.specs.size(), "Qwen4ExpSession::parked_host: spec ",
-                spec, ", expected 0..", kv_layout_.specs.size() - 1);
-    const std::string &name = kv_layout_.specs[(size_t)spec].name;
-    const ParkedArrayKv *arr = nullptr;
-    for (const ParkedArrayKv &a : parked.arrays)
-        if (a.name == name) { arr = &a; break; }
-    STRIX_CHECK(arr != nullptr, "Qwen4ExpSession::parked_host: the record has no array '", name, "'");
-    STRIX_CHECK(array_off <= kv_layout_.specs[(size_t)spec].bytes &&
-                    bytes <= kv_layout_.specs[(size_t)spec].bytes - array_off,
-                "Qwen4ExpSession::parked_host: [", array_off, ", +", bytes, " B) of '", name, "' is past its ",
-                kv_layout_.specs[(size_t)spec].bytes, " bytes");
-    const size_t page = kv_res_->page_bytes();
-    for (size_t p = array_off / page; p * page < array_off + bytes &&
-                                       p * page < kv_layout_.specs[(size_t)spec].bytes; ++p) {
-        bool held = false;
-        for (const PageHandle &ph : arr->pages)
-            if (ph.page == p) { held = true; break; }
-        STRIX_CHECK(held, "Qwen4ExpSession::parked_host: '", name, "' page ", p, " (byte ", p * page,
-                    " of the range [", array_off, ", +", bytes, " B)) is not in the parked record - the range "
-                    "reaches past what the conversation wrote");
-    }
-    return static_cast<const uint8_t *>(parked.reservation->base()) +
-           kv_layout_.parked_gen_offset(parked.parked_gen) + kv_array_within(kv_layout_, name) + array_off;
+    (void)parked; (void)spec; (void)array_off; (void)bytes;
+    STRIX_CHECK(false, "Qwen4ExpSession::parked_host: VMM parking not supported in pure static KV mode");
+    return nullptr;
 }
 
 void Qwen4ExpSession::export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes, int64_t from) {
@@ -2241,31 +1780,9 @@ void Qwen4ExpSession::export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *
 // definition). forward_qwen4exp_paged_park_stitch stitches this + state_paged_ranges back into export_state's
 // bytes, so a paged entry's on-disk file is the same file a HostBuffer entry writes.
 PagedState Qwen4ExpSession::paged_state(int64_t parked_id, int64_t n) const {
-    const ParkedKv &record = parked(parked_id);  // the session's own live record, named by the id
-    PagedState out;
-    out.parked_id = parked_id;
-    out.page_bytes = record.bytes;
-    out.record_name = record.tally_category;
-    out.state_bytes = state_bytes(n, 0);
-    for (const StatePagedRange &r : state_paged_ranges(n)) {
-        // A range with nothing in it (the 8-bit regions below one full group, n < 32) holds no byte of the state:
-        // the writer's walk wants only ranges that cover something.
-        if (r.bytes == 0) continue;
-        // The writer walks the chunks in order and trusts them not to overlap, so they are checked here once,
-        // where they are made, rather than at every gather.
-        STRIX_CHECK(out.chunks.empty() || r.pack_off >= out.chunks.back().state_off + out.chunks.back().bytes,
-                    "Qwen4ExpSession::paged_state: range at ", r.pack_off, " overlaps or precedes the previous "
-                    "one (the ranges must tile the state in order)");
-        STRIX_CHECK(r.pack_off + r.bytes <= out.state_bytes, "Qwen4ExpSession::paged_state: range [", r.pack_off,
-                    ", +", r.bytes, " B) is past the state's ", out.state_bytes, " bytes");
-        out.chunks.push_back({r.pack_off, r.bytes, parked_host(record, r.spec, r.array_off, r.bytes)});
-    }
-    size_t paged = 0;
-    for (const PagedChunk &c : out.chunks) paged += c.bytes;
-    STRIX_CHECK(!out.chunks.empty(), "Qwen4ExpSession::paged_state: the state at ", n, " has no paged ranges");
-    STRIX_CHECK(paged + small_state_bytes(n) == out.state_bytes, "Qwen4ExpSession::paged_state: ", paged,
-                " paged + ", small_state_bytes(n), " small bytes, the state is ", out.state_bytes);
-    return out;
+    (void)parked_id; (void)n;
+    STRIX_CHECK(false, "Qwen4ExpSession::paged_state: VMM parking not supported in pure static KV mode");
+    return {};
 }
 
 void Qwen4ExpSession::export_small_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *out, size_t bytes) {
@@ -3182,8 +2699,8 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             lin(u_.get(), l.qkv, proj_.get(), T, act);
             for (const Run &r : runs) {
                 Qwen4ExpSeqState &sq = *r.sq;
-                uint8_t *kc = sq.k_cache[(size_t)i].capacity() ? sq.k_cache[(size_t)i].get() : nullptr,
-                        *vc = sq.v_cache[(size_t)i].capacity() ? sq.v_cache[(size_t)i].get() : nullptr;
+                uint8_t *kc = sq.k_cache[(size_t)i].size() ? sq.k_cache[(size_t)i].get() : nullptr,
+                        *vc = sq.v_cache[(size_t)i].size() ? sq.v_cache[(size_t)i].get() : nullptr;
                 uint8_t *kv_rows = !q8 ? nullptr
                                    : sq.gdn_to_spare ? sq.verify_in[(size_t)i].get() +
                                                              (size_t)(kMaxLogits * D.idx_d) * e

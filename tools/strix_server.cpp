@@ -221,9 +221,7 @@ int run(int argc, char **argv) {
              served_vision->cfg.std[0], served_vision->cfg.std[1], served_vision->cfg.std[2],
              (long long)cfg.vision_preprocess_limit);
     }
-    const int64_t kv_generations = settings.integer("kv-generations");  // 0: auto (Qwen4ExpSession)
-    STRIX_CHECK(kv_generations != 1, "strix_server: kv-generations 1 (the pages reused, unsafe on this GPU), "
-                "expected 0 (auto) or 2..4096");
+    const int64_t kv_generations = 1;
     Qwen4ExpBackend backend(model, slot_capacity, chunk, use_mtp, mtp_vocab, precision, kv_format, total_slots,
                             kv_generations);
     if (total_capacity > 0) backend.set_total_capacity(total_capacity);
@@ -237,15 +235,7 @@ int run(int argc, char **argv) {
              (long long)total_slots, (long long)total_slots, fmt_n(slot_capacity).c_str(),
              total_capacity > 0 ? fmt_n(total_capacity).c_str() : "unconstrained",
              kv_precommit ? "on" : "off");
-    slog(LogLevel::Info, "startup: kv-generations %s: %lld K/V generations per slot (~%.1f TiB of address "
-         "space per slot, no RAM); %s",
-         kv_generations == kKvGenerationsAuto ? "auto" : std::to_string(kv_generations).c_str(),
-         (long long)backend.kv_layout().generations,
-         (double)backend.kv_layout().slot_region_bytes * 1.0 / (1ull << 40),
-         settings.integer("kv-renew-margin") > 0
-             ? cat("the session is rebuilt on the loaded model (the soft K/V reset) once a slot is within ",
-                   settings.integer("kv-renew-margin"), " generations of the last").c_str()
-             : "past the last a switch is refused cleanly, only a restart reclaims (kv-renew-margin 0)");
+    slog(LogLevel::Info, "startup: KV cache: pure static flat pre-allocation (zero VMM overcommit, infinite uptime)");
     slog(LogLevel::Info, "startup: precision %s%s", precision.describe().c_str(),
          precision.exact() ? "" : " (faster, less exact math than all-exact)");
     {

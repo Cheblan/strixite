@@ -30,7 +30,6 @@
 #include "kernels/norm.hpp"  // Act
 #include "runtime/device_buffer.hpp"
 #include "runtime/ngram_rows.hpp"
-#include "runtime/paged_buffer.hpp"
 #include "runtime/paged_state.hpp"  // PagedState: the host-only view of a parked conversation
 #include "runtime/ngram_table.hpp"
 #include "runtime/ple_hash.hpp"
@@ -389,6 +388,8 @@ int64_t kv_generations_that_fit(const Qwen4ExpDims &D, size_t act_bytes, int64_t
 // (RAM back; that parked generation's addresses stay spent, like every other generation's). The record names
 // the reservation its pages came from, so an id handed to another session refuses LOUD (hazards "VMM").
 // Move/copy like any value; empty (null reservation) = no record.
+class VmmReservation;
+using PageHandle = uint64_t;
 struct ParkedArrayKv {
     std::string name;                 // the array's name (its buffer parks and resumes under the same name)
     std::vector<PageHandle> pages;    // the kept pages of one paged array, by index within the array
@@ -464,40 +465,29 @@ struct Qwen4ExpSeqState {
     // layout.slot_offset(slot) - all slots' K/V and the parked region in one reservation, so pages can move
     // between them): every array kv_slot_specs names exists in `layout`.
     Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity, int64_t chain_rows, bool mtp, KvFormat kv,
-                     VmmReservation &kv_res, const KvReservationLayout &layout, int64_t slot,
-                     PrefillMath prefill_math = PrefillMath::WmmaBf16);
+                     int64_t slot, PrefillMath prefill_math = PrefillMath::WmmaBf16);
     ~Qwen4ExpSeqState();
     Qwen4ExpSeqState(const Qwen4ExpSeqState &) = delete;
     Qwen4ExpSeqState &operator=(const Qwen4ExpSeqState &) = delete;
-    // The paged arrays' mapping unit. gfx1151: a 2 MiB page is created in ~45 us and mapped pages read at hipMalloc's
-    // speed; slack per array is under one page.
-    static constexpr size_t kPageBytes = (size_t)2 << 20;
 
     int64_t pos = 0;
     // Where the last import_state ended (-1: none since reset): a delta import needs its base's import just
     // before - and pos still there (any forward moves it; restores need snapshots, which an import invalidates).
     int64_t imported_at = -1;
-    // Per-layer state (empty buffers for the other kind). The capacity-sized arrays (K / V caches, block keys, the
-    // 8-bit K/V below, the MTP head's) are paged: their address range covers the capacity, their pages are mapped as
-    // the conversation fills them (Qwen4ExpSession::ensure_rows).
-    std::vector<PagedDeviceBuffer> k_cache, v_cache, block_keys;
+    // Flat static buffers for the full capacity allocated at startup:
+    std::vector<DeviceBuffer<uint8_t>> k_cache, v_cache, block_keys;
     std::vector<DeviceBuffer<uint8_t>> tail[2], conv_state;
     std::vector<DeviceBuffer<float>> rec_state;
     int tail_cur = 0;  // the current indexer tails - and with KvFormat::Q8 the current K/V tails
-    // KvFormat::Q8 (k_cache / v_cache empty then): per attention layer the 8-bit storage (kernels/kv8.hpp, for the
-    // capacity rounded up to whole groups) and the K/V tails [2] (kv8_tail[tail_cur] current, double-buffered).
-    std::vector<PagedDeviceBuffer> kv8_store;
+    // KvFormat::Q8: per attention layer the 8-bit storage and the K/V tails [2] (kv8_tail[tail_cur] current).
+    std::vector<DeviceBuffer<uint8_t>> kv8_store;
     std::vector<DeviceBuffer<uint8_t>> kv8_tail[2];
     DeviceBuffer<uint8_t> ple_state;
     PleHistory ple_hist;
     // Rewinds for can_restore: epoch e started when the state rewound to rewind_to[e] (reset() = 0).
     std::vector<int64_t> rewind_to{0};
-    // The MTP head's state (with mtp): the layer's K / V cache, block keys and indexer tails
-    // (tail_mtp[mtp_tail_cur] current); mtp_prev [H*d] the trunk's streams after position pos - 1 (zeros at 0),
-    // row 0's input for the next MTP rows; and the draft chain's own buffers (step - 1's output streams -
-    // swapped against the session's mtp_x_ mid-chain, so only one state may draft at a time - the session
-    // enforces it - and the chain's own indexer tails).
-    PagedDeviceBuffer k_cache_mtp, v_cache_mtp, block_keys_mtp;
+    // The MTP head's state (with mtp): the layer's K / V cache, block keys and indexer tails.
+    DeviceBuffer<uint8_t> k_cache_mtp, v_cache_mtp, block_keys_mtp;
     DeviceBuffer<uint8_t> tail_mtp[2], mtp_prev;
     DeviceBuffer<uint8_t> mtp_chain_prev, mtp_chain_tail[2];
     int mtp_tail_cur = 0;
@@ -611,62 +601,21 @@ public:
     }
     void set_on_slot_evicted(std::function<void(int seq)> f) { on_slot_evicted_ = std::move(f); }
     void set_kv_budget(std::function<void(uint64_t bytes)> f) { kv_budget_ = std::move(f); }
-    // The bytes one slot's paged arrays map at the full capacity (the startup memory plan's deep-slot term).
+    // The bytes one slot's arrays map at the full capacity (static preallocation).
     uint64_t kv_full_bytes() const;
-    // The bytes slot seq's paged arrays map now: the deepest position any of its conversations reached (pages are
-    // never given back while the session lives - reset and import keep them).
     uint64_t kv_mapped_bytes(int seq) const;
-    // The one reservation every slot's paged K/V is carved from, its layout, and the parked-page region inside it
-    // (address space today: parking the pages into it is L2 step (b), gated on the gfx1151 release-path proof).
-    const VmmReservation &kv_reservation() const { return *kv_res_; }
-    // Slot seq's position in the generations its K/V reservation holds (Qwen4ExpSession's kv_generations): +1 per
-    // park, and per reset or resume of a slot whose generation was used (kv_generation_fresh). -1 when the reservation has
-    // no generations (kv_generations = 1). /metrics' generations gauge reads it - the headroom before the
-    // exhaustion refusal.
-    int64_t kv_generation(int seq) const;
-    // True while nothing was ever mapped in slot seq's current generation (after a park, or a reset with no
-    // forward since): a reset stays in it and a resume maps straight into it - neither spends a generation.
-    bool kv_generation_fresh(int seq) const;
+    int64_t kv_generation(int seq) const { (void)seq; return 1; }
+    bool kv_generation_fresh(int seq) const { (void)seq; return true; }
     const KvReservationLayout &kv_layout() const { return kv_layout_; }
-    // The parked generations (ParkedKv above). THE SESSION KEEPS
-    // THE RECORDS and hands out an id, because the cache that holds a parked conversation is host-only code and
-    // cannot name a handle (runtime/paged_state.hpp). The id IS the parked generation the pages went into -
-    // unique for the process's life, since parking never refunds one - so it can never name a recycled slot, and
-    // an id that was never taken or is already spent refuses by name.
-    // park_kv takes the whole paged K/V of slot seq out of the slot (unmap + kept handles, the slot cursor
-    // advances) and maps it into the next parked generation with host access (the disk writer reads parked pages
-    // over the host bus - probe check 2: CPU-read-needs-host); it returns that id. resume_parked maps the id's
-    // pages into slot seq - its current generation when that is fresh, else the next one, the slot's current
-    // pages going the way a reset's do (unmap + release - the caller has decided that conversation is over) -
-    // and unmaps the parked one. release_parked is
-    // eviction: unmap + release, RAM back. Neither refunds a parked generation - every park of the process's
-    // life spends one (the shared budget = kv-generations), exhaustion refuses cleanly, and only a
-    // restart reclaims. The parked budget counts parks, shared across slots: a park takes
-    // parked_generation_capacity() before it touches anything.
     int64_t park_kv(int seq, std::string tally_category);
-    // The operation the prompt cache needs: the whole K/V goes out AND the slot
-    // stops claiming to hold the conversation - position 0, every snapshot of it dead, the small parts cleared,
-    // exactly as a reset leaves a slot, except that the pages are already out so the generation cursor does
-    // not move twice. Without the cold half the engine's resume_point would take its live branch (it tests
-    // be->pos() == lcp) on a slot whose pages are gone: a conversation reading another one's K/V.
     int64_t park_and_cold(int seq, std::string tally_category);
     void resume_parked(int seq, int64_t parked_id);
     void release_parked(int64_t parked_id);
-    // The live record behind an id: loud when it is an id never taken, or one already resumed or evicted (both
-    // spend it - a conversation is parked once and handed back once).
     const ParkedKv &parked(int64_t parked_id) const;
-    // The host-only view of a parked conversation - what a paged cache entry holds (PagedState): the writer's
-    // byte map with host addresses resolved, the page bytes to count, the id to give back.
     PagedState paged_state(int64_t parked_id, int64_t n) const;
-    int64_t parked_generations_used() const { return parked_used_.load(); }  // parks taken (never given back)
-    // Parked records still live (taken, neither resumed nor released): the soft K/V reset rebuilds the session only
-    // at 0 - a live record's pages go with the session, and a cache entry would still point into them.
-    int64_t parked_live() const {
-        int64_t n = 0;
-        for (const ParkedKv &p : parked_by_gen_) n += p.live() ? 1 : 0;
-        return n;
-    }
-    int64_t parked_generation_capacity() const { return kv_layout_.parked_generations; }
+    int64_t parked_generations_used() const { return 0; }
+    int64_t parked_live() const { return 0; }
+    int64_t parked_generation_capacity() const { return 0; }
     bool broken() const { return broken_; }  // an earlier call failed midway: only reset() clears it
     int64_t pos() const { return seqs_[0]->pos; }
     int64_t pos(int seq) const;  // slot seq's position (pos() is seq 0's)
@@ -942,35 +891,10 @@ public:
 
 private:
     const Qwen4ExpModel &m_;
-    // The one HIP reservation every slot's paged K/V is carved from, plus the parked-page region behind the slot
-    // regions (pages hand off correctly only inside one reservation on gfx1151). Declared before seqs_ so it
-    // outlives the buffers carved from it. Layout built from kv_reservation_layout; address space only - the RAM
-    // is what the states' buffers map.
-    std::unique_ptr<VmmReservation> kv_res_;
     KvReservationLayout kv_layout_;
-    std::atomic<int64_t> parked_used_{0};  // parks taken across every slot (atomic: park_budget_left reads beside calls)
-    // The records this session parked, indexed by parked generation (= their id); spent ones are
-    // emptied in place so an id never names a live conversation twice. Sized once, with the budget.
-    std::vector<ParkedKv> parked_by_gen_;
-    // Mixed into every parked id this session hands out (a process-wide counter): ids from an
-    // earlier session are dead rather than aliasing a live one of a rebuild.
-    uint64_t parked_epoch_ = 0;
-    // One sequence state per serving slot (feat/multi-sequence): what the server runs
-    // today is one; batched forwards address them by run. seqs_ is built at the top of the constructor, before
-    // any st() use.
     std::vector<std::unique_ptr<Qwen4ExpSeqState>> seqs_;
-    // The state a single-sequence call runs on (the batched API takes them by run).
     void reset_seq_state(Qwen4ExpSeqState &s);  // one state back to position 0 (reset's per-slot part)
     int seq_index(const Qwen4ExpSeqState &s) const;  // which slot s is (checked)
-    // Throws KvBudgetExhausted when resetting s would need a generation past the budget; touches nothing.
-    void kv_budget_for_reset(const Qwen4ExpSeqState &s) const;
-    // The paged arrays of state sq and their byte ranges that positions [0, end) use: f(buffer, ranges) per array.
-    void for_paged(Qwen4ExpSeqState &sq, int64_t end, const std::function<void(PagedDeviceBuffer &,
-                   const std::vector<PagedDeviceBuffer::Range> &)> &f) const;
-    // Maps the pages sq's arrays need for positions [0, end) and a little past (for_paged's headroom for tile
-    // over-reads) - every writer calls it before its kernels: prepare_positions (forward bodies, keep_verify_prefix,
-    // run_mtp), each run of a multi-run batched forward, import_state - after kv_budget_ (or the floor check) allowed
-    // the bytes.
     void ensure_rows(Qwen4ExpSeqState &sq, int64_t end);
     std::function<void(uint64_t)> kv_budget_;
     static uint64_t mem_available_bytes();
