@@ -92,6 +92,8 @@ private:
     bool poisoned_locked(int seq) const;  // a failure since seq's last reset (check_ok_locked's condition, inverted)
     void fail_locked();  // a call failed with the backend failed(): every seq refuses until its reset
     bool can_run_locked(int seq, Kind kind) const;
+    bool has_pending_verifies_locked() const;
+    bool others_decoding_locked(int seq) const;
     bool lead_ready_locked(double now) const;  // the pending verifies should run as a batch now
     void run_batch(std::unique_lock<std::mutex> &lock);
 
@@ -111,8 +113,10 @@ private:
     // thread before a waiting call's thread wakes, so a prefill's next chunk never got the GPU until every decode
     // ended. A seq's call waiting (calls_waiting_) blocks other seqs' new chains once a batch ran since that seq's
     // last call (last_call_batch_): chunk, decode step, chunk, ...
+    static constexpr double kPrefillYieldTimeoutSeconds = 0.025;
     std::multiset<int> calls_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
+    std::vector<double> last_call_time_;    // per seq: timestamp when its last call completed
     std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
     int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
 };

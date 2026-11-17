@@ -17,6 +17,7 @@ GpuArbiter::GpuArbiter(LmBackend &be)
     : be_(be),
       epoch_((size_t)be.n_seqs(), 0),
       last_call_batch_((size_t)be.n_seqs(), 0),
+      last_call_time_((size_t)be.n_seqs(), 0.0),
       concurrent_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
@@ -36,13 +37,45 @@ void GpuArbiter::fail_locked() {
                                          "GpuArbiter: the batched verify was abandoned - another slot's call failed"));
 }
 
+bool GpuArbiter::has_pending_verifies_locked() const {
+    for (const auto &[s, p] : pending_)
+        if (!p.done) return true;
+    return false;
+}
+
+bool GpuArbiter::others_decoding_locked(int seq) const {
+    for (int s : decoding_)
+        if (s != seq) return true;
+    return false;
+}
+
 bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
     if (busy_) return false;
     if (kind == Kind::Hint) return true;
     if (kind == Kind::Resolve) return resolving_.count(seq) > 0;
     if (!resolving_.empty()) return false;  // the batch's resolutions first (its shared workspaces)
-    // A batch ready to go runs before a new call (between a prefill's chunks the other slots' decode steps run).
-    return !lead_ready_locked(now_s());
+
+    // A batch ready to go runs before a new call.
+    if (lead_ready_locked(now_s())) return false;
+
+    // If any verify run is waiting for the GPU, an exclusive Call must not preempt it!
+    // The batched verify forward takes ~35 ms; running an exclusive prefill chunk here
+    // would lock the GPU for 500-2500 ms and starve the waiting decode slots.
+    if (has_pending_verifies_locked()) return false;
+
+    // 1-to-1 Quantum Interleaving:
+    // If other slots are actively decoding and this slot is running a prefill chunk (not decoding itself),
+    // it must yield for at least one verify batch (or until the yield timeout expires).
+    if (kind == Kind::Call && others_decoding_locked(seq) && !decoding_.count(seq)) {
+        if (stats_.verify_batches == last_call_batch_[(size_t)seq]) {
+            const double elapsed = now_s() - last_call_time_[(size_t)seq];
+            if (elapsed < kPrefillYieldTimeoutSeconds) {
+                return false;  // yield GPU to let pending/drafting decode steps submit and run
+            }
+        }
+    }
+
+    return true;
 }
 
 bool GpuArbiter::poisoned_locked(int seq) const {
@@ -76,7 +109,13 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
                 last_call_batch_.size() - 1);
     const bool call = kind == Kind::Call;
     auto waiting = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
-    cv_.wait(lock, [&] { return failed_ || can_run_locked(seq, kind); });
+    while (!failed_ && !can_run_locked(seq, kind)) {
+        if (call && others_decoding_locked(seq)) {
+            cv_.wait_for(lock, std::chrono::milliseconds(5));
+        } else {
+            cv_.wait(lock);
+        }
+    }
     if (call) {
         calls_waiting_.erase(waiting);
         last_call_batch_[(size_t)seq] = stats_.verify_batches;
@@ -92,6 +131,7 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     } catch (...) {
         lock.lock();
         busy_ = false;
+        if (call) last_call_time_[(size_t)seq] = now_s();
         if (be_.failed()) fail_locked();
         lock.unlock();
         cv_.notify_all();
@@ -99,6 +139,7 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     }
     lock.lock();
     busy_ = false;
+    if (call) last_call_time_[(size_t)seq] = now_s();
     if (kind == Kind::Resolve) resolving_.erase(seq);
     lock.unlock();
     cv_.notify_all();
@@ -153,6 +194,9 @@ bool GpuArbiter::lead_ready_locked(double now) const {
 }
 
 double GpuArbiter::batch_wait_locked() const {
+    if (!calls_waiting_.empty()) {
+        return kBatchWaitMinSeconds;
+    }
     return std::clamp(0.4 * last_batch_seconds_, kBatchWaitMinSeconds, kBatchWaitMaxSeconds);
 }
 
@@ -261,6 +305,8 @@ void GpuArbiter::reset(int seq) {
     if (!err) {
         if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
         epoch_[(size_t)seq] = failures_;
+        last_call_batch_[(size_t)seq] = 0;
+        last_call_time_[(size_t)seq] = 0.0;
         resolving_.erase(seq);
     } else if (be_.failed()) {
         fail_locked();
@@ -294,9 +340,7 @@ bool GpuArbiter::others_decoding(int seq) const {
     std::lock_guard<std::mutex> lock(mu_);
     STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter::others_decoding: seq ", seq, ", expected 0..",
                 epoch_.size() - 1);
-    for (int s : decoding_)
-        if (s != seq) return true;
-    return false;
+    return others_decoding_locked(seq);
 }
 
 GpuArbiter::Stats GpuArbiter::stats() const {
