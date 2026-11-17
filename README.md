@@ -208,8 +208,3 @@ Pull requests and issues are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 ## License
 
 [AGPL-3.0](LICENSE). The model weights are separate and under the Qwen Community License 1.0.
-
-## Support
-
-strixite is free, and donations are never expected - but they are appreciated. Whatever comes in goes straight into
-equipment that speeds up development and testing. [Buy me a coffee](https://buymeacoffee.com/wemo).
