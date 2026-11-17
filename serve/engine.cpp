@@ -1230,9 +1230,12 @@ void Engine::run(Job &job, Slot &sl) {
         };
         auto chunk_end = [&](int64_t pos) {
             int64_t step = sl.be->max_chunk();
-            // Not for an image prompt: its blocks (up to a max chunk) must each fit one forward.
-            if (!has_images && arbiter_ && options_.shared_chunk > 0 && arbiter_->others_decoding(sl.index))
+            if (arbiter_ && options_.shared_chunk > 0 && arbiter_->others_decoding(sl.index))
                 step = std::min(step, options_.shared_chunk);
+            if (has_images) {
+                if (const PrefillImage *im = block_for(pos))
+                    step = std::max(step, im->rows);
+            }
             int64_t end = std::min(P, pos + step);
             if (cut > pos && cut < end) end = cut;
             if (ust > pos && ust < end) end = ust;

@@ -17,7 +17,6 @@ GpuArbiter::GpuArbiter(LmBackend &be)
     : be_(be),
       epoch_((size_t)be.n_seqs(), 0),
       last_call_batch_((size_t)be.n_seqs(), 0),
-      last_call_time_((size_t)be.n_seqs(), 0.0),
       concurrent_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
@@ -63,15 +62,12 @@ bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
     // would lock the GPU for 500-2500 ms and starve the waiting decode slots.
     if (has_pending_verifies_locked()) return false;
 
-    // 1-to-1 Quantum Interleaving:
+    // 1-to-1 Event-Driven Quantum Interleaving:
     // If other slots are actively decoding and this slot is running a prefill chunk (not decoding itself),
-    // it must yield for at least one verify batch (or until the yield timeout expires).
+    // it must yield until at least one verify batch has completed.
     if (kind == Kind::Call && others_decoding_locked(seq) && !decoding_.count(seq)) {
         if (stats_.verify_batches == last_call_batch_[(size_t)seq]) {
-            const double elapsed = now_s() - last_call_time_[(size_t)seq];
-            if (elapsed < kPrefillYieldTimeoutSeconds) {
-                return false;  // yield GPU to let pending/drafting decode steps submit and run
-            }
+            return false;  // yield GPU until active decode slots run their verify batch
         }
     }
 
@@ -110,11 +106,7 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     const bool call = kind == Kind::Call;
     auto waiting = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
     while (!failed_ && !can_run_locked(seq, kind)) {
-        if (call && others_decoding_locked(seq)) {
-            cv_.wait_for(lock, std::chrono::milliseconds(5));
-        } else {
-            cv_.wait(lock);
-        }
+        cv_.wait(lock);
     }
     if (call) {
         calls_waiting_.erase(waiting);
@@ -131,7 +123,6 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     } catch (...) {
         lock.lock();
         busy_ = false;
-        if (call) last_call_time_[(size_t)seq] = now_s();
         if (be_.failed()) fail_locked();
         lock.unlock();
         cv_.notify_all();
@@ -139,7 +130,6 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     }
     lock.lock();
     busy_ = false;
-    if (call) last_call_time_[(size_t)seq] = now_s();
     if (kind == Kind::Resolve) resolving_.erase(seq);
     lock.unlock();
     cv_.notify_all();
@@ -306,7 +296,6 @@ void GpuArbiter::reset(int seq) {
         if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
         epoch_[(size_t)seq] = failures_;
         last_call_batch_[(size_t)seq] = 0;
-        last_call_time_[(size_t)seq] = 0.0;
         resolving_.erase(seq);
     } else if (be_.failed()) {
         fail_locked();

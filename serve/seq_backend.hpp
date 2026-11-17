@@ -109,14 +109,11 @@ private:
     uint64_t failures_ = 0;
     Stats stats_;
     double last_batch_seconds_ = 0;  // the last batched verify's forward time
-    // Fairness between a prefill and the decoding seqs: a decoding seq resolves and starts its next chain on the same
-    // thread before a waiting call's thread wakes, so a prefill's next chunk never got the GPU until every decode
-    // ended. A seq's call waiting (calls_waiting_) blocks other seqs' new chains once a batch ran since that seq's
-    // last call (last_call_batch_): chunk, decode step, chunk, ...
-    static constexpr double kPrefillYieldTimeoutSeconds = 0.080;
+    // Fairness between prefill and decoding seqs: pure event-driven 1-to-1 quantum interleaving.
+    // When other seqs are actively decoding, an exclusive call (prefill chunk) yields until at least one
+    // verify batch completes (stats_.verify_batches > last_call_batch_). Zero magic wall-clock timers.
     std::multiset<int> calls_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
-    std::vector<double> last_call_time_;    // per seq: timestamp when its last call completed
     std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
     int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
 };
