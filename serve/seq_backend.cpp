@@ -16,7 +16,6 @@ double now_s() {
 GpuArbiter::GpuArbiter(LmBackend &be)
     : be_(be),
       epoch_((size_t)be.n_seqs(), 0),
-      last_call_batch_((size_t)be.n_seqs(), 0),
       concurrent_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
@@ -62,12 +61,21 @@ bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
     // would lock the GPU for 500-2500 ms and starve the waiting decode slots.
     if (has_pending_verifies_locked()) return false;
 
-    // 1-to-1 Event-Driven Quantum Interleaving:
-    // If other slots are actively decoding and this slot is running a prefill chunk (not decoding itself),
-    // it must yield until at least one verify batch has completed.
+    // Deficit Round Robin Event-Driven Quantum Interleaving:
+    // If other slots are actively decoding and this slot is running an exclusive prefill chunk (not decoding itself),
+    // it must yield until active decode slots complete their quantum of verify batches.
     if (kind == Kind::Call && others_decoding_locked(seq) && !decoding_.count(seq)) {
-        if (stats_.verify_batches == last_call_batch_[(size_t)seq]) {
-            return false;  // yield GPU until active decode slots run their verify batch
+        if (stats_.verify_batches - last_prefill_batch_ < kPrefillYieldBatches) {
+            return false;  // yield GPU until active decode slots run their verify batch quantum
+        }
+        // Fair round-robin across concurrent prefill slots:
+        // If this slot was the last one to run a prefill chunk and another prefill slot is waiting, let the other run first.
+        if (last_prefill_seq_ == seq && calls_waiting_.size() > 1) {
+            for (int s : calls_waiting_) {
+                if (s != seq && !decoding_.count(s)) {
+                    return false;
+                }
+            }
         }
     }
 
@@ -101,8 +109,6 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     // down (the production abort: a post-request snapshot_pos Hint threw after another slot's clean failure).
     if (kind == Kind::Hint && poisoned_locked(seq)) return false;
     check_ok_locked(seq);
-    STRIX_CHECK(seq >= 0 && seq < (int)last_call_batch_.size(), "GpuArbiter::run: seq ", seq, ", expected 0..",
-                last_call_batch_.size() - 1);
     const bool call = kind == Kind::Call;
     auto waiting = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
     while (!failed_ && !can_run_locked(seq, kind)) {
@@ -110,7 +116,10 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     }
     if (call) {
         calls_waiting_.erase(waiting);
-        last_call_batch_[(size_t)seq] = stats_.verify_batches;
+        if (!decoding_.count(seq)) {
+            last_prefill_batch_ = stats_.verify_batches;
+            last_prefill_seq_ = seq;
+        }
     }
     if (kind == Kind::Hint && poisoned_locked(seq)) return false;  // poisoned while waiting: same skip
     check_ok_locked(seq);
@@ -295,7 +304,7 @@ void GpuArbiter::reset(int seq) {
     if (!err) {
         if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
         epoch_[(size_t)seq] = failures_;
-        last_call_batch_[(size_t)seq] = 0;
+        if (last_prefill_seq_ == seq) last_prefill_seq_ = -1;
         resolving_.erase(seq);
     } else if (be_.failed()) {
         fail_locked();

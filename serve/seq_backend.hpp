@@ -68,6 +68,7 @@ public:
     // How long a waiting verify holds its batch for a decoding seq that hasn't sent its own yet,
     // within [kBatchWaitMinSeconds, kBatchWaitMaxSeconds].
     static constexpr double kBatchWaitMinSeconds = 0.010, kBatchWaitMaxSeconds = 0.020;
+    static constexpr int64_t kPrefillYieldBatches = 4;
     double batch_wait_locked() const;
 
     struct Stats {
@@ -109,11 +110,14 @@ private:
     uint64_t failures_ = 0;
     Stats stats_;
     double last_batch_seconds_ = 0;  // the last batched verify's forward time
-    // Fairness between prefill and decoding seqs: pure event-driven 1-to-1 quantum interleaving.
-    // When other seqs are actively decoding, an exclusive call (prefill chunk) yields until at least one
-    // verify batch completes (stats_.verify_batches > last_call_batch_). Zero magic wall-clock timers.
+    // Fairness between prefill and decoding seqs: pure event-driven Deficit Round Robin interleaving.
+    // When other seqs are actively decoding, prefill slots yield so decoding runs a quantum of verify
+    // batches (kPrefillYieldBatches). Tracking is GLOBAL across all prefill slots: only ONE prefill
+    // chunk can execute before decode receives another verify quantum, eliminating multi-slot prefill
+    // gang-up and reducing inter-token latency spikes.
     std::multiset<int> calls_waiting_;
-    std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
+    int64_t last_prefill_batch_ = 0;        // stats_.verify_batches when the last prefill chunk ran
+    int last_prefill_seq_ = -1;             // seq that ran the last prefill chunk (for round-robin)
     std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
     int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
 };
