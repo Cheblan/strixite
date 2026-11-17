@@ -113,7 +113,7 @@ private:
     // thread before a waiting call's thread wakes, so a prefill's next chunk never got the GPU until every decode
     // ended. A seq's call waiting (calls_waiting_) blocks other seqs' new chains once a batch ran since that seq's
     // last call (last_call_batch_): chunk, decode step, chunk, ...
-    static constexpr double kPrefillYieldTimeoutSeconds = 0.025;
+    static constexpr double kPrefillYieldTimeoutSeconds = 0.080;
     std::multiset<int> calls_waiting_;
     std::vector<int64_t> last_call_batch_;  // per seq: stats_.verify_batches when its last call ran
     std::vector<double> last_call_time_;    // per seq: timestamp when its last call completed
