@@ -200,6 +200,12 @@ public:
         check_seq(seq, "forward_rows");
         return forward_rows(ids, n_logits, cands, n_valid, masks);
     }
+    virtual LogitRows forward_image_prefill(int seq, const std::vector<int32_t> &ids, const PrefillImage &image,
+                                            const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                            int64_t n_valid, const LogitMasks *masks = nullptr) {
+        check_seq(seq, "forward_image_prefill");
+        return forward_image_prefill(ids, image, pos3, n_logits, cands, n_valid, masks);
+    }
     virtual Top2 forward_mtp_top2(int seq, int32_t token_id, int64_t step) {
         check_seq(seq, "forward_mtp_top2");
         return forward_mtp_top2(token_id, step);
@@ -600,8 +606,7 @@ public:
     Engine &operator=(const Engine &) = delete;
     // The backend's n_seqs() slots each serve one conversation at a time: a worker per slot, requests in arrival
     // order (FIFO) to an idle slot - the one the prompt continues, else an empty one, else the least recently used
-    // (dispatch_locked); an image prompt waits for slot 0
-    // (image positions are slot 0's); a prompt that continues a busy slot's running request waits for that slot. Several slots share the GPU through a GpuArbiter (serve/seq_backend.hpp),
+    // (dispatch_locked); a prompt that continues a busy slot's running request waits for that slot. Several slots share the GPU through a GpuArbiter (serve/seq_backend.hpp),
     // which batches their MTP verifies.
 
     void submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink);

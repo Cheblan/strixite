@@ -192,7 +192,7 @@ void Engine::dispatch_locked() {
     while (!queue_.empty() && fatal_.empty()) {
         const GenerationRequest &req = queue_.front().req;
         const std::vector<int32_t> &key = req.image_pos3.empty() ? req.prompt : req.cache_key;
-        // The slot, among the idle ones (an image prompt: slot 0 only, image positions are slot 0's): the one whose
+        // The slot, among the idle ones: the one whose
         // state the prompt continues (its tokens a prefix of the prompt - the same conversation, longest first), else
         // an empty one, else the least recently used (its conversation goes back to the prompt cache). A shared
         // prefix alone (a system prompt and tool list every conversation of a client has) doesn't pick a slot: it
@@ -247,7 +247,6 @@ void Engine::dispatch_locked() {
         int64_t cont_common = 0, pointed_at = 0;
         for (auto &sl : slots_) {
             if (sl->busy) continue;
-            if (!req.image_pos3.empty() && sl->index != 0) continue;
             const size_t n = sl->seq.size();  // an idle slot's tokens don't change (its worker waits for a job)
             if (n == 0) {
                 if (!empty) empty = sl.get();

@@ -269,23 +269,31 @@ LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_lo
 LogitRows Qwen4ExpBackend::forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &image,
                                                  const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
                                                  int64_t n_valid, const LogitMasks *masks) {
+    return forward_image_prefill(0, ids, image, pos3, n_logits, cands, n_valid, masks);
+}
+
+LogitRows Qwen4ExpBackend::forward_image_prefill(int seq, const std::vector<int32_t> &ids, const PrefillImage &image,
+                                                 const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                                 int64_t n_valid, const LogitMasks *masks) {
+    check_seq(seq, "forward_image_prefill");
     STRIX_CHECK(model_.has_vision(), "Qwen4ExpBackend::forward_image_prefill: the model was loaded without "
                 "a vision.strixw - image prompts are refused (config vision)");
     if (masks != nullptr)
         masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_image_prefill");
     STRIX_CHECK(!image.prefill.pixel_values.empty(), "Qwen4ExpBackend::forward_image_prefill: the image block at row ",
                 image.row_start, " has no pixel_values - the engine decodes a known image before its forward");
-    session_->set_positions(pos3);  // the walk's triples for exactly this forward's rows (Phase A checks)
+    session_->set_positions(seq, pos3);  // the walk's triples for exactly this forward's rows (Phase A checks)
     ImageInput in;
     in.pixel_values = image.prefill.pixel_values;  // one copy per image forward (the block runs once)
     in.grid_t = image.prefill.grid_t, in.grid_h = image.prefill.grid_h, in.grid_w = image.prefill.grid_w;
+    std::vector<Qwen4ExpSession::BatchRun> run{{seq, ids, n_logits}};
     if (!cands || n_logits == 0) {
-        LogitRows l = LogitRows::from_full(session_->forward(ids, n_logits, &in), logits_row());
+        LogitRows l = LogitRows::from_full(session_->forward_batch(run, &in), logits_row());
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
     }
     want_candidates(n_valid, masks, n_logits);
-    session_->forward(ids, n_logits, &in);
+    session_->forward_batch(run, &in);
     return candidate_rows(n_logits);
 }
 

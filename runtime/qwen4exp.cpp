@@ -1149,20 +1149,26 @@ std::array<int64_t, 3> continuation_value_of(const int64_t *last, const int64_t 
 }  // namespace
 
 void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
+    set_positions(0, std::move(pos3));
+}
+
+void Qwen4ExpSession::set_positions(int seq, std::vector<int64_t> pos3) {
     const char *fn = "Qwen4ExpSession::set_positions";
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), fn, ": seq ", seq, ", expected 0..", n_slots() - 1);
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     STRIX_CHECK(pos3.size() % 3 == 0, fn, ": ", pos3.size(), " values, expected a whole number of (t,h,w) triples");
     if (pos3.empty()) {  // clear: the next forward is on the scalar path again (any text-only call may do this)
-        st().pending3.clear();
+        sq.pending3.clear();
         return;
     }
     const int64_t rows = (int64_t)pos3.size() / 3;
-    STRIX_CHECK(!st().verify_pending, fn, ": a forward_verify awaits keep_verify / drop_verify - the next forward's "
+    STRIX_CHECK(!sq.verify_pending, fn, ": a forward_verify awaits keep_verify / drop_verify - the next forward's "
                 "rows are undefined until then");
-    STRIX_CHECK(st().pending3.empty(), fn, ": positions for the next forward are already set (", st().pending3.size() / 3,
+    STRIX_CHECK(sq.pending3.empty(), fn, ": positions for the next forward are already set (", sq.pending3.size() / 3,
                 " rows) - forward them or clear with an empty vector");
     STRIX_CHECK(rows >= 1 && rows <= max_tokens_, fn, ": ", rows, " rows, expected 1..", max_tokens_,
                 " (one forward of at most max_tokens rows)");
-    STRIX_CHECK(st().pos + rows <= capacity_, fn, ": rows [", st().pos, ", ", st().pos + rows, ") exceed the capacity ",
+    STRIX_CHECK(sq.pos + rows <= capacity_, fn, ": rows [", sq.pos, ", ", sq.pos + rows, ") exceed the capacity ",
                 capacity_);
     const int64_t max_pos = m_.dims().max_positions();
     for (int64_t r = 0; r < rows; ++r)
@@ -1174,32 +1180,32 @@ void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
         }
     // The span must continue the history exactly (the vision position-walk design note). Rows at or past the
     // position are the pending span's - a set_positions while a previous span is still un-forwarded was
-    // refused above, and no other call advances st().pos with a span pending.
+    // refused above, and no other call advances sq.pos with a span pending.
     // The span must continue the history exactly (the vision position-walk design note). While the history is
     // empty (a text-only session that never set positions, or one resumed after the image) there is nothing
-    // to continue - the first interleaved span can start anywhere valid. Once non-empty it must reach st().pos
-    // (every forward extends it), and rows at or past st().pos are the pending span's.
-    if (!st().pos3_host.empty()) {
-        STRIX_CHECK(st().pos3Hend() == st().pos, fn, ": the triple history covers [", st().pos3_start, ", ", st().pos3Hend(),
-                    ") but the position is ", st().pos, " (internal: every forward extends the history to st().pos)");
-        const int64_t *last = st().pos3_host.data() + (size_t)((st().pos3Hend() - st().pos3_start - 1) * 3);
-        const Cont want = continuation_of(last, st().pos3_host.data(), (int64_t)st().pos3_host.size() / 3);
-        STRIX_CHECK(accepts(want, pos3.data()), fn, ": row ", st().pos, " is ", triple_str(pos3.data()), " but the "
-                    "history's row ", st().pos - 1, " ", triple_str(last),
+    // to continue - the first interleaved span can start anywhere valid. Once non-empty it must reach sq.pos
+    // (every forward extends it), and rows at or past sq.pos are the pending span's.
+    if (!sq.pos3_host.empty()) {
+        STRIX_CHECK(sq.pos3Hend() == sq.pos, fn, ": the triple history covers [", sq.pos3_start, ", ", sq.pos3Hend(),
+                    ") but the position is ", sq.pos, " (internal: every forward extends the history to sq.pos)");
+        const int64_t *last = sq.pos3_host.data() + (size_t)((sq.pos3Hend() - sq.pos3_start - 1) * 3);
+        const Cont want = continuation_of(last, sq.pos3_host.data(), (int64_t)sq.pos3_host.size() / 3);
+        STRIX_CHECK(accepts(want, pos3.data()), fn, ": row ", sq.pos, " is ", triple_str(pos3.data()), " but the "
+                    "history's row ", sq.pos - 1, " ", triple_str(last),
                     " continues at " + triple_str(want.exact.data()) +
                         (want.kind == ContKind::kEndOrImage ? " (or an image step at the block edge)"
                                                             : std::string()));
     } else {
         // First interleaved span of a text-only (or after-image resumed) session: its first row continues the
         // uniform prefix, so it sits at the scalar continuation of the current position.
-        const int64_t want[3] = {st().pos + st().rope_delta, st().pos + st().rope_delta, st().pos + st().rope_delta};
-        STRIX_CHECK(triple_eq(pos3.data(), want), fn, ": row ", st().pos, " is ", triple_str(pos3.data()), " but the "
+        const int64_t want[3] = {sq.pos + sq.rope_delta, sq.pos + sq.rope_delta, sq.pos + sq.rope_delta};
+        STRIX_CHECK(triple_eq(pos3.data(), want), fn, ": row ", sq.pos, " is ", triple_str(pos3.data()), " but the "
                     "uniform prefix continues at ", triple_str(want), " (the first interleaved row must sit at "
-                    "the walk's current position ", st().pos, " + delta)");
+                    "the walk's current position ", sq.pos, " + delta)");
     }
-    st().history_ever_interleaved = st().history_ever_interleaved || st().rope_delta != 0 || !st().pos3_host.empty();  // (delta is
+    sq.history_ever_interleaved = sq.history_ever_interleaved || sq.rope_delta != 0 || !sq.pos3_host.empty();  // (delta is
     // <= 0 by invariant - nonzero only after an image packed positions ahead of the sequence indices)
-    st().pending3 = std::move(pos3);
+    sq.pending3 = std::move(pos3);
 }
 
 // Point the rope triple array at the forward's block span [4*(seq/4), seq+n) and fill mk_block_ / mk_jobs_.
@@ -2407,10 +2413,8 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         STRIX_CHECK((int64_t)image->pixel_values.size() == np * tower->dims().patch_in, ifn, ": ",
                     image->pixel_values.size(), " pixel values, expected ", np, " patches x ",
                     tower->dims().patch_in, " columns");
-        // set_positions addresses slot 0 only (the per-slot form comes with the engine's slots): an image
-        // forward on another slot would be checked against slot 0's triples.
-        STRIX_CHECK(batch[0].seq == 0, ifn, ": an image forward on seq ", batch[0].seq,
-                    ", expected seq 0 (set_positions / mRoPE are slot 0's only so far)");
+        STRIX_CHECK(batch[0].seq >= 0 && batch[0].seq < n_slots(), ifn, ": an image forward on seq ", batch[0].seq,
+                    ", expected seq in 0..", n_slots() - 1);
         STRIX_CHECK(!runs[0].sq->pending3.empty(), ifn, ": an image forward carries its set_positions triples (the "
                     "image rows' (t,h,w) section positions) - set them first (Phase A's walk rule)");
         STRIX_CHECK((int64_t)runs[0].sq->pending3.size() / 3 == T, ifn, ": set_positions holds ",

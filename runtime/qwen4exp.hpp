@@ -636,6 +636,7 @@ public:
     // be a position the model can represent. set_positions before forward / forward_verify consumes it; before
     // any of the other calls that touch position (forward_mtp, save, import_state) it is refused.
     void set_positions(std::vector<int64_t> pos3);
+    void set_positions(int seq, std::vector<int64_t> pos3);
     int64_t rope_delta() const { return st().rope_delta; }  // rows after the last image: rope angle at seq + delta
     int64_t rope_delta(int seq) const {
         STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::rope_delta: seq out of range");

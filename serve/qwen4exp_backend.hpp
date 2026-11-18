@@ -86,6 +86,9 @@ public:
     int64_t pos(int seq) const override { return session_->pos(seq); }
     LogitRows forward_rows(int seq, const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                            const LogitMasks *masks = nullptr) override;
+    LogitRows forward_image_prefill(int seq, const std::vector<int32_t> &ids, const PrefillImage &image,
+                                    const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
+                                    int64_t n_valid, const LogitMasks *masks = nullptr) override;
     Top2 forward_mtp_top2(int seq, int32_t token_id, int64_t step) override {
         const Qwen4ExpSession::MtpTop2 p = session_->forward_mtp_top2_seq(seq, token_id, step);
         Top2 t;

@@ -273,6 +273,51 @@ int main(int argc, char **argv) {
     test_assert(arb_stats.verify_batches >= 1, "GpuArbiter verify_batches >= 1");
 
     // ======================================================================
+    // EDGE CASE 8: Multi-Slot Vision (Vision directly on Slot 1 and Slot 2 via SeqBackend)
+    // ======================================================================
+    printf("\n--- Edge Case 8: Vision directly on Slot 1 via SeqBackend (Unbound from Slot 0) ---\n");
+    backend.reset(1);
+    backend.reset(2);
+    test_assert(backend.rope_delta(1) == 0, "Slot 1 initial rope_delta == 0");
+    test_assert(backend.batchable(1) == true, "Slot 1 initial batchable() == true");
+
+    SeqBackend seq2(arbiter, 2);
+    std::vector<vision::ServedImage> s_images_s1 = vision::prepare_images(
+        {vision::ParsedImage{make_test_png(256, 256, 50, 150, 250), "image/png"}}, sv);
+    vision::VisionPromptPlan plan_s1 = vision::plan_vision_prompt(prompt_with_image, s_images_s1, sv.cfg,
+                                                                 sv.image_token_id, backend.max_positions());
+    PrefillImage prefill_im_s1{std::move(s_images_s1[0].prefill), s_images_s1[0].row_start, s_images_s1[0].rows};
+
+    bool s1_vision_threw = false;
+    LogitRows s1_logits;
+    try {
+        s1_logits = seq1.forward_image_prefill(prompt_with_image, prefill_im_s1, plan_s1.pos3, 1, false, 0);
+    } catch (const std::exception &e) {
+        printf("Slot 1 forward_image_prefill threw: %s\n", e.what());
+        s1_vision_threw = true;
+    }
+    test_assert(!s1_vision_threw, "Slot 1 executed forward_image_prefill without throwing");
+    test_assert(backend.rope_delta(1) != 0, "Slot 1 post-vision rope_delta is non-zero");
+    test_assert(backend.batchable(1) == true, "Slot 1 post-vision batchable() == true");
+
+    // Now test concurrent verify with Slot 0 (vision), Slot 1 (vision), and Slot 2 (text)
+    std::thread th0([&] {
+        seq0.forward_verify_rows({4001}, 1, false, 0);
+        seq0.keep_verify();
+    });
+    std::thread th1([&] {
+        seq1.forward_verify_rows({4002}, 1, false, 0);
+        seq1.keep_verify();
+    });
+    std::thread th2([&] {
+        seq2.forward_rows({5001}, 1, false, 0);
+    });
+    th0.join();
+    th1.join();
+    th2.join();
+    test_assert(true, "Concurrent execution with Slot 0 (vision), Slot 1 (vision), and Slot 2 (text) completed cleanly");
+
+    // ======================================================================
     // FINAL SUMMARY
     // ======================================================================
     printf("\n======================================================================\n");

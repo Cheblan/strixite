@@ -406,11 +406,9 @@ LogitRows SeqBackend::forward_verify_rows(const std::vector<int32_t> &ids, int64
 LogitRows SeqBackend::forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &image,
                                             const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
                                             int64_t n_valid, const LogitMasks *masks) {
-    STRIX_CHECK(seq_ == 0, "SeqBackend::forward_image_prefill: an image prompt on slot ", seq_,
-                ", expected slot 0 (image positions are slot 0's only; the engine routes image requests there)");
     LogitRows l;
     arb_.run(seq_, GpuArbiter::Kind::Call, [&] {
-        l = arb_.backend().forward_image_prefill(ids, image, pos3, n_logits, cands, n_valid, masks);
+        l = arb_.backend().forward_image_prefill(seq_, ids, image, pos3, n_logits, cands, n_valid, masks);
     });
     return l;
 }
