@@ -161,14 +161,18 @@ uint64_t write_all_releasing(int fd, HostBuffer &src, size_t n, uint64_t at, con
 
 // /proc/meminfo's MemAvailable in bytes; throws if it can't be read.
 uint64_t proc_mem_available() {
-    std::ifstream f("/proc/meminfo");
-    STRIX_CHECK(f.good(), "PromptCache: can't open /proc/meminfo");
-    std::string key;
-    uint64_t kib = 0;
-    std::string unit;
-    while (f >> key >> kib >> unit)
-        if (key == "MemAvailable:") return kib << 10;
-    STRIX_FAIL("PromptCache: /proc/meminfo has no MemAvailable line");
+    int fd = ::open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    STRIX_CHECK(fd >= 0, "PromptCache: can't open /proc/meminfo");
+    char buf[2048];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    STRIX_CHECK(n > 0, "PromptCache: can't read /proc/meminfo");
+    buf[n] = '\0';
+    const char *p = std::strstr(buf, "MemAvailable:");
+    STRIX_CHECK(p != nullptr, "PromptCache: /proc/meminfo has no MemAvailable line");
+    unsigned long long kib = 0;
+    STRIX_CHECK(std::sscanf(p + 13, "%llu", &kib) == 1, "PromptCache: unparsable MemAvailable in /proc/meminfo");
+    return (uint64_t)kib << 10;
 }
 
 PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string fingerprint)
@@ -290,7 +294,17 @@ PromptCache::~PromptCache() {
 }
 
 uint64_t PromptCache::mem_available() const {
-    return opt_.mem_available ? opt_.mem_available() : proc_mem_available();
+    if (opt_.mem_available) return opt_.mem_available();
+    const double now = now_s();
+    const double last = cached_mem_time_.load(std::memory_order_relaxed);
+    if (now - last < 0.5) {
+        const uint64_t cached = cached_mem_.load(std::memory_order_relaxed);
+        if (cached > 0) return cached;
+    }
+    const uint64_t val = proc_mem_available();
+    cached_mem_.store(val, std::memory_order_relaxed);
+    cached_mem_time_.store(now, std::memory_order_relaxed);
+    return val;
 }
 
 uint64_t PromptCache::disk_free() const {

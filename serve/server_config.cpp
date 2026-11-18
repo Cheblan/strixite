@@ -280,12 +280,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "each generation takes one slot's K/V carve (~8.2 GiB at 512k q8) in every slot region and in the parked "
          "region, so (total-slots + 1) x generations x the carve must fit in 32 TiB; an explicit count that doesn't "
          "fails startup, naming the most that fit"},
-        {"kv-renew-margin", K::Int, 0, 1024, "16",
-         "the soft K/V reset: once a slot has at most this many K/V generations left (or the parked budget this many "
-         "parks), new requests wait for the running ones, every parked conversation is written to disk, and the "
-         "session is rebuilt on the loaded model - the budget starts over without a restart; the weights and the "
-         "prompt cache stay, conversations come back from the cache. Takes seconds (the disk writes). 0 = off: past "
-         "the last generation a switch is refused and only a restart reclaims"},
+        {"kv-renew-margin", K::Int, 0, 1024, "0", "obsolete / ignored in flat KV"},
         {"rope-yarn-factor", K::Number, 1, 8, "2",
          "YaRN context extension: positions as trained (262144) x this; 1 = off (RoPE as trained). A change makes "
          "the prompt cache's entries from the other setting unusable (dropped at startup)"},

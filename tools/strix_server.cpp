@@ -349,7 +349,6 @@ int run(int argc, char **argv) {
     eng_opts.think_close_on_call = think_close_on_call;
     eng_opts.shared_chunk = chunk_shared;
     eng_opts.degraded = degraded;
-    eng_opts.kv_renew_margin = settings.integer("kv-renew-margin");
     slog(LogLevel::Info, "startup: think-block / tool-call guard %s, literal tags %s, think close before a call %s",
          think_end_guard ? "on" : "off", literal_tags ? "on" : "off", think_close_on_call ? "on" : "off");
     if (think_nudge)

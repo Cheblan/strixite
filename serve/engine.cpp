@@ -189,9 +189,7 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
 }
 
 void Engine::dispatch_locked() {
-    // A soft K/V reset is due or running (renew_kv): nothing new starts until it is done - the running requests
-    // finish, then one idle worker rebuilds the session.
-    while (!queue_.empty() && fatal_.empty() && !renew_due_ && !renewing_) {
+    while (!queue_.empty() && fatal_.empty()) {
         const GenerationRequest &req = queue_.front().req;
         const std::vector<int32_t> &key = req.image_pos3.empty() ? req.prompt : req.cache_key;
         // The slot, among the idle ones (an image prompt: slot 0 only, image positions are slot 0's): the one whose
@@ -327,23 +325,10 @@ void Engine::worker(Slot &sl) {
         std::unique_ptr<Job> job;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            const auto renew_now = [&] { return renew_due_ && !renewing_ && stats_.busy == 0 && fatal_.empty(); };
             cv_.wait(lock, [&] {
-                return stop_ || sl.job != nullptr || (drain_wanted_ && !renewing_) || renew_now();
+                return stop_ || sl.job != nullptr || drain_wanted_;
             });
-            if (sl.job == nullptr && !stop_ && renew_now()) {
-                // Every slot is idle and dispatch is held: this worker renews (the others wait - no job, no drain).
-                renewing_ = true;
-                lock.unlock();
-                renew_kv();  // never throws: a failure is logged, or made fatal, inside
-                lock.lock();
-                renewing_ = false, renew_due_ = false;
-                dispatch_locked();
-                lock.unlock();
-                cv_.notify_all();
-                continue;
-            }
-            if (sl.job == nullptr && !stop_ && drain_wanted_ && !renewing_) {
+            if (sl.job == nullptr && !stop_ && drain_wanted_) {
                 // The prompt cache retired parked records while no request ran (its margin watch evicted them,
                 // or an eviction write finished): give their pages back now, not at the next request - another
                 // process wanting RAM is why the watch evicted.
@@ -438,15 +423,6 @@ void Engine::worker(Slot &sl) {
             }
             const int64_t snap = sl.be->snapshot_pos(LmBackend::kTurnSlot);  // -1 when poisoned (a Hint): turn_pos
                                                                              // "none", never a save against it
-            if (renew_due()) {  // before the slot goes idle: dispatch_locked in release_slot already holds
-                std::lock_guard<std::mutex> lock(mu_);
-                if (!renew_off_ && !renew_due_) {
-                    renew_due_ = true;
-                    slog(LogLevel::Info, "K/V budget: within the renewal margin (kv-renew-margin %lld) - new requests "
-                         "wait until the running ones finish and the session is rebuilt",
-                         (long long)options_.kv_renew_margin);
-                }
-            }
             release_slot(snap);
             cv_.notify_all();
         } catch (const std::exception &ex) {
@@ -460,17 +436,6 @@ void Engine::worker(Slot &sl) {
 std::string Engine::fatal_error() const {
     std::lock_guard<std::mutex> lock(mu_);
     return fatal_;
-}
-
-bool Engine::kv_renew_available() const {
-    if (options_.kv_renew_margin <= 0 || !be_.can_renew()) return false;
-    std::lock_guard<std::mutex> lock(mu_);
-    return !renew_off_;
-}
-
-std::string Engine::kv_budget_refusal() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return kv_refusal_;
 }
 
 int64_t Engine::resume_point(Slot &sl, const std::vector<int32_t> &prompt, int64_t id, bool &from_disk, bool &from_ram) {
@@ -873,121 +838,6 @@ void Engine::drain_parked(Slot &sl) {
     // A refusal is a bug (a spent or foreign id - the session checks loudly), not a condition to route
     // around: let it throw, the worker's guard fails this request clean and resets.
     for (const int64_t id : cache_->take_retired()) sl.be->release_parked(id);
-}
-
-bool Engine::renew_due() const {
-    if (options_.kv_renew_margin <= 0 || !be_.can_renew()) return false;
-    const BackendStats b = be_.backend_stats();
-    for (size_t k = 0; k < b.kv_generation_used.size() && k < b.kv_generation_capacity.size(); ++k) {
-        const int64_t cap = b.kv_generation_capacity[k];
-        if (cap > 1 && cap - 1 - b.kv_generation_used[k] <= options_.kv_renew_margin) return true;
-    }
-    return b.parked_generation_capacity > 0 &&
-           b.parked_generation_capacity - b.parked_generation_used <= options_.kv_renew_margin;
-}
-
-void Engine::renew_kv() {
-    // How long the spill may wait for its writes: a parked conversation is at most a slot's K/V (~8 GB at 512k),
-    // written at disk speed - minutes would mean a stuck disk, and then the renewal is called off, not forced.
-    constexpr double kSpillSeconds = 300;
-    const double t0 = now_s();
-    const BackendStats b0 = be_.backend_stats();
-    std::string gens;
-    for (size_t k = 0; k < b0.kv_generation_used.size(); ++k)
-        gens += (k ? ", " : "") + std::to_string(b0.kv_generation_used[k]);
-    slog(LogLevel::Info, "%s", kLogRule);
-    slog_row(LogLevel::Info, "kv renew", "the soft K/V reset: slot generation%s %s of %s, parked %s of %s - the session "
-             "is rebuilt on the loaded model (weights, n-gram rows and the prompt cache stay)",
-             b0.kv_generation_used.size() > 1 ? "s" : "", gens.c_str(),
-             b0.kv_generation_capacity.empty() ? "-" : std::to_string(b0.kv_generation_capacity[0]).c_str(),
-             fmt_n(b0.parked_generation_used).c_str(), fmt_n(b0.parked_generation_capacity).c_str());
-    const char *stage = "the held Turns";
-    try {
-        // 1. Each slot's held Turn to the cache - as a copy: a park would only be written to disk again below.
-        if (cache_)
-            for (auto &s : slots_) flush_pending_turn(*s, "the K/V budget renews", /*allow_park=*/false);
-        // 2. Every parked conversation to disk: its pages go with the old session.
-        stage = "the parked entries";
-        PromptCache::Spill sp;
-        if (cache_ && be_.paged_states()) {
-            sp = cache_->spill_parked(kSpillSeconds);
-            STRIX_CHECK(sp.left == 0, "Engine::renew_kv: ", sp.left, " parked entries were still being written after ",
-                        fmt_rate(sp.seconds, 0), " s - the session keeps them");
-            slog_row(LogLevel::Info, "", "parked conversations: %s written to disk (%s GB of pages), %s dropped "
-                     "(one-shot, or no room), %s s", fmt_n(sp.written).c_str(), fmt_rate(sp.bytes / 1e9, 1).c_str(),
-                     fmt_n(sp.dropped).c_str(), fmt_rate(sp.seconds, 2).c_str());
-        }
-        // 3. Their records back to the session that carved them (renew refuses while one is live).
-        stage = "the parked records";
-        int64_t released = 0;
-        if (cache_ && be_.paged_states())
-            for (const int64_t id : cache_->take_retired()) be_.release_parked(0, id), ++released;
-        // 4. The new session: the old one's destructor frees its reservation, which is what makes even reused
-        // addresses read right again.
-        stage = "the session rebuild";
-        const double t_r = now_s();
-        be_.renew();
-        const double rebuild_ms = (now_s() - t_r) * 1e3;
-        // 5. Every slot starts empty: its conversation is in the prompt cache (or re-prefills).
-        for (auto &s : slots_) s->seq.clear(), s->pending = PendingTurn(), s->needs_reset = false;
-        const double ms = (now_s() - t0) * 1e3;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            for (auto &s : slots_) {
-                s->turn_pos = -1;
-                stats_.slot_live_tokens[(size_t)s->index] = 0, stats_.slot_snapshot_pos[(size_t)s->index] = -1;
-            }
-            stats_.live_tokens = 0;
-            kv_refusal_.clear();  // the budget is back: /health is no longer degraded by an old refusal
-            ++stats_.kv_renewals, stats_.kv_renew_last_ms = ms;
-        }
-        const BackendStats b1 = be_.backend_stats();
-        slog_row(LogLevel::Info, "", "%s parked records given back, session rebuilt in %s ms; generation %s of %s "
-                 "again", fmt_n(released).c_str(), fmt_rate(rebuild_ms, 0).c_str(),
-                 b1.kv_generation_used.empty() ? "-" : std::to_string(b1.kv_generation_used[0]).c_str(),
-                 b1.kv_generation_capacity.empty() ? "-" : std::to_string(b1.kv_generation_capacity[0]).c_str());
-        slog_row(LogLevel::Info, "done", "%9s s total, renewal %lld of this process", fmt_rate(ms / 1e3, 2).c_str(),
-                 (long long)b1.kv_renewals);
-        slog(LogLevel::Info, "%s", kLogRule);
-    } catch (const std::exception &ex) {
-        const bool lost = dynamic_cast<const GpuFatalError *>(&ex) != nullptr || be_.failed();
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            ++stats_.kv_renew_failures;
-            renew_off_ = true;  // no retry loop: the exhaustion refusal stays the guard, a restart reclaims
-        }
-        for (auto &s : slots_) s->seq.clear(), s->pending = PendingTurn();
-        if (!lost) {
-            // Nothing is half-done that matters: every step before the rebuild only moved conversations into the
-            // prompt cache. The slots start clean (their next request resets them).
-            for (auto &s : slots_) s->needs_reset = true;
-            slog_row(LogLevel::Error, "error", "the soft K/V reset failed at %s: %s", stage, ex.what());
-            slog_row(LogLevel::Error, "", "serving goes on in this session; no further renewal in this process - at "
-                     "exhaustion requests are refused (HTTP 503 kv_budget_exhausted) until a restart");
-            slog(LogLevel::Info, "%s", kLogRule);
-            return;
-        }
-        // The old session is gone and no new one stands: nothing can run. As a lost GPU context: fail the
-        // queue, refuse new requests, and let the supervisor restart the server.
-        const std::string what = std::string("the soft K/V reset failed at ") + stage + ": " + ex.what();
-        slog_row(LogLevel::Error, "error", "FATAL: %s", what.c_str());
-        slog_row(LogLevel::Error, "", "FATAL: no session to serve on: failing the queued requests%s",
-                 options_.on_fatal ? ", the server exits for its supervisor to restart it" : "");
-        slog(LogLevel::Info, "%s", kLogRule);
-        std::deque<Job> failed;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            fatal_ = what;
-            failed.swap(queue_);
-            stats_.queued = 0;
-        }
-        for (Job &j : failed) {
-            GenerationResult r;
-            r.finish_reason = "error", r.error = what + "; the server is restarting";
-            deliver(j, r);
-        }
-        if (options_.on_fatal) options_.on_fatal(what);
-    }
 }
 
 namespace {
@@ -1743,27 +1593,8 @@ void Engine::run(Job &job, Slot &sl) {
         if (sl.be->failed()) {  // can't happen (the refusals touch nothing) - but a broken session is never served on
             fail_clean(e);
         } else {
-            bool first = false;
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (kv_refusal_.empty()) kv_refusal_ = e.what(), first = true;
-            }
-            slog_row(LogLevel::Error, "error", "REFUSED: the K/V generation budget is spent - %s", e.what());
-            const bool renews = kv_renew_available();
-            if (renews)
-                slog_row(LogLevel::Error, "", "the soft K/V reset rebuilds the session as soon as the running requests "
-                         "finish (kv-renew-margin); /health says degraded until then");
-            else
-                slog_row(LogLevel::Error, "", "this slot serves only the conversation it holds until the server restarts "
-                         "(a restart reclaims the budget: kv-generations); /health says degraded%s",
-                         first ? " from now on" : "");
-            res.error = renews ? std::string("the K/V generation budget is spent (kv-generations): the session renews "
-                                             "itself as soon as the running requests finish - retry in a few seconds (") +
-                                     e.what() + ")"
-                               : std::string("the K/V generation budget is spent (kv-generations): until the server "
-                                             "restarts it serves only the conversation its slot holds, and refuses to "
-                                             "start or switch to another - a restart reclaims the budget (") +
-                                     e.what() + ")";
+            slog_row(LogLevel::Error, "error", "REFUSED: %s", e.what());
+            res.error = e.what();
             res.error_type = kErrorKvBudget;
             finish("error");
         }

@@ -42,41 +42,8 @@ void Qwen4ExpBackend::build_session() {
 }
 
 void Qwen4ExpBackend::set_kv_budget(std::function<void(uint64_t)> f) {
-    kv_budget_ = std::move(f);  // kept: a renewed session gets it too
+    kv_budget_ = std::move(f);
     session_->set_kv_budget(kv_budget_);
-}
-
-void Qwen4ExpBackend::renew() {
-    STRIX_CHECK(session_ != nullptr, "Qwen4ExpBackend::renew: no session (an earlier renewal failed midway)");
-    // Refused before anything changes: a live parked record's pages go with the session, and the prompt cache
-    // entry that holds it would then point into unmapped memory. The engine spills and drains them first.
-    const int64_t live = session_->parked_live();
-    STRIX_CHECK(live == 0, "Qwen4ExpBackend::renew: ", live, " parked records are still live - the prompt cache ",
-                "must write them to disk and the engine give them back before the session is rebuilt");
-    const std::string fp = state_fingerprint();
-    {
-        // The HTTP thread reads backend_stats() while requests run; the swap must not race it.
-        std::lock_guard<std::mutex> lock(stats_mu_);
-        // Snapshots first (they belong to the session), then the session: its destructor unmaps every slot's
-        // pages and frees the reservation - the freeing is what makes reused addresses read right again.
-        snapshots_.clear();
-        session_.reset();
-        try {
-            build_session();
-            session_->reset();
-        } catch (const std::exception &ex) {
-            // The old session is gone: nothing can run on this backend any more. The engine treats this as it
-            // does a lost GPU context (the server exits for its supervisor to restart it).
-            snapshots_.clear();
-            session_.reset();
-            throw GpuFatalError(std::string("Qwen4ExpBackend::renew: the old session is gone and building the new "
-                                            "one failed: ") + ex.what());
-        }
-    }
-    const std::string fp2 = state_fingerprint();
-    STRIX_CHECK(fp2 == fp, "Qwen4ExpBackend::renew: the rebuilt session's state fingerprint '", fp2, "' differs ",
-                "from the old one's '", fp, "' - cached states would not fit it");
-    ++renewals_;
 }
 
 Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int seq, int slot) {
@@ -100,9 +67,7 @@ const NgramTableRows *Qwen4ExpBackend::ngram_table() const {
 }
 
 BackendStats Qwen4ExpBackend::backend_stats() const {
-    std::lock_guard<std::mutex> lock(stats_mu_);  // renew() swaps the session under it
     BackendStats s;
-    s.kv_renewals = renewals_;
     const Qwen4ExpSession::PleStats p = session_->ple_stats();
     s.ple_gathers = p.gathers, s.ple_waits = p.waits;
     s.ple_gather_seconds = p.gather_seconds, s.ple_wait_seconds = p.wait_seconds;

@@ -72,6 +72,7 @@
 // kMaxSpares of the last saved state's size + prefault_headroom, only while MemAvailable stays above ram_margin plus
 // that size. Spares count as RAM and go first when memory is short.
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -406,6 +407,9 @@ private:
     uint64_t prefault_want_locked() const;  // bytes of the spare to populate now; 0 = none
     uint64_t mem_available() const;
     uint64_t disk_free() const;
+
+    mutable std::atomic<uint64_t> cached_mem_{0};
+    mutable std::atomic<double> cached_mem_time_{0.0};
 
     std::string dir_, fingerprint_;
     uint64_t max_bytes_;

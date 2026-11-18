@@ -641,51 +641,8 @@ void HttpServer::routes() {
         // is up and serves what its slots hold) once a slot's next switch would be refused, the shared parked
         // budget is spent (switches then save copies), or a request was refused. Only a restart reclaims; the
         // gauges in /metrics say the same over time.
-        const BackendStats bs = engine_.backend_stats();
-        const std::string kv_refusal = engine_.kv_budget_refusal();
-        std::vector<std::string> kv_reasons;
-        json::Value kv = json::Value::object();
-        if (!bs.kv_generation_capacity.empty() && bs.kv_generation_capacity[0] > 1) {
-            json::Value left = json::Value::array();
-            for (size_t k = 0; k < bs.kv_generation_used.size() && k < bs.kv_generation_capacity.size(); ++k) {
-                const int64_t l = bs.kv_generation_capacity[k] - 1 - bs.kv_generation_used[k];
-                left.push(json::Value::integer(l));
-                if (l <= 0)
-                    kv_reasons.push_back(cat("slot ", k, " is at K/V generation ", bs.kv_generation_used[k], " of ",
-                                             bs.kv_generation_capacity[k], " (its last): it serves only the "
-                                             "conversation it holds"));
-            }
-            kv.set("generations_left", std::move(left));
-            kv.set("generations_capacity", json::Value::integer(bs.kv_generation_capacity[0]));
-            if (bs.parked_generation_capacity >= 0) {
-                const int64_t pl = bs.parked_generation_capacity - bs.parked_generation_used;
-                kv.set("parked_left", json::Value::integer(pl));
-                if (pl <= 0)
-                    kv_reasons.push_back(cat("the parked budget is spent (", bs.parked_generation_used, " of ",
-                                             bs.parked_generation_capacity, "): a switch saves a copy, not pages"));
-            }
-        }
-        if (!kv_refusal.empty()) kv_reasons.push_back("a request was refused: " + kv_refusal);
-        if (!kv.as_object("kv_budget").empty() || s.kv_renewals > 0 || s.kv_renew_failures > 0) {
-            kv.set("renewals", json::Value::integer(s.kv_renewals));  // soft K/V resets since startup
-            if (s.kv_renew_failures > 0) {
-                kv.set("renew_failures", json::Value::integer(s.kv_renew_failures));
-                kv_reasons.push_back("a soft K/V reset failed (the log says why): a restart reclaims the budget");
-            }
-        }
-        const bool kv_degraded = !kv_reasons.empty();
-        if (kv_degraded) {
-            json::Value why = json::Value::array();
-            for (const std::string &r : kv_reasons) why.push(json::Value::string(r));
-            kv.set("degraded", std::move(why));
-            kv.set("action", json::Value::string(engine_.kv_renew_available()
-                                                     ? "none: the session renews itself (the soft K/V reset) once the "
-                                                       "running requests finish"
-                                                     : "restart the server to reclaim the K/V generation budget"));
-        }
-        b.set("status", json::Value::string(!fatal.empty() ? "error" : kv_degraded ? "degraded" : "ok"));
+        b.set("status", json::Value::string(!fatal.empty() ? "error" : "ok"));
         if (!fatal.empty()) b.set("error", json::Value::string(fatal));
-        if (!kv.as_object("kv_budget").empty()) b.set("kv_budget", std::move(kv));
         if (!engine_.degraded().empty()) b.set("degraded", json::Value::string(engine_.degraded()));
         b.set("model", json::Value::string(cfg_.model_id));
         b.set("backend", json::Value::string(engine_.backend().describe()));
@@ -895,11 +852,8 @@ void HttpServer::routes() {
          metric("strix_parked_generation_capacity", "gauge", "Parked generations the reservation holds "
                 "(= kv-generations, the shared budget; -1: the backend has no parked budget).",
                 (double)bs.parked_generation_capacity);
-         metric("strix_kv_renewals_total", "counter", "Soft K/V resets: the session rebuilt on the loaded model "
-                "when the generation budget neared its end (kv-renew-margin); the generation gauges start over at "
-                "each.", (double)s.kv_renewals);
-         metric("strix_kv_renew_failures_total", "counter", "Soft K/V resets that failed (no further one runs in "
-                "this process; exhaustion then refuses until a restart).", (double)s.kv_renew_failures);
+         metric("strix_kv_renewals_total", "counter", "Soft K/V resets: obsolete / 0 in flat KV.", 0.0);
+         metric("strix_kv_renew_failures_total", "counter", "Soft K/V resets that failed: obsolete / 0 in flat KV.", 0.0);
          metric("strix_context_length", "gauge", "Positions the session holds.", (double)engine_.capacity());
         metric("strix_prompt_cache_disk_hits_total", "counter", "Requests resumed from the prompt cache (RAM or disk).", (double)s.disk_hits);
         metric("strix_prompt_cache_disk_tokens_total", "counter", "Prompt tokens restored from the prompt cache.", (double)s.disk_tokens);

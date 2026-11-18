@@ -35,12 +35,8 @@ public:
     // Which K/V generation the conversation's slot stands at (the parked budget's other side; the tests and
     // /health read it - reaching the last one is the switch-count exhaustion refusal).
     int64_t kv_generation() const { return session_->kv_generation(0); }
-    void set_kv_budget(std::function<void(uint64_t)> f);  // kept for a renewed session too
+    void set_kv_budget(std::function<void(uint64_t)> f);
     void reset() override { session_->reset(); }
-    // The soft K/V reset (LmBackend::renew): a new session on the same loaded model, built with the same
-    // settings - every slot's K/V, snapshot and generation counter start over, the weights and n-gram rows stay.
-    bool can_renew() const override { return true; }
-    void renew() override;
     std::vector<float> forward(const std::vector<int32_t> &ids, bool want_logits) override {
         return session_->forward(ids, want_logits ? 1 : 0);
     }
@@ -175,9 +171,7 @@ private:
     const KvFormat kv_;
     const int64_t n_seqs_, kv_generations_;
     std::function<void(uint64_t)> kv_budget_;
-    std::unique_ptr<Qwen4ExpSession> session_;  // null only when a renewal failed midway (failed() is then true)
-    mutable std::mutex stats_mu_;  // backend_stats (any thread) vs renew's swap
-    int64_t renewals_ = 0;
+    std::unique_ptr<Qwen4ExpSession> session_;
     std::vector<std::vector<Qwen4ExpSnapshot>> snapshots_;  // [seq][snapshot slot]
     Qwen4ExpSnapshot &snap(int seq, int slot);
     const Qwen4ExpSnapshot &snap(int seq, int slot) const;

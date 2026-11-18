@@ -256,13 +256,6 @@ public:
         reset();
     }
     virtual bool failed() const { return false; }
-    // The soft K/V reset: rebuild the session on the
-    // loaded model, so the K/V generation budget starts over without a restart - every seq's state, snapshot,
-    // parked record and generation counter go, the weights stay. The caller holds every seq idle and has given
-    // back every parked record (renew refuses before anything changes while one is live). A throw after the old
-    // session went leaves failed() true. can_renew false (the default): renew is not offered.
-    virtual bool can_renew() const { return false; }
-    virtual void renew() { throw Error("LmBackend::renew: this backend cannot rebuild its session"); }
     virtual void save_snapshot(int seq, int slot) {
         check_seq(seq, "save_snapshot");
         save_snapshot(slot);
@@ -598,13 +591,6 @@ public:
         // either way - the next conversation's resume or reset advances past it). 0: every held Turn parks (the
         // tests that drive the park route on tiny states).
         uint64_t park_min_bytes = 256ull << 20;
-        // The soft K/V reset (config kv-renew-margin; LmBackend::renew): once a slot has at most this many K/V
-        // generations left, or the shared parked budget this many parks, the engine starts no new request, waits
-        // for the running ones, writes every parked conversation to disk, and rebuilds the session on the loaded
-        // model - the budget starts over, the weights and the prompt cache stay. A request spends at most a few
-        // generations (a switch: one slot + one parked), so the default leaves room for the requests running when
-        // the margin is crossed. 0: off (exhaustion refuses, a restart reclaims).
-        int64_t kv_renew_margin = 16;
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -635,11 +621,6 @@ public:
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
-    // The first K/V generation budget refusal's text (empty: none yet). From then on the slot that refused serves
-    // only the conversation it holds; a restart reclaims the budget. /health reports it (status degraded).
-    std::string kv_budget_refusal() const;
-    // The soft K/V reset is on (kv-renew-margin > 0, the backend can renew) and has not failed in this process.
-    bool kv_renew_available() const;
 
 private:
     struct Job {
@@ -716,13 +697,6 @@ private:
     void flush_pending_turn(Slot &sl, const char *why, bool allow_park = true);
     // The soft K/V reset's trigger: the backend can renew, the margin is on, and a slot's generations or the
     // parked budget are within it (BackendStats). Off the lock (reads the backend's stats).
-    bool renew_due() const;
-    // The soft K/V reset itself, on an idle slot's worker while every slot is idle and dispatch is held
-    // (renew_due_): held Turns to the cache as copies, parked entries to disk, their records back, the session
-    // rebuilt, every slot's bookkeeping cleared. A failure before the old session went is logged and leaves
-    // serving as it was (the refusal at exhaustion stays the last guard); one after it is fatal (restart).
-    void renew_kv();
-
     LmBackend &be_;
     const Tokenizer &tok_;
     Options options_;
@@ -742,12 +716,7 @@ private:
     std::deque<Job> queue_;
     bool stop_ = false;
     bool drain_wanted_ = false;  // the prompt cache's retired hook fired: an idle worker drains (under mu_)
-    // The soft K/V reset (under mu_): due = dispatch holds new requests until the running ones finish, then one
-    // idle worker renews; renewing = it runs (other workers neither drain nor take jobs); off = a renewal failed
-    // before the session went - no more attempts in this process, the exhaustion refusal stays the guard.
-    bool renew_due_ = false, renewing_ = false, renew_off_ = false;
     std::string fatal_;  // the GpuFatalError's text once one was thrown; under mu_
-    std::string kv_refusal_;  // the first KvBudgetExhausted's text (kv_budget_refusal); under mu_
     EngineStats stats_;
     double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
     int64_t held_logged_ = 0;  // the request whose wait for its conversation's busy slot was logged; under mu_
