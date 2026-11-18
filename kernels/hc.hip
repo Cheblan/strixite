@@ -14,10 +14,9 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kH = 4;              // streams (qwen4_exp hc_count); the kernels keep per-stream sums in registers
 constexpr int kChunk = 32;         // codes per chunk: one 16-byte load at Q4, two at Q8
-constexpr int64_t kMaxR = 1024;    // low rank, held in LDS by hc_mix_up
+constexpr int64_t kMaxR = 320;     // low rank, held in LDS by hc_mix_up (320 for Qwen 3.8-Flash-Next)
 constexpr int64_t kMaxTokens = 65535;  // grid.y
 constexpr int64_t kMaxD = 1 << 20;
-constexpr size_t kMaxDownLds = 32768;  // hc_mix_down's chunk sums (float2 per 32 inputs): H*d up to 131072
 
 __device__ inline float bf16_bits_to_f32(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
 __device__ inline uint16_t f32_to_bf16_bits(float f) {
@@ -85,17 +84,7 @@ __global__ void __launch_bounds__(kThreads)
     const int ks = wave % KS;
     const int64_t t = blockIdx.y;
     const T *xr = x + t * K;
-    extern __shared__ float2 xs[];  // [K / kChunk]: each chunk's sum and sum of squares (dynamic LDS)
     const int64_t nc = K / kChunk;
-    for (int64_t c = threadIdx.x; c < nc; c += blockDim.x) {
-        float xv[kChunk];
-        load_x32(xr, c * kChunk, xv);
-        float xsum = 0.f, sq = 0.f;
-#pragma unroll
-        for (int i = 0; i < kChunk; ++i) xsum += xv[i], sq = fmaf(xv[i], xv[i], sq);
-        xs[c] = make_float2(xsum, sq);
-    }
-    __syncthreads();
     float v[kV];
 #pragma unroll
     for (int i = 0; i < kV; ++i) v[i] = 0.f;
@@ -103,8 +92,9 @@ __global__ void __launch_bounds__(kThreads)
         for (int64_t c = (int64_t)ks * warpSize + lane; c < nc; c += (int64_t)KS * warpSize) {
             float xv[kChunk];
             load_x32(xr, c * kChunk, xv);
-            const float2 ss = xs[c];
-            const float xsum = ss.x, sq = ss.y;
+            float xsum = 0.f, sq = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i) xsum += xv[i], sq = fmaf(xv[i], xv[i], sq);
             const int g = (int)(c * kChunk / d);
 #pragma unroll
             for (int rw = 0; rw < RW; ++rw) {
@@ -203,8 +193,15 @@ __global__ void __launch_bounds__(kThreads)
         float nsc, nmn;
         auto fetch = [&](int c) {
             load_chunk<BITS>(q + ((int64_t)c * N + row) * (kChunk * BITS / 8), nwords);
-            const int64_t gi = (int64_t)(c * kChunk / G) * N + row;
-            nsc = bf16_bits_to_f32(scale[gi]), nmn = bf16_bits_to_f32(minv[gi]);
+            if constexpr (G > kChunk) {
+                if (c % (G / kChunk) == 0) {
+                    const int64_t gi = (int64_t)(c * kChunk / G) * N + row;
+                    nsc = bf16_bits_to_f32(scale[gi]), nmn = bf16_bits_to_f32(minv[gi]);
+                }
+            } else {
+                const int64_t gi = (int64_t)(c * kChunk / G) * N + row;
+                nsc = bf16_bits_to_f32(scale[gi]), nmn = bf16_bits_to_f32(minv[gi]);
+            }
         };
         fetch(0);
         for (int c = 0; c < r / kChunk; ++c) {
@@ -243,11 +240,15 @@ __global__ void __launch_bounds__(kThreads)
 
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
-    hc_inject_kernel(T *x, const float *w_in, const T *y, int64_t n_total, int64_t d) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n_total; i += (int64_t)gridDim.x * blockDim.x) {
-        const int64_t t = i / (kH * d), rem = i % (kH * d), s = rem / d, j = rem % d;
-        // One FP32 rounding (fma), then the activation dtype's - the reference's x + w*y exactly.
-        store(x, i, fmaf(w_in[t * kH + s], load(y, t * d + j), load(x, i)));
+    hc_inject_kernel(T *x, const float *w_in, const T *y, int64_t n_rows, int64_t d) {
+    for (int64_t row = blockIdx.y; row < n_rows; row += gridDim.y) {
+        const int64_t t = row / kH;
+        const float w = w_in[row];
+        const T *y_row = y + t * d;
+        T *x_row = x + row * d;
+        for (int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; j < d; j += (int64_t)gridDim.x * blockDim.x) {
+            store(x_row, j, fmaf(w, load(y_row, j), load(x_row, j)));
+        }
     }
 }
 
@@ -310,13 +311,10 @@ void mix_down(const void *x, const QArrays &w, int64_t T, int64_t H, int64_t d, 
     const int waves = kThreads / device_warp_size(kThreads), KS = split_k(T);
     STRIX_CHECK(waves % KS == 0, fn, ": split-K factor ", KS, " must divide the ", waves, " waves of a block");
     const int RW = rows_per_wave(T);
-    const size_t lds = (size_t)(w.K / kChunk) * sizeof(float2);  // the chunk sums
-    STRIX_CHECK(lds <= kMaxDownLds, fn, ": K = ", w.K, " needs ", lds, " bytes of LDS for its chunk sums, at most ",
-                kMaxDownLds, " (H*d up to ", kMaxDownLds / sizeof(float2) * kChunk, ")");
     const int64_t rows_per_block = waves / KS * RW;
     dim3 grid((unsigned)((R + rows_per_block - 1) / rows_per_block), (unsigned)T), block(kThreads);
-#define STRIX_HC_DOWN_RW(TT, G, RWV)                                                                               \
-    hc_down_kernel<TT, G, RWV, BITS><<<grid, block, lds, stream>>>(static_cast<const TT *>(x), w.q, w.scale, w.minv, \
+#define STRIX_HC_DOWN_RW(TT, G, RWV)                                                                             \
+    hc_down_kernel<TT, G, RWV, BITS><<<grid, block, 0, stream>>>(static_cast<const TT *>(x), w.q, w.scale, w.minv, \
                                                                 R, w.K, d, (int)r, eps, KS, h, w_in, inv)
 #define STRIX_HC_DOWN(TT, G)                                                                    \
     switch (RW) {                                                                               \
@@ -410,14 +408,16 @@ void hc_inject(void *x, const float *w_in, const void *y, int64_t T, int64_t H, 
     auto xb = reinterpret_cast<uintptr_t>(x), yb = reinterpret_cast<uintptr_t>(y);
     STRIX_CHECK(yb + (uintptr_t)(T * d) * es <= xb || xb + (uintptr_t)(T * H * d) * es <= yb, fn,
                 ": y overlaps the streams x");
-    const int64_t n = T * H * d;
-    const unsigned blocks = (unsigned)std::min<int64_t>((n + kThreads - 1) / kThreads, 4096);
+    const int64_t n_rows = T * H;
+    const unsigned grid_x = (unsigned)((d + kThreads - 1) / kThreads);
+    const unsigned grid_y = (unsigned)std::min<int64_t>(n_rows, 65535);
+    dim3 grid(grid_x, grid_y);
     if (act == Act::F32)
-        hc_inject_kernel<float><<<blocks, kThreads, 0, stream>>>(static_cast<float *>(x), w_in,
-                                                                 static_cast<const float *>(y), n, d);
+        hc_inject_kernel<float><<<grid, kThreads, 0, stream>>>(static_cast<float *>(x), w_in,
+                                                               static_cast<const float *>(y), n_rows, d);
     else
-        hc_inject_kernel<uint16_t><<<blocks, kThreads, 0, stream>>>(static_cast<uint16_t *>(x), w_in,
-                                                                    static_cast<const uint16_t *>(y), n, d);
+        hc_inject_kernel<uint16_t><<<grid, kThreads, 0, stream>>>(static_cast<uint16_t *>(x), w_in,
+                                                                  static_cast<const uint16_t *>(y), n_rows, d);
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " d=", d);
 }
 
