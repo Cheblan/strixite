@@ -314,7 +314,7 @@ void HttpServer::routes() {
                                                "forward chunk of ", max_block, " (config chunk) - it cannot "
                                                "be forwarded in one piece"),
                                            "messages");
-                    if (pre_tokens != gen.prompt.size())
+                    if (pre_tokens != (int64_t)gen.prompt.size())
                         vision_note = std::to_string((long long)images.size()) +
                                       (images.size() == 1 ? " image (" : " images (") +
                                       std::to_string((long long)decoded) + " decoded, " +
