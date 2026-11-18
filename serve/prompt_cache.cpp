@@ -294,17 +294,7 @@ PromptCache::~PromptCache() {
 }
 
 uint64_t PromptCache::mem_available() const {
-    if (opt_.mem_available) return opt_.mem_available();
-    const double now = now_s();
-    const double last = cached_mem_time_.load(std::memory_order_relaxed);
-    if (now - last < 0.5) {
-        const uint64_t cached = cached_mem_.load(std::memory_order_relaxed);
-        if (cached > 0) return cached;
-    }
-    const uint64_t val = proc_mem_available();
-    cached_mem_.store(val, std::memory_order_relaxed);
-    cached_mem_time_.store(now, std::memory_order_relaxed);
-    return val;
+    return opt_.mem_available ? opt_.mem_available() : proc_mem_available();
 }
 
 uint64_t PromptCache::disk_free() const {

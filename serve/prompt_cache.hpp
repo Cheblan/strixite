@@ -408,9 +408,6 @@ private:
     uint64_t mem_available() const;
     uint64_t disk_free() const;
 
-    mutable std::atomic<uint64_t> cached_mem_{0};
-    mutable std::atomic<double> cached_mem_time_{0.0};
-
     std::string dir_, fingerprint_;
     uint64_t max_bytes_;
     Options opt_;
