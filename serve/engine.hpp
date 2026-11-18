@@ -695,8 +695,7 @@ private:
     // allow_park false: the copy route even where a park could go (the soft K/V reset - a park would only be
     // written to disk again before the session goes).
     void flush_pending_turn(Slot &sl, const char *why, bool allow_park = true);
-    // The soft K/V reset's trigger: the backend can renew, the margin is on, and a slot's generations or the
-    // parked budget are within it (BackendStats). Off the lock (reads the backend's stats).
+
     LmBackend &be_;
     const Tokenizer &tok_;
     Options options_;
