@@ -133,6 +133,7 @@ int run(int argc, char **argv) {
     precision.attention = parse_attention_precision(settings.text("attention-precision"));
     const KvFormat kv_format = parse_kv_format(settings.text("kv-cache"));  // an unknown value fails startup
     const bool use_mtp = settings.on("mtp");
+    const bool draft_head_q4 = settings.on("draft-head-q4");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
     const std::string mtp_gate_rule = settings.text("mtp-gate-rule");
@@ -194,11 +195,15 @@ int run(int argc, char **argv) {
     // MTP drafts score a Q4 copy of the draft vocabulary's LM head rows (Qwen4ExpModel::make_draft_head_q4; strixite
     // PR #2): half the bytes per draft call, the verify still decides every token.
     if (use_mtp && model.has_mtp()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
-        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
-             (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (draft_head_q4) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
+            slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+                 (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        } else {
+            slog(LogLevel::Info, "startup: MTP draft head: Q4 copy disabled (--draft-head-q4 off); using loaded Q8 LM head directly");
+        }
     }
     std::unique_ptr<vision::ServedVision> served_vision;
     if (vision) {

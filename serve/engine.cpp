@@ -898,14 +898,17 @@ void Engine::drain_parked(Slot &sl) {
 namespace {
 // A finished request's detail rows, before its cache saves: MTP and PLE (debug), a dropped tool call.
 void log_detail(const GenerationResult &r) {
-    if (r.mtp_drafted_tokens > 0) {
+    if (r.mtp_drafted_tokens > 0 || r.mtp_draft_calls > 0) {
         char per_forward[48] = "";
         if (r.decode_forwards > 0)
             std::snprintf(per_forward, sizeof per_forward, ", %.2f tokens per forward",
                           (double)(r.completion_tokens - r.fed_tokens) / (double)r.decode_forwards);
-        slog_row(LogLevel::Debug, "mtp", "%s/%s drafts accepted (%.1f%%)%s", fmt_n(r.mtp_accepted_tokens).c_str(),
-                 fmt_n(r.mtp_drafted_tokens).c_str(), 100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens,
-                 per_forward);
+        const double avg_draft_ms = r.mtp_draft_calls > 0 ? r.mtp_draft_ms / (double)r.mtp_draft_calls : 0.0;
+        slog_row(LogLevel::Debug, "mtp", "%s/%s drafts accepted (%.1f%%)%s, avg draft: %.3f ms (calls: %lld)",
+                 fmt_n(r.mtp_accepted_tokens).c_str(),
+                 fmt_n(r.mtp_drafted_tokens).c_str(),
+                 r.mtp_drafted_tokens > 0 ? 100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens : 0.0,
+                 per_forward, avg_draft_ms, (long long)r.mtp_draft_calls);
         slog_row(LogLevel::Debug, "", "%s rollbacks; drafts accepted before the reject 0/1/2/3+: %s/%s/%s/%s",
                  fmt_n(r.mtp_rollbacks).c_str(), fmt_n(r.mtp_reject_at[0]).c_str(), fmt_n(r.mtp_reject_at[1]).c_str(),
                  fmt_n(r.mtp_reject_at[2]).c_str(), fmt_n(r.mtp_reject_at[3]).c_str());
@@ -1470,7 +1473,11 @@ void Engine::run(Job &job, Slot &sl) {
                         }
                     }
 
+                    const auto t_draft_start = std::chrono::steady_clock::now();
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
+                    const auto t_draft_end = std::chrono::steady_clock::now();
+                    res.mtp_draft_ms += std::chrono::duration<double, std::milli>(t_draft_end - t_draft_start).count();
+                    ++res.mtp_draft_calls;
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
                     if (d == im_end_ || d == eot_) break;

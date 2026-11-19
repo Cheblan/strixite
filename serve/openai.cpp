@@ -462,10 +462,13 @@ json::Value strix_ext(const GenerationResult &r, bool clamped, const std::string
         s.set("thinking_skipped_reason",
               json::Value::string("max_tokens <= 1024 leaves no room to think; ask for thinking (enable_thinking / "
                                   "thinking.type / reasoning_effort) or a budget to keep it"));
-    if (r.mtp_drafted_tokens > 0) {
+    if (r.mtp_drafted_tokens > 0 || r.mtp_draft_calls > 0) {
         s.set("mtp_drafted_tokens", json::Value::integer(r.mtp_drafted_tokens));
         s.set("mtp_accepted_tokens", json::Value::integer(r.mtp_accepted_tokens));
-        s.set("mtp_acceptance_rate", json::Value::number(100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens));
+        s.set("mtp_acceptance_rate", json::Value::number(r.mtp_drafted_tokens > 0 ? 100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens : 0.0));
+        s.set("mtp_draft_calls", json::Value::integer(r.mtp_draft_calls));
+        s.set("mtp_draft_ms", json::Value::number(r.mtp_draft_ms));
+        s.set("mtp_avg_draft_ms", json::Value::number(r.mtp_draft_calls > 0 ? r.mtp_draft_ms / (double)r.mtp_draft_calls : 0.0));
     }
     return s;
 }
