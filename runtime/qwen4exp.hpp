@@ -895,6 +895,11 @@ public:
     void set_mtp_vocab(int64_t n);
     int64_t mtp_vocab() const { return mtp_vocab_; }
 
+    // Copies previous hidden streams h_t (e.g. after prompt prefill) to host.
+    void get_mtp_prev(int seq, void *dst_host, size_t max_bytes);
+    // Copies updated mtp_x streams after run_mtp to host.
+    void get_mtp_x(int seq, void *dst_host, size_t max_bytes);
+
 private:
     const Qwen4ExpModel &m_;
     KvReservationLayout kv_layout_;

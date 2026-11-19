@@ -264,6 +264,9 @@ target_link_libraries(test_split_invariance PRIVATE strix_serve_model)
 add_executable(test_vision_batchable_edge_cases tools/test_vision_batchable_edge_cases.cpp)
 target_link_libraries(test_vision_batchable_edge_cases PRIVATE strix_serve_model)
 
+add_executable(capture_mtp_reference tools/mtp_train/capture_mtp_reference.cpp)
+target_link_libraries(capture_mtp_reference PRIVATE strix_serve_model)
+
 
 
 # The tutorials live in the public repo only; built when present.

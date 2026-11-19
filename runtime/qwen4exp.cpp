@@ -3585,6 +3585,20 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     return {final_best, p.best_v, p.second_v, p.nan != 0};
 }
 
+void Qwen4ExpSession::get_mtp_prev(int seq, void *dst_host, size_t max_bytes) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::get_mtp_prev: seq out of range");
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    size_t sz = std::min(max_bytes, (size_t)sq.mtp_prev.size());
+    STRIX_HIP_CHECK(hipMemcpy(dst_host, sq.mtp_prev.get(), sz, hipMemcpyDeviceToHost), "copy mtp_prev");
+}
+
+void Qwen4ExpSession::get_mtp_x(int seq, void *dst_host, size_t max_bytes) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::get_mtp_x: seq out of range");
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    size_t sz = std::min(max_bytes, (size_t)sq.mtp_ws.mtp_x.size());
+    STRIX_HIP_CHECK(hipMemcpy(dst_host, sq.mtp_ws.mtp_x.get(), sz, hipMemcpyDeviceToHost), "copy mtp_x");
+}
+
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {
     Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     sq.mtp_chain_step = step, sq.mtp_chain_pos = sq.pos;
