@@ -232,7 +232,7 @@ def encode_index(meta: dict, tensors: list) -> bytes:
     return bytes(b)
 
 
-def extract_overlay(src_path: str, dst_path: str, all_mtp: bool = False):
+def extract_overlay(src_path: str, dst_path: str, all_mtp: bool = False, include_heads: bool = False):
     print(f"Reading source strixw: {src_path}")
     meta, tensors = parse_strixw(src_path)
     
@@ -240,6 +240,9 @@ def extract_overlay(src_path: str, dst_path: str, all_mtp: bool = False):
     selected = []
     for t in tensors:
         name = t['name']
+        if include_heads and name in ('model.language_model.embed_tokens.weight', 'lm_head.weight'):
+            selected.append(t)
+            continue
         if not name.startswith("mtp."):
             continue
         if not all_mtp and name.startswith("mtp.layers.0.mlp.experts_"):
@@ -340,9 +343,10 @@ def main():
     parser.add_argument("src", help="Path to source weights.strixw")
     parser.add_argument("dst", help="Path to output overlay .strixw")
     parser.add_argument("--all-mtp", action="store_true", help="Extract all 24 MTP tensors including MoE experts")
+    parser.add_argument("--include-heads", action="store_true", help="Also extract embed_tokens and lm_head")
     args = parser.parse_args()
 
-    extract_overlay(args.src, args.dst, all_mtp=args.all_mtp)
+    extract_overlay(args.src, args.dst, all_mtp=args.all_mtp, include_heads=args.include_heads)
 
 
 if __name__ == "__main__":
