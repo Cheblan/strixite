@@ -899,6 +899,8 @@ public:
     void get_mtp_prev(int seq, void *dst_host, size_t max_bytes);
     // Copies updated mtp_x streams after run_mtp to host.
     void get_mtp_x(int seq, void *dst_host, size_t max_bytes);
+    // Copies MTP K/V cache up to n_tokens to host.
+    void get_mtp_kv_cache(int seq, void *k_host, void *v_host, int64_t n_tokens);
 
 private:
     const Qwen4ExpModel &m_;

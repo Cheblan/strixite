@@ -87,6 +87,12 @@ int main(int argc, char **argv) {
     backend.session().get_mtp_prev(0, h_t_bf16.data(), n4 * sizeof(uint16_t));
     printf("Captured h_t [10240] BF16 from sq.mtp_prev\n");
 
+    // Capture prompt MTP K/V cache [n_prompt, 2, 256] BF16
+    const size_t kv_elems = prompt_tokens.size() * 2 * 256;
+    std::vector<uint16_t> k_prompt(kv_elems), v_prompt(kv_elems);
+    backend.session().get_mtp_kv_cache(0, k_prompt.data(), v_prompt.data(), (int64_t)prompt_tokens.size());
+    printf("Captured prompt MTP KV cache (%zu elements)\n", kv_elems);
+
     struct StepData {
         int32_t step;
         int32_t token_id;
@@ -145,12 +151,17 @@ int main(int argc, char **argv) {
     std::ofstream out(out_path, std::ios::binary);
     STRIX_CHECK(out.good(), "Failed to open output file: ", out_path);
 
-    const char magic[8] = {'M', 'T', 'P', 'R', 'E', 'F', '0', '1'};
+    const char magic[8] = {'M', 'T', 'P', 'R', 'E', 'F', '0', '2'};
     out.write(magic, 8);
 
     uint32_t n_prompt = (uint32_t)prompt_tokens.size();
     out.write(reinterpret_cast<const char *>(&n_prompt), 4);
     out.write(reinterpret_cast<const char *>(prompt_tokens.data()), n_prompt * sizeof(int32_t));
+
+    uint32_t n_kv_prompt = (uint32_t)kv_elems;
+    out.write(reinterpret_cast<const char *>(&n_kv_prompt), 4);
+    out.write(reinterpret_cast<const char *>(k_prompt.data()), n_kv_prompt * sizeof(uint16_t));
+    out.write(reinterpret_cast<const char *>(v_prompt.data()), n_kv_prompt * sizeof(uint16_t));
 
     uint32_t nh = (uint32_t)n4;
     out.write(reinterpret_cast<const char *>(&nh), 4);

@@ -3599,6 +3599,17 @@ void Qwen4ExpSession::get_mtp_x(int seq, void *dst_host, size_t max_bytes) {
     STRIX_HIP_CHECK(hipMemcpy(dst_host, sq.mtp_ws.mtp_x.get(), sz, hipMemcpyDeviceToHost), "copy mtp_x");
 }
 
+void Qwen4ExpSession::get_mtp_kv_cache(int seq, void *k_host, void *v_host, int64_t n_tokens) {
+    STRIX_CHECK(seq >= 0 && seq < n_slots(), "Qwen4ExpSession::get_mtp_kv_cache: seq out of range");
+    Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
+    const Qwen4ExpDims &D = m_.dims();
+    size_t e = es(m_.act());
+    size_t sz = (size_t)(n_tokens * D.hkv * D.hd) * e;
+    STRIX_CHECK(sz <= sq.k_cache_mtp.size(), "Qwen4ExpSession::get_mtp_kv_cache: size exceeds cache");
+    STRIX_HIP_CHECK(hipMemcpy(k_host, sq.k_cache_mtp.get(), sz, hipMemcpyDeviceToHost), "copy k_cache_mtp");
+    STRIX_HIP_CHECK(hipMemcpy(v_host, sq.v_cache_mtp.get(), sz, hipMemcpyDeviceToHost), "copy v_cache_mtp");
+}
+
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {
     Qwen4ExpSeqState &sq = *seqs_[(size_t)seq];
     sq.mtp_chain_step = step, sq.mtp_chain_pos = sq.pos;
