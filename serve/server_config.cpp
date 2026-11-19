@@ -337,6 +337,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp-vocab-filter", K::Text, 0, 0, "all",
          "MTP draft vocabulary filter preset (all, en+ru, en, no-cjk) or comma-separated sections "
          "(core,latin,cyrillic,greek,digits,punct,code,cjk,arabic,asian,other)"},
+        {"mtp-overlay", K::PathOrOff, 0, 0, "off",
+         "path to a .strixw overlay containing replacement mtp.* tensors; off = no overlay"},
         {"draft-head-q4", K::OnOff, 0, 0, "on",
          "MTP draft head: quantize a Q4 copy of the draft vocabulary's LM head rows at load for faster drafting; "
          "off uses the loaded Q8 LM head directly"},

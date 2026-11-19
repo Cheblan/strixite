@@ -101,7 +101,7 @@ public:
     Qwen4ExpModel(const std::string &weights, const std::string &ngram, kernels::Act act,
                   bool allow_truncated = false, int64_t ngram_cache_rows = NgramTableRows::kDefaultCacheRows,
                   float yarn_factor = 1.0f, WeightPlacement placement = WeightPlacement::Device,
-                  const std::string &vision = "");
+                  const std::string &vision = "", const std::string &mtp_overlay = "");
     const Qwen4ExpDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }
     const StrixwDevice &weights() const { return *w_; }
@@ -181,6 +181,7 @@ private:
     Qwen4ExpDims dims_;
     kernels::Act act_;
     std::unique_ptr<StrixwDevice> w_;
+    std::unique_ptr<StrixwDevice> overlay_w_;
     std::unique_ptr<VisionTower> vision_;  // the constructor's vision file, empty = no tower
     std::unique_ptr<NgramRowSource> ngram_;
     std::vector<Layer> layers_;

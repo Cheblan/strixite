@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <set>
 
 namespace strix {
 
@@ -74,7 +75,8 @@ void check_f16_attn_bound(const float *w_dev, int64_t D, float cos_sin_scale, co
 
 Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngram, Act act,
                              bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor,
-                             WeightPlacement placement, const std::string &vision)
+                             WeightPlacement placement, const std::string &vision,
+                             const std::string &mtp_overlay)
     : act_(act) {
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, "Qwen4ExpModel: unsupported activation dtype ", (int)act);
     STRIX_CHECK(std::isfinite(yarn_factor) && yarn_factor >= 1.0f && yarn_factor <= 8.0f, "Qwen4ExpModel: yarn_factor = ",
@@ -182,30 +184,88 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         }
         layers_.push_back(l);
     }
+    std::string overlay_path = mtp_overlay;
+    if (overlay_path == "off") overlay_path.clear();
+    if (!overlay_path.empty()) {
+        overlay_w_ = std::make_unique<StrixwDevice>(overlay_path, 8, placement);
+    }
     has_mtp_ = f.find("mtp.fc_embedding.weight") != nullptr;
     if (has_mtp_) {
-        mtp_.fc_embedding = w_->qw("mtp.fc_embedding.weight", {D.d, D.d});
-        mtp_.fc_hidden = w_->qw("mtp.fc_hidden.weight", {D.d, D.d});
-        mtp_.pre_fc_norm_embedding = w_->f32("mtp.pre_fc_norm_embedding.weight", {D.d});
-        mtp_.pre_fc_norm_hidden = w_->f32("mtp.pre_fc_norm_hidden.weight", {n4});
-        mtp_.hc_mixer = load_hc(*w_, "mtp.hyper_connection_mixer.", D, false);
+        std::set<std::string> overlay_used;
+        uint64_t overlay_bytes = 0;
+
+        auto shape_str_helper = [](const std::vector<int64_t> &s) {
+            std::string r = "[";
+            for (size_t i = 0; i < s.size(); ++i) r += (i ? ", " : "") + std::to_string(s[i]);
+            return r + "]";
+        };
+
+        auto dev_for = [&](const std::string &name) -> const StrixwDevice & {
+            if (overlay_w_ && overlay_w_->file().find(name) != nullptr) {
+                const auto *base_t = w_->file().find(name);
+                const auto *over_t = overlay_w_->file().find(name);
+                if (!base_t || base_t->shape != over_t->shape || base_t->encoding != over_t->encoding) {
+                    std::fprintf(stderr,
+                                 "FATAL: --mtp-overlay '%s' tensor '%s' shape/dtype mismatch (base: %s %s, overlay: %s %s)\n",
+                                 overlay_path.c_str(), name.c_str(),
+                                 base_t ? strixw_encoding_name(base_t->encoding) : "null",
+                                 base_t ? shape_str_helper(base_t->shape).c_str() : "[]",
+                                 strixw_encoding_name(over_t->encoding),
+                                 shape_str_helper(over_t->shape).c_str());
+                    std::abort();
+                }
+                overlay_used.insert(name);
+                overlay_bytes += over_t->bytes();
+                return *overlay_w_;
+            }
+            return *w_;
+        };
+
+        auto load_hc_overlay = [&](const std::string &p, const Qwen4ExpDims &dims, bool inject) -> Hc {
+            const int64_t n4_dim = dims.H * dims.d;
+            const std::string down_name = p + "mix_down";
+            const std::string up_name = p + "mix_up";
+            const std::string norm_name = p + "hc_norm.weight";
+            return {dev_for(down_name).qw(down_name, {dims.r + (inject ? dims.H : 0), n4_dim}),
+                    dev_for(up_name).qw_chunk_major(up_name, {n4_dim, dims.r}),
+                    dev_for(norm_name).f32(norm_name, {n4_dim})};
+        };
+
+        mtp_.fc_embedding = dev_for("mtp.fc_embedding.weight").qw("mtp.fc_embedding.weight", {D.d, D.d});
+        mtp_.fc_hidden = dev_for("mtp.fc_hidden.weight").qw("mtp.fc_hidden.weight", {D.d, D.d});
+        mtp_.pre_fc_norm_embedding = dev_for("mtp.pre_fc_norm_embedding.weight").f32("mtp.pre_fc_norm_embedding.weight", {D.d});
+        mtp_.pre_fc_norm_hidden = dev_for("mtp.pre_fc_norm_hidden.weight").f32("mtp.pre_fc_norm_hidden.weight", {n4});
+        mtp_.hc_mixer = load_hc_overlay("mtp.hyper_connection_mixer.", D, false);
         const std::string M = "mtp.layers.0.";
         Layer &l = mtp_.layer;
-        l.hc_attn = load_hc(*w_, M + "attn_hyper_connection.", D, true);
-        l.hc_mlp = load_hc(*w_, M + "mlp_hyper_connection.", D, true);
+        l.hc_attn = load_hc_overlay(M + "attn_hyper_connection.", D, true);
+        l.hc_mlp = load_hc_overlay(M + "mlp_hyper_connection.", D, true);
         const std::string A = M + "self_attn.";
-        l.qkv = w_->qw(A + "qkv", {D.astride, D.d});
-        l.o_proj = w_->qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
-        l.q_norm = w_->f32(A + "q_norm.weight", {D.hd});
-        l.k_norm = w_->f32(A + "k_norm.weight", {D.hd});
-        l.idx_q_norm = w_->f32(A + "indexer.q_layernorm.weight", {D.idx_d});
-        l.idx_k_norm = w_->f32(A + "indexer.k_layernorm.weight", {D.idx_d});
-        l.gate_up = w_->qw(M + "mlp.experts_gate_up", {Estack * 2 * D.inter, D.d});
-        l.down = w_->qw(M + "mlp.experts_down", {Estack * D.d, D.inter});
-        l.router = w_->bf16(M + "mlp.router", {D.experts + 1, D.d});
+        l.qkv = dev_for(A + "qkv").qw(A + "qkv", {D.astride, D.d});
+        l.o_proj = dev_for(A + "o_proj.weight").qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
+        l.q_norm = dev_for(A + "q_norm.weight").f32(A + "q_norm.weight", {D.hd});
+        l.k_norm = dev_for(A + "k_norm.weight").f32(A + "k_norm.weight", {D.hd});
+        l.idx_q_norm = dev_for(A + "indexer.q_layernorm.weight").f32(A + "indexer.q_layernorm.weight", {D.idx_d});
+        l.idx_k_norm = dev_for(A + "indexer.k_layernorm.weight").f32(A + "indexer.k_layernorm.weight", {D.idx_d});
+        l.gate_up = dev_for(M + "mlp.experts_gate_up").qw(M + "mlp.experts_gate_up", {Estack * 2 * D.inter, D.d});
+        l.down = dev_for(M + "mlp.experts_down").qw(M + "mlp.experts_down", {Estack * D.d, D.inter});
+        l.router = dev_for(M + "mlp.router").bf16(M + "mlp.router", {D.experts + 1, D.d});
         if (shared_separate_) {
-            l.shared_gate_up = w_->qw(M + "mlp.shared_expert.gate_up", {2 * D.inter, D.d});
-            l.shared_down = w_->qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
+            l.shared_gate_up = dev_for(M + "mlp.shared_expert.gate_up").qw(M + "mlp.shared_expert.gate_up", {2 * D.inter, D.d});
+            l.shared_down = dev_for(M + "mlp.shared_expert.down_proj.weight").qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
+        }
+
+        if (overlay_w_) {
+            for (const auto &t : overlay_w_->file().tensors()) {
+                if (overlay_used.find(t.name) == overlay_used.end()) {
+                    std::fprintf(stderr,
+                                 "FATAL: --mtp-overlay '%s' contains unexpected tensor '%s' (not a recognized MTP tensor)\n",
+                                 overlay_path.c_str(), t.name.c_str());
+                    std::abort();
+                }
+            }
+            slog(LogLevel::Info, "startup: MTP overlay: substituted %zu tensors (%.1f MB) from '%s'",
+                 overlay_used.size(), (double)overlay_bytes / 1e6, overlay_path.c_str());
         }
     }
     // The image tower (vision): a second file, loaded last (it's the optional part), with the side-file

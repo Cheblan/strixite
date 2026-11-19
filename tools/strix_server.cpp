@@ -94,6 +94,27 @@ int run(int argc, char **argv) {
         const ConfigSetting &s = settings.setting(o.name);
         slog(LogLevel::Info, "startup: config %s = %s (%s)", o.name.c_str(), s.value.c_str(), s.source.c_str());
     }
+    const std::string mtp_overlay = settings.text("mtp-overlay");
+    if (mtp_overlay != "off" && !mtp_overlay.empty()) {
+        if (!std::filesystem::is_regular_file(mtp_overlay)) {
+            std::fprintf(stderr, "FATAL: --mtp-overlay '%s' is missing or not a regular file\n", mtp_overlay.c_str());
+            std::abort();
+        }
+        try {
+            StrixwFile test_f(mtp_overlay);
+            for (const auto &t : test_f.tensors()) {
+                if (t.name.rfind("mtp.", 0) != 0) {
+                    std::fprintf(stderr, "FATAL: --mtp-overlay '%s' contains non-mtp tensor '%s'\n",
+                                 mtp_overlay.c_str(), t.name.c_str());
+                    std::abort();
+                }
+            }
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "FATAL: --mtp-overlay '%s' is not a valid .strixw file: %s\n",
+                         mtp_overlay.c_str(), e.what());
+            std::abort();
+        }
+    }
     const std::string weights = settings.text("weights"), ngram = settings.text("ngram");
     const std::string tokenizer = settings.text("tokenizer"), gen_config = settings.text("generation-config");
     ServerConfig cfg;
@@ -195,7 +216,7 @@ int run(int argc, char **argv) {
                         "files), or set vision = off");
     }
     Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows, yarn_factor,
-                        placement, vision_weights);
+                        placement, vision_weights, mtp_overlay);
     if (placement != WeightPlacement::Device)
         slog(LogLevel::Info, "startup: placement %s (test machines only)", weight_placement_name(placement));
     if (yarn_factor > 1.0f)
