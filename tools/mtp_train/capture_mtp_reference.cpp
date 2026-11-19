@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
 
     printf("Loading Tokenizer: %s\n", tok_path.c_str());
     Tokenizer tokenizer(tok_path);
-    std::vector<int32_t> prompt_tokens = tokenizer.encode(prompt, true);
+    std::vector<int32_t> prompt_tokens = tokenizer.encode(prompt);
     printf("Prompt encoded into %zu tokens\n", prompt_tokens.size());
 
     PrecisionOptions prec;
