@@ -268,6 +268,63 @@ void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
     draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
     draft_q4_bytes_ = q4.bytes();
     draft_head_ = qweight(draft_q4_->view());
+    compact_to_vocab_.clear();
+    STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
+                draft_head_.K(), "], expected [", rows, ", ", K, "]");
+}
+
+void Qwen4ExpModel::make_draft_head_q4(const std::vector<int32_t> &selected_rows, int64_t G, int threads) {
+    if (selected_rows.empty()) {
+        make_draft_head_q4(dims_.vocab, G, threads);
+        return;
+    }
+    const char *fn = "Qwen4ExpModel::make_draft_head_q4(selected_rows)";
+    STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
+    STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
+    STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
+    const int64_t N = lm_head_.N(), K = lm_head_.K();
+    STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
+    const int64_t rows = (int64_t)selected_rows.size();
+    STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
+    STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
+    STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
+    STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
+
+    STRIX_CHECK(lm_head_.bits == 8, fn, ": compact filtering requires Q8 LM head, got ", lm_head_.bits, " bits");
+
+    const Q8DeviceView &v = lm_head_.q8;
+    STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is incomplete");
+
+    Q8Weight q8;
+    q8.N = rows, q8.K = K, q8.G = v.G;
+    q8.q.resize((size_t)(rows * K));
+    q8.scale.resize((size_t)(rows * (K / v.G)));
+    q8.minv.resize(q8.scale.size());
+
+    // Read full Q8 arrays back once
+    std::vector<uint8_t> full_q((size_t)(N * K));
+    std::vector<uint16_t> full_scale((size_t)(N * (K / v.G)));
+    std::vector<uint16_t> full_minv(full_scale.size());
+    STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q8 codes");
+    STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 scales");
+    STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 mins");
+
+    const int64_t groups_per_row = K / v.G;
+    for (int64_t i = 0; i < rows; ++i) {
+        const int64_t src = selected_rows[(size_t)i];
+        STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
+        std::memcpy(q8.q.data() + i * K, full_q.data() + src * K, (size_t)K);
+        std::memcpy(q8.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
+                    (size_t)(groups_per_row * sizeof(uint16_t)));
+        std::memcpy(q8.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
+                    (size_t)(groups_per_row * sizeof(uint16_t)));
+    }
+
+    const Q4Weight q4 = quantize_q4_from_q8(q8, G, threads);
+    draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
+    draft_q4_bytes_ = q4.bytes();
+    draft_head_ = qweight(draft_q4_->view());
+    compact_to_vocab_ = selected_rows;
     STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
                 draft_head_.K(), "], expected [", rows, ", ", K, "]");
 }
@@ -3443,7 +3500,8 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     auto &ws = seqs_[(size_t)seq]->mtp_ws;
     hipStream_t stream = ws.stream;
     auto *dev = reinterpret_cast<kernels::MtpPick *>(ws.mtp_pick.get());
-    kernels::mtp_pick(ws.logits.get(), mtp_vocab_, ws.router_err.get(), ws.expert_err.get(), ws.attn_err.get(),
+    const int64_t pick_vocab = !m_.compact_to_vocab().empty() ? m_.draft_head_q4().N() : mtp_vocab_;
+    kernels::mtp_pick(ws.logits.get(), pick_vocab, ws.router_err.get(), ws.expert_err.get(), ws.attn_err.get(),
                       reinterpret_cast<kernels::EmbeddingError *>(ws.emb_err.get()), dev, stream);
     auto *host = reinterpret_cast<kernels::MtpPick *>(ws.host_pick.get());
     STRIX_HIP_CHECK(hipMemcpyAsync(host, dev, sizeof(kernels::MtpPick), hipMemcpyDeviceToHost, stream),
@@ -3454,10 +3512,17 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2_seq(int seq, int32_t 
     kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
     kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
     kernels::report_embedding_error(p.emb, m_.dims().vocab);
-    STRIX_CHECK(p.nan || (p.best >= 0 && p.best < mtp_vocab_), "Qwen4ExpSession::forward_mtp_top2: pick ", p.best,
-                " outside the draft vocabulary [0, ", mtp_vocab_, ")");
+    STRIX_CHECK(p.nan || (p.best >= 0 && p.best < pick_vocab), "Qwen4ExpSession::forward_mtp_top2: pick ", p.best,
+                " outside the draft vocabulary [0, ", pick_vocab, ")");
+    int32_t final_best = p.best;
+    if (!m_.compact_to_vocab().empty() && !p.nan) {
+        STRIX_CHECK(final_best >= 0 && final_best < (int32_t)m_.compact_to_vocab().size(),
+                    "Qwen4ExpSession::forward_mtp_top2: compact index ", final_best, " out of range [0, ",
+                    m_.compact_to_vocab().size(), ")");
+        final_best = m_.compact_to_vocab()[(size_t)final_best];
+    }
     mtp_done(seq, step);
-    return {p.best, p.best_v, p.second_v, p.nan != 0};
+    return {final_best, p.best_v, p.second_v, p.nan != 0};
 }
 
 void Qwen4ExpSession::mtp_done(int seq, int64_t step) {
@@ -3608,14 +3673,16 @@ void Qwen4ExpSession::run_mtp(int seq, int32_t token_id, int64_t step) {
     // else from the LM head as loaded.
     hc_mix(mtp.hc_mixer, false);
     const QWeightView &draft = m_.draft_head_q4();
-    QWeightView head = draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.lm_head();
-    STRIX_CHECK(head.K() == m_.lm_head().K() && mtp_vocab_ <= head.N(), "Qwen4ExpSession::forward_mtp: draft head [",
-                head.N(), ", ", head.K(), "] for mtp_vocab ", mtp_vocab_, " and the LM head's K ", m_.lm_head().K());
+    const bool is_compact = !m_.compact_to_vocab().empty();
+    QWeightView head = (draft.bits != 0 && (is_compact || mtp_vocab_ <= draft.N())) ? draft : m_.lm_head();
+    const int64_t target_rows = is_compact ? draft.N() : mtp_vocab_;
+    STRIX_CHECK(head.K() == m_.lm_head().K() && target_rows <= head.N(), "Qwen4ExpSession::forward_mtp: draft head [",
+                head.N(), ", ", head.K(), "] for target_rows ", target_rows, " and the LM head's K ", m_.lm_head().K());
     switch (head.bits) {
-        case 8: head.q8.N = mtp_vocab_; break;
-        case 6: head.q6.N = mtp_vocab_; break;
-        case 5: head.q5.N = mtp_vocab_; break;
-        case 4: head.q4.N = mtp_vocab_; break;
+        case 8: head.q8.N = target_rows; break;
+        case 6: head.q6.N = target_rows; break;
+        case 5: head.q5.N = target_rows; break;
+        case 4: head.q4.N = target_rows; break;
         default: STRIX_FAIL("Qwen4ExpSession::forward_mtp: LM head has ", head.bits, " bits, expected 4, 5, 6 or 8");
     }
     kernels::linear_qw(ws.u.get(), head, ws.logits.get(), 1, act, Act::F32, stream);

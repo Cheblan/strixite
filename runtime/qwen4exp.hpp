@@ -169,8 +169,11 @@ public:
     // 32 / 64 / 128 and divides the head's K; no copy made yet (call once, at load, before any session drafts -
     // sessions read it without locking). threads: 1..64 CPU workers for the requantization (~0.1 s at 65,536 rows).
     void make_draft_head_q4(int64_t rows, int64_t G = 64, int threads = 16);
+    void make_draft_head_q4(const std::vector<int32_t> &selected_rows, int64_t G = 64, int threads = 16);
     // The copy (bits == 0 until make_draft_head_q4 ran).
     const QWeightView &draft_head_q4() const { return draft_head_; }
+    // Mapping from compact draft index to original vocab ID (empty if unfiltered).
+    const std::vector<int32_t> &compact_to_vocab() const { return compact_to_vocab_; }
     // Device bytes the copy holds (0 when none, or when it is the loaded Q4 head itself).
     size_t draft_head_q4_bytes() const { return draft_q4_ ? draft_q4_bytes_ : 0; }
 
@@ -185,6 +188,7 @@ private:
     Q8DeviceView embed_q8_{};
     QWeightView lm_head_;
     QWeightView draft_head_;                 // make_draft_head_q4's copy (bits 0: none)
+    std::vector<int32_t> compact_to_vocab_;  // remap table for compact draft head
     std::unique_ptr<Q4Device> draft_q4_;     // its storage when made from a Q8 head
     size_t draft_q4_bytes_ = 0;
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;

@@ -334,6 +334,9 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp-lut-step-penalty", K::Number, 0.0, 1.0, "0.015", "MTP cost-gating LUT step penalty deduction"},
         {"mtp-ema-decay", K::Number, 0.01, 1.0, "0.15", "MTP cost-gating Renewal-Reward EMA smoothing factor"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
+        {"mtp-vocab-filter", K::Text, 0, 0, "all",
+         "MTP draft vocabulary filter preset (all, en+ru, en, no-cjk) or comma-separated sections "
+         "(core,latin,cyrillic,greek,digits,punct,code,cjk,arabic,asian,other)"},
         {"draft-head-q4", K::OnOff, 0, 0, "on",
          "MTP draft head: quantize a Q4 copy of the draft vocabulary's LM head rows at load for faster drafting; "
          "off uses the loaded Q8 LM head directly"},

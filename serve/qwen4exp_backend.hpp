@@ -45,6 +45,14 @@ public:
         return session_->forward(ids, n_logits);
     }
     bool has_mtp() const override { return session_->has_mtp(); }
+    float mtp_draft_step_ms() const override {
+        if (!session_->has_mtp()) return 2.16f;
+        const auto &draft = model_.draft_head_q4();
+        if (draft.bits == 4 && draft.N() > 0) {
+            return 0.755f + 1.403f * (float(draft.N()) / 248320.0f);
+        }
+        return 3.405f;  // Q8 lm_head fallback
+    }
     std::vector<float> forward_mtp(int32_t token_id, int64_t step) override {
         return session_->forward_mtp(token_id, step);
     }

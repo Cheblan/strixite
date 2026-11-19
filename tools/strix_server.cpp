@@ -19,6 +19,7 @@
 #include "serve/qwen4exp_backend.hpp"
 #include "serve/server_config.hpp"
 #include "serve/tokenizer.hpp"
+#include "serve/vocab_filter.hpp"
 #include "serve/vision_request.hpp"
 #include "kernels/vision.hpp"  // kernels::kMaxVisionSeq (the attention cap = the resize clamp)
 
@@ -160,6 +161,17 @@ int run(int argc, char **argv) {
     cfg.defaults = sampling_defaults(gen_config);
     const Tokenizer tok(tokenizer);
     slog(LogLevel::Info, "startup: tokenizer %s (%d tokens)", tokenizer.c_str(), tok.size());
+
+    // Early validation: check MTP vocabulary filter and prerequisites before loading weights (~50 s)
+    const std::string vocab_filter_spec = settings.text("mtp-vocab-filter");
+    const uint32_t filter_mask = vocab_filter::parse_filter(vocab_filter_spec);
+    const bool is_filtered = !vocab_filter::is_all(filter_mask);
+    if (is_filtered) {
+        STRIX_CHECK(draft_head_q4, "strix_server: --mtp-vocab-filter requires --draft-head-q4 on");
+        STRIX_CHECK(mtp_vocab == 0, "strix_server: --mtp-vocab-filter cannot be combined with nonzero --mtp-vocab (got ",
+                    mtp_vocab, "); use --mtp-vocab 0 with filtering");
+    }
+
     const WeightPlacement placement = parse_weight_placement(settings.text("placement"), "placement");
     // Vision: the tower file is a sibling of the served weights; the preprocessor values come
     // from the checkpoint's own files next to the tokenizer (the producer is JSON-free, this is where
@@ -197,10 +209,22 @@ int run(int argc, char **argv) {
     if (use_mtp && model.has_mtp()) {
         if (draft_head_q4) {
             const auto t0 = std::chrono::steady_clock::now();
-            const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
-            slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
-                 (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (is_filtered) {
+                const int64_t max_v = std::min((int64_t)tok.size(), model.dims().vocab);
+                const std::vector<int32_t> compact_ids = vocab_filter::filter_vocabulary(tok, filter_mask, max_v);
+                model.make_draft_head_q4(compact_ids, /*G=*/64, /*threads=*/16);
+                const double dur_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                slog(LogLevel::Info,
+                     "startup: MTP draft head: compact Q4 filter '%s' retained %lld / %lld tokens (%.1f%%), %.1f MB, made in %.2f s",
+                     vocab_filter_spec.c_str(), (long long)compact_ids.size(), (long long)model.dims().vocab,
+                     100.0 * (double)compact_ids.size() / (double)model.dims().vocab,
+                     (double)model.draft_head_q4_bytes() / 1e6, dur_s);
+            } else {
+                const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
+                slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+                     (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
         } else {
             slog(LogLevel::Info, "startup: MTP draft head: Q4 copy disabled (--draft-head-q4 off); using loaded Q8 LM head directly");
         }

@@ -114,6 +114,8 @@ public:
         return forward(ids, n_logits > 0);
     }
     virtual bool has_mtp() const { return false; }
+    // Latency of one MTP draft step in milliseconds (used by Cost-gate)
+    virtual float mtp_draft_step_ms() const { return 2.16f; }
     // The MTP head's logits for the token after token_id (step 0: token_id is the last sampled token; step > 0:
     // chained, token_id is step - 1's draft - Qwen4ExpSession::forward_mtp).
     virtual std::vector<float> forward_mtp(int32_t token_id, int64_t step) {

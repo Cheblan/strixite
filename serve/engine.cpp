@@ -63,7 +63,7 @@ static constexpr float kVerifyLatencyMs[] = {
     53.54f,  // T = 7
     57.94f   // T = 8
 };
-static constexpr float kMtpDraftStepMs = 2.16f;
+static constexpr float kDefaultMtpDraftStepMs = 2.16f;
 
 inline float get_verify_cost(int64_t T) {
     if (T < 0) return 0.0f;
@@ -1458,11 +1458,12 @@ void Engine::run(Job &job, Slot &sl) {
                 const float tau_global = ema_T / std::max(1.0f, ema_E);
 
                 float P_cum = 1.0f;
+                const float draft_step_ms = sl.be ? sl.be->mtp_draft_step_ms() : kDefaultMtpDraftStepMs;
 
                 for (int64_t step = 0; step < steps; ++step) {
                     const int64_t k_curr = step;
                     const float delta_verify = get_verify_cost(k_curr + 2) - get_verify_cost(k_curr + 1);
-                    const float delta_T = kMtpDraftStepMs + delta_verify;
+                    const float delta_T = draft_step_ms + delta_verify;
 
                     // Stage 1: Pre-draft optimistic check (Cost mode only)
                     // Under Renewal-Reward criterion, if even optimistic p_{k+1} = 1.0 satisfies
@@ -1554,7 +1555,7 @@ void Engine::run(Job &job, Slot &sl) {
 
                     // Renewal-Reward EMA update after MTP verify round:
                     const int64_t acc = j;
-                    const float round_T = get_verify_cost(k + 1) + (float)k * kMtpDraftStepMs;
+                    const float round_T = get_verify_cost(k + 1) + (float)k * draft_step_ms;
                     const float round_E = 1.0f + (float)acc;
                     const float decay = options_.mtp_ema_decay;
                     ema_T = (1.0f - decay) * ema_T + decay * round_T;
