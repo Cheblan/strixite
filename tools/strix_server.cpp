@@ -118,7 +118,8 @@ int run(int argc, char **argv) {
     const int64_t chunk_shared = settings.integer("chunk-shared");
     const float yarn_factor = (float)settings.number("rope-yarn-factor");
     const std::string cache_dir = settings.text("prompt-cache-dir");
-    const int64_t cache_gib = settings.integer("prompt-cache-gib");
+    const bool prompt_cache_enabled = settings.on("prompt-cache");
+    const int64_t cache_gib = prompt_cache_enabled ? settings.integer("prompt-cache-gib") : 0;
     PromptCache::Options cache_opts;
     cache_opts.ram_margin = (uint64_t)settings.integer("prompt-cache-ram-margin-gib") << 30;
     cache_opts.idle_seconds = settings.number("prompt-cache-idle-s");
@@ -134,6 +135,10 @@ int run(int argc, char **argv) {
     const bool use_mtp = settings.on("mtp");
     const int64_t mtp_draft = settings.integer("mtp-draft"), mtp_vocab = settings.integer("mtp-vocab");
     const float mtp_margin = (float)settings.number("mtp-margin");
+    const std::string mtp_gate_rule = settings.text("mtp-gate-rule");
+    const std::string sampled_gate = settings.text("sampled-gate");
+    const float mtp_lut_step_penalty = (float)settings.number("mtp-lut-step-penalty");
+    const float mtp_ema_decay = (float)settings.number("mtp-ema-decay");
     const int64_t ngram_cache_rows = settings.integer("ngram-cache-rows");
     const std::string capture_dir = settings.text("capture-dir");  // empty: no capture
     const bool think_nudge = settings.on("think-nudge");
@@ -341,6 +346,13 @@ int run(int argc, char **argv) {
     eng_opts.mtp_draft = mtp_draft;
     eng_opts.mtp_escalating_margin = settings.on("mtp-escalating-margin");
     eng_opts.mtp_margin_slope = (float)settings.number("mtp-margin-slope");
+    eng_opts.set_mtp_gate_rule(mtp_gate_rule);
+    eng_opts.set_sampled_gate(sampled_gate);
+    eng_opts.mtp_lut_step_penalty = mtp_lut_step_penalty;
+    eng_opts.mtp_ema_decay = mtp_ema_decay;
+    slog(LogLevel::Info, "startup: MTP gate rule greedy=%s, sampled=%s (step_penalty=%.3f, ema_decay=%.2f)",
+         eng_opts.mtp_gate_rule_str().c_str(), eng_opts.sampled_gate_str().c_str(),
+         eng_opts.mtp_lut_step_penalty, eng_opts.mtp_ema_decay);
     eng_opts.think_nudge = think_nudge;
     eng_opts.think_nudge_policy = nudge_policy;
     eng_opts.think_nudge_wording = nudge_wording;

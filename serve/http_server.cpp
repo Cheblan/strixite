@@ -732,12 +732,20 @@ void HttpServer::routes() {
             engine_.set_mtp_escalating_margin(v == "1" || v == "on" || v == "true");
         }
         if (req.has_param("margin_slope")) engine_.set_mtp_margin_slope(std::stof(req.get_param_value("margin_slope")));
+        if (req.has_param("gate_rule")) engine_.set_mtp_gate_rule(req.get_param_value("gate_rule"));
+        if (req.has_param("sampled_gate")) engine_.set_sampled_gate(req.get_param_value("sampled_gate"));
+        if (req.has_param("lut_step_penalty")) engine_.set_mtp_lut_step_penalty(std::stof(req.get_param_value("lut_step_penalty")));
+        if (req.has_param("ema_decay")) engine_.set_mtp_ema_decay(std::stof(req.get_param_value("ema_decay")));
         json::Value b = json::Value::object();
         b.set("status", json::Value::string("ok"));
         b.set("mtp_margin", json::Value::number(engine_.mtp_margin()));
         b.set("mtp_draft", json::Value::integer(engine_.mtp_draft()));
         b.set("mtp_escalating_margin", json::Value::boolean(engine_.mtp_escalating_margin()));
         b.set("mtp_margin_slope", json::Value::number(engine_.mtp_margin_slope()));
+        b.set("mtp_gate_rule", json::Value::string(engine_.mtp_gate_rule_str()));
+        b.set("sampled_gate", json::Value::string(engine_.sampled_gate_str()));
+        b.set("mtp_lut_step_penalty", json::Value::number(engine_.mtp_lut_step_penalty()));
+        b.set("mtp_ema_decay", json::Value::number(engine_.mtp_ema_decay()));
         res.set_content(b.dump(), "application/json");
     };
     svr_->Get("/set_mtp", handle_set_mtp);

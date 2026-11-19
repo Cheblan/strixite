@@ -553,6 +553,26 @@ class SeqBackend;
 class Engine {
 public:
     struct Options {
+        enum class MtpGateRule {
+            Margin,
+            Cost
+        };
+        MtpGateRule mtp_gate_rule = MtpGateRule::Margin;  // default for deterministic/greedy (T = 0)
+        MtpGateRule sampled_gate = MtpGateRule::Cost;     // default for sampling (T > 0)
+        float mtp_lut_step_penalty = 0.015f;              // probability penalty deduction per draft step
+        float mtp_ema_decay = 0.15f;                      // Renewal-Reward EMA smoothing factor
+        std::string mtp_gate_rule_str() const {
+            return mtp_gate_rule == MtpGateRule::Cost ? "cost" : "margin";
+        }
+        std::string sampled_gate_str() const {
+            return sampled_gate == MtpGateRule::Cost ? "cost" : "margin";
+        }
+        void set_mtp_gate_rule(const std::string &r) {
+            mtp_gate_rule = (r == "cost") ? MtpGateRule::Cost : MtpGateRule::Margin;
+        }
+        void set_sampled_gate(const std::string &r) {
+            sampled_gate = (r == "margin") ? MtpGateRule::Margin : MtpGateRule::Cost;
+        }
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
@@ -619,10 +639,20 @@ public:
     int64_t mtp_draft() const { return options_.mtp_draft; }
     bool mtp_escalating_margin() const { return options_.mtp_escalating_margin; }
     float mtp_margin_slope() const { return options_.mtp_margin_slope; }
+    Options::MtpGateRule mtp_gate_rule() const { return options_.mtp_gate_rule; }
+    std::string mtp_gate_rule_str() const { return options_.mtp_gate_rule_str(); }
+    Options::MtpGateRule sampled_gate() const { return options_.sampled_gate; }
+    std::string sampled_gate_str() const { return options_.sampled_gate_str(); }
+    float mtp_lut_step_penalty() const { return options_.mtp_lut_step_penalty; }
+    float mtp_ema_decay() const { return options_.mtp_ema_decay; }
     void set_mtp_margin(float m) { options_.mtp_margin = m; }
     void set_mtp_draft(int64_t d) { options_.mtp_draft = d; }
     void set_mtp_escalating_margin(bool m) { options_.mtp_escalating_margin = m; }
     void set_mtp_margin_slope(float s) { options_.mtp_margin_slope = s; }
+    void set_mtp_gate_rule(const std::string &r) { options_.set_mtp_gate_rule(r); }
+    void set_sampled_gate(const std::string &r) { options_.set_sampled_gate(r); }
+    void set_mtp_lut_step_penalty(float p) { options_.mtp_lut_step_penalty = p; }
+    void set_mtp_ema_decay(float d) { options_.mtp_ema_decay = d; }
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }

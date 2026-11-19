@@ -19,7 +19,63 @@ namespace strix {
 
 namespace {
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+struct MtpKnot { float delta; float p; };
+static constexpr MtpKnot kMtpProbLut[] = {
+    {0.0f,  0.100f},
+    {0.4f,  0.205f},
+    {0.75f, 0.451f},
+    {1.25f, 0.592f},
+    {1.75f, 0.625f},
+    {3.0f,  0.932f},
+    {6.0f,  0.985f}
+};
+
+inline float interpolate_mtp_prob(float delta) {
+    constexpr size_t N = sizeof(kMtpProbLut) / sizeof(kMtpProbLut[0]);
+    if (delta <= kMtpProbLut[0].delta) return kMtpProbLut[0].p;
+    if (delta >= kMtpProbLut[N - 1].delta) return kMtpProbLut[N - 1].p;
+    for (size_t i = 1; i < N; ++i) {
+        if (delta <= kMtpProbLut[i].delta) {
+            const float d0 = kMtpProbLut[i - 1].delta;
+            const float d1 = kMtpProbLut[i].delta;
+            const float p0 = kMtpProbLut[i - 1].p;
+            const float p1 = kMtpProbLut[i].p;
+            const float t = (delta - d0) / (d1 - d0);
+            return p0 + t * (p1 - p0);
+        }
+    }
+    return kMtpProbLut[N - 1].p;
+}
+
+// Measured hardware latency profile on AMD Strix Halo (gfx1151, Qwen 3.8-Flash-Next in ms).
+// In-engine steady_clock measurements:
+// T = 1: 26.69 ms, T = 2: 32.12 ms, T = 3: 36.62 ms, T = 4: 41.28 ms,
+// T = 5: 45.91 ms, T = 6: 48.33 ms (Grouped WMMA MoE active), T = 7: 53.54 ms, T = 8: 57.94 ms
+static constexpr float kVerifyLatencyMs[] = {
+    0.0f,    // T = 0
+    26.69f,  // T = 1
+    32.12f,  // T = 2
+    36.62f,  // T = 3
+    41.28f,  // T = 4
+    45.91f,  // T = 5
+    48.33f,  // T = 6
+    53.54f,  // T = 7
+    57.94f   // T = 8
+};
+static constexpr float kMtpDraftStepMs = 2.16f;
+
+inline float get_verify_cost(int64_t T) {
+    if (T < 0) return 0.0f;
+    constexpr size_t N = sizeof(kVerifyLatencyMs) / sizeof(kVerifyLatencyMs[0]);
+    if (T < (int64_t)N) {
+        return kVerifyLatencyMs[T];
+    }
+    return kVerifyLatencyMs[N - 1] + (float)(T - (int64_t)(N - 1)) * 4.5f;
+}
 }  // namespace
+
+
 
 bool ends_sentence(std::string_view tail) {
     if (tail.empty()) return false;
@@ -893,6 +949,8 @@ void log_footer(const GenerationResult &r) {
 
 void Engine::run(Job &job, Slot &sl) {
     GenerationRequest &req = job.req;
+    const bool is_greedy = (req.sampling.temperature == 0.0);
+    const Options::MtpGateRule active_gate = is_greedy ? options_.mtp_gate_rule : options_.sampled_gate;
     GenerationSink &sink = *job.sink;
     GenerationResult res;
     int64_t generated_counted = 0;  // of res.completion_tokens, already in stats_.generated_tokens (per decode step)
@@ -1264,6 +1322,8 @@ void Engine::run(Job &job, Slot &sl) {
         // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
         // forward of its own (strixite PR #1).
         int32_t carry = -1;
+        float ema_T = 48.0f;
+        float ema_E = 3.2f;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
@@ -1389,15 +1449,31 @@ void Engine::run(Job &job, Slot &sl) {
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 sl.be->prefetch_ple(ids, 0);
                 StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
+
+                // Under Renewal-Reward theory, each slot evaluates its own marginal throughput trade-off:
+                // ema_T / ema_E is this slot's expected latency per accepted token.
+                const float tau_global = ema_T / std::max(1.0f, ema_E);
+
+                float P_cum = 1.0f;
+
                 for (int64_t step = 0; step < steps; ++step) {
+                    const int64_t k_curr = step;
+                    const float delta_verify = get_verify_cost(k_curr + 2) - get_verify_cost(k_curr + 1);
+                    const float delta_T = kMtpDraftStepMs + delta_verify;
+
+                    // Stage 1: Pre-draft optimistic check (Cost mode only)
+                    // Under Renewal-Reward criterion, if even optimistic p_{k+1} = 1.0 satisfies
+                    // P_cum * tau_global <= delta_T, drafting token k+1 cannot improve global throughput.
+                    if (active_gate == Options::MtpGateRule::Cost) {
+                        if (P_cum * tau_global <= delta_T) {
+                            break;
+                        }
+                    }
+
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
-                    float required_margin = options_.mtp_margin;
-                    if (options_.mtp_escalating_margin) {
-                        required_margin += (float)step * options_.mtp_margin_slope;
-                    }
-                    if (t.best_v - t.second_v < required_margin || d == im_end_ || d == eot_) break;
+                    if (d == im_end_ || d == eot_) break;
                     // A <tool_call> drafted inside the think block might need the think close fed ahead of it: no draft.
                     if (d == call_begin_ && options_.think_close_on_call && parser.in_reasoning()) break;
                     // A draft the response format refuses would be rejected anyway: don't verify it.
@@ -1405,7 +1481,31 @@ void Engine::run(Job &job, Slot &sl) {
                         if (!so->allows(draft_at, d)) break;
                         draft_at = so->after(draft_at, d);
                     }
-                    ids.push_back(d);
+
+                    if (active_gate == Options::MtpGateRule::Cost) {
+                        // Stage 2: Post-draft actual cost check via empirical piecewise-linear LUT
+                        const float delta_logits = t.best_v - t.second_v;
+                        const float p_lut = interpolate_mtp_prob(delta_logits);
+                        const float p_next = std::clamp(p_lut - options_.mtp_lut_step_penalty * (float)step, 0.01f, 0.995f);
+                        const float P_cum_next = P_cum * p_next;
+
+                        if (P_cum_next * tau_global <= delta_T) {
+                            // Marginal addition does not improve global throughput (Renewal-Reward criterion)
+                            break;
+                        }
+
+                        ids.push_back(d);
+                        P_cum = P_cum_next;
+                    } else {
+                        // Margin mode
+                        float required_margin = options_.mtp_margin;
+                        if (options_.mtp_escalating_margin) {
+                            required_margin += (float)step * options_.mtp_margin_slope;
+                        }
+                        if (t.best_v - t.second_v < required_margin) break;
+                        ids.push_back(d);
+                    }
+
                     if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
@@ -1444,6 +1544,15 @@ void Engine::run(Job &job, Slot &sl) {
                             break;
                         }
                     }
+
+                    // Renewal-Reward EMA update after MTP verify round:
+                    const int64_t acc = j;
+                    const float round_T = get_verify_cost(k + 1) + (float)k * kMtpDraftStepMs;
+                    const float round_E = 1.0f + (float)acc;
+                    const float decay = options_.mtp_ema_decay;
+                    ema_T = (1.0f - decay) * ema_T + decay * round_T;
+                    ema_E = (1.0f - decay) * ema_E + decay * round_E;
+
                     if (cut) {  // at the budget's stop (above): id and j accepted drafts kept
                         sl.be->keep_verify_prefix(ids, j + 1);
                         sl.seq.insert(sl.seq.end(), ids.begin(), ids.begin() + j + 1);
@@ -1516,6 +1625,9 @@ void Engine::run(Job &job, Slot &sl) {
             }
             sl.seq.push_back(id);
             step(0, 0, 1);
+            const float decay = options_.mtp_ema_decay;
+            ema_T = (1.0f - decay) * ema_T + decay * get_verify_cost(1);
+            ema_E = (1.0f - decay) * ema_E + decay * 1.0f;
         }
         decoding.end();
         parser.finish(events);

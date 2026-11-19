@@ -289,6 +289,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
          "prefill chunk in tokens while another slot is decoding (several slots): a slot's chunk holds the GPU, so the "
          "other slots' decode steps run only between chunks; 0 = always the full chunk"},
         {"model-id", K::Text, 0, 0, server.model_id, "the model name the API reports"},
+        {"prompt-cache", K::OnOff, 0, 0, "on", "prompt cache: on or off (off disables RAM/disk cache without purging disk files)"},
         {"prompt-cache-dir", K::Path, 0, 0, models_dir + "/prompt-cache", "the disk prompt cache's directory"},
         {"prompt-cache-gib", K::Int, 0, 1 << 16, "128", "the disk prompt cache's cap in GiB; 0 = no prompt cache"},
         {"prompt-cache-ram-margin-gib", K::Int, 0, 1 << 12, std::to_string(cache.ram_margin >> 30),
@@ -328,6 +329,10 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir) {
         {"mtp-escalating-margin", K::OnOff, 0, 0, "on", "escalate MTP margin with draft depth (slope 0.08 per step)"},
         {"mtp-margin-slope", K::Number, 0, 10, "0.08", "margin increase per draft step in escalating mode"},
         {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-gate-rule", K::Text, 0, 0, "margin", "MTP gate rule for deterministic/greedy (T = 0): margin or cost"},
+        {"sampled-gate", K::Text, 0, 0, "cost", "MTP gate rule for sampling (T > 0): cost or margin"},
+        {"mtp-lut-step-penalty", K::Number, 0.0, 1.0, "0.015", "MTP cost-gating LUT step penalty deduction"},
+        {"mtp-ema-decay", K::Number, 0.01, 1.0, "0.15", "MTP cost-gating Renewal-Reward EMA smoothing factor"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(kServedNgramCacheRows),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},
