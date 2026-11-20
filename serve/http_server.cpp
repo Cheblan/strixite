@@ -751,6 +751,25 @@ void HttpServer::routes() {
     svr_->Get("/set_mtp", handle_set_mtp);
     svr_->Post("/set_mtp", handle_set_mtp);
 
+    svr_->Get("/hw_stats", [this](const httplib::Request &req, httplib::Response &res) {
+        if (req.has_param("reset")) {
+            engine_.reset_hw_latency_stats();
+        }
+        const Engine::HwLatencyReport rep = engine_.hw_latency_report();
+        json::Value b = json::Value::object();
+        b.set("draft_ms", json::Value::number(rep.draft_ms));
+        b.set("draft_count", json::Value::integer((int64_t)rep.draft_count));
+        json::Value v_ms = json::Value::array();
+        json::Value v_cnt = json::Value::array();
+        for (int i = 0; i < 16; ++i) {
+            v_ms.push(json::Value::number(rep.verify_ms[i]));
+            v_cnt.push(json::Value::integer((int64_t)rep.verify_counts[i]));
+        }
+        b.set("verify_ms", std::move(v_ms));
+        b.set("verify_counts", std::move(v_cnt));
+        res.set_content(b.dump(), "application/json");
+    });
+
     svr_->Get("/metrics", [this](const httplib::Request &, httplib::Response &res) {
         const EngineStats s = engine_.stats();
         std::string m;

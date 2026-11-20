@@ -20,6 +20,14 @@ namespace strix {
 namespace {
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+struct HwLatencyStats {
+    std::atomic<uint64_t> verify_count[16]{};
+    std::atomic<uint64_t> verify_time_ns[16]{};
+    std::atomic<uint64_t> draft_count{0};
+    std::atomic<uint64_t> draft_time_ns{0};
+};
+static HwLatencyStats g_hw_stats;
+
 struct MtpKnot { float delta; float p; };
 static constexpr MtpKnot kMtpProbLut[] = {
     {0.0f,  0.100f},
@@ -52,18 +60,22 @@ inline float interpolate_mtp_prob(float delta) {
 // In-engine steady_clock measurements:
 // T = 1: 26.69 ms, T = 2: 32.12 ms, T = 3: 36.62 ms, T = 4: 41.28 ms,
 // T = 5: 45.91 ms, T = 6: 48.33 ms (Grouped WMMA MoE active), T = 7: 53.54 ms, T = 8: 57.94 ms
+// Measured hardware latency profile on AMD Strix Halo (gfx1151, Qwen 3.8-Flash-Next in ms).
+// Refreshed live steady_clock measurements:
+// T = 1: 26.84 ms, T = 2: 32.13 ms, T = 3: 36.62 ms, T = 4: 41.60 ms,
+// T = 5: 46.11 ms, T = 6: 46.89 ms (Grouped WMMA MoE active), T = 7: 50.04 ms, T = 8: 54.33 ms
 static constexpr float kVerifyLatencyMs[] = {
-    0.0f,    // T = 0
-    26.69f,  // T = 1
-    32.12f,  // T = 2
-    36.62f,  // T = 3
-    41.28f,  // T = 4
-    45.91f,  // T = 5
-    48.33f,  // T = 6
-    53.54f,  // T = 7
-    57.94f   // T = 8
+    0.0f,     // T = 0
+    26.84f,   // T = 1
+    32.13f,   // T = 2
+    36.62f,   // T = 3
+    41.60f,   // T = 4
+    46.11f,   // T = 5
+    46.89f,   // T = 6
+    50.04f,   // T = 7
+    54.33f    // T = 8
 };
-static constexpr float kDefaultMtpDraftStepMs = 2.16f;
+static constexpr float kDefaultMtpDraftStepMs = 1.69f;
 
 inline float get_verify_cost(int64_t T) {
     if (T < 0) return 0.0f;
@@ -71,7 +83,7 @@ inline float get_verify_cost(int64_t T) {
     if (T < (int64_t)N) {
         return kVerifyLatencyMs[T];
     }
-    return kVerifyLatencyMs[N - 1] + (float)(T - (int64_t)(N - 1)) * 4.5f;
+    return kVerifyLatencyMs[N - 1] + (float)(T - (int64_t)(N - 1)) * 4.3f;
 }
 }  // namespace
 
@@ -344,6 +356,28 @@ void Engine::dispatch_locked() {
         --stats_.queued, ++stats_.busy;
         stats_.slot_request[(size_t)best->index] = best->running_id;
     }
+}
+
+Engine::HwLatencyReport Engine::hw_latency_report() const {
+    HwLatencyReport rep;
+    for (int i = 0; i < 16; ++i) {
+        rep.verify_counts[i] = g_hw_stats.verify_count[i].load(std::memory_order_relaxed);
+        const uint64_t ns = g_hw_stats.verify_time_ns[i].load(std::memory_order_relaxed);
+        rep.verify_ms[i] = rep.verify_counts[i] > 0 ? ((double)ns / 1e6 / (double)rep.verify_counts[i]) : 0.0;
+    }
+    rep.draft_count = g_hw_stats.draft_count.load(std::memory_order_relaxed);
+    const uint64_t d_ns = g_hw_stats.draft_time_ns.load(std::memory_order_relaxed);
+    rep.draft_ms = rep.draft_count > 0 ? ((double)d_ns / 1e6 / (double)rep.draft_count) : 0.0;
+    return rep;
+}
+
+void Engine::reset_hw_latency_stats() {
+    for (int i = 0; i < 16; ++i) {
+        g_hw_stats.verify_count[i].store(0, std::memory_order_relaxed);
+        g_hw_stats.verify_time_ns[i].store(0, std::memory_order_relaxed);
+    }
+    g_hw_stats.draft_count.store(0, std::memory_order_relaxed);
+    g_hw_stats.draft_time_ns.store(0, std::memory_order_relaxed);
 }
 
 EngineStats Engine::stats() const {
@@ -1477,6 +1511,9 @@ void Engine::run(Job &job, Slot &sl) {
                     const auto t_draft_start = std::chrono::steady_clock::now();
                     const Top2 t = sl.be->forward_mtp_top2(ids.back(), step);
                     const auto t_draft_end = std::chrono::steady_clock::now();
+                    const uint64_t ns_d = std::chrono::duration_cast<std::chrono::nanoseconds>(t_draft_end - t_draft_start).count();
+                    g_hw_stats.draft_time_ns.fetch_add(ns_d, std::memory_order_relaxed);
+                    g_hw_stats.draft_count.fetch_add(1, std::memory_order_relaxed);
                     res.mtp_draft_ms += std::chrono::duration<double, std::milli>(t_draft_end - t_draft_start).count();
                     ++res.mtp_draft_calls;
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
@@ -1520,8 +1557,15 @@ void Engine::run(Job &job, Slot &sl) {
                 if (k > 0) {
                     res.mtp_drafted_tokens += k;
                     ++res.decode_forwards;
+                    const auto t_v0 = std::chrono::steady_clock::now();
                     LogitRows ml = sl.be->forward_verify_rows(
                         ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
+                    const auto t_v1 = std::chrono::steady_clock::now();
+                    const uint64_t ns_v = std::chrono::duration_cast<std::chrono::nanoseconds>(t_v1 - t_v0).count();
+                    if (k + 1 < 16) {
+                        g_hw_stats.verify_time_ns[k + 1].fetch_add(ns_v, std::memory_order_relaxed);
+                        g_hw_stats.verify_count[k + 1].fetch_add(1, std::memory_order_relaxed);
+                    }
                     STRIX_CHECK(ml.rows == k + 1, "Engine: verify of ", k + 1, " tokens returned ", ml.rows,
                                 " logits rows");
                     // Accept drafts while the sampled token is the draft.
@@ -1624,7 +1668,12 @@ void Engine::run(Job &job, Slot &sl) {
             if (arbiter_ && sl.be->has_mtp()) {
                 // Several slots: a step with no draft is a verify of id alone, so it joins the other slots' batch. As a
                 // plain forward it ran alone on the GPU and held their batch until it finished.
+                const auto t_v0 = std::chrono::steady_clock::now();
                 LogitRows ml = sl.be->forward_verify_rows({id}, 1, cands, n_valid, masks_for({}));
+                const auto t_v1 = std::chrono::steady_clock::now();
+                const uint64_t ns_v = std::chrono::duration_cast<std::chrono::nanoseconds>(t_v1 - t_v0).count();
+                g_hw_stats.verify_time_ns[1].fetch_add(ns_v, std::memory_order_relaxed);
+                g_hw_stats.verify_count[1].fetch_add(1, std::memory_order_relaxed);
                 STRIX_CHECK(ml.rows == 1, "Engine: verify of 1 token (no draft) returned ", ml.rows, " logits rows");
                 sl.be->keep_verify();
                 logits = ml.row_of(0);

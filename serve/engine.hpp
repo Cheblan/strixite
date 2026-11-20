@@ -657,6 +657,15 @@ public:
     void set_sampled_gate(const std::string &r) { options_.set_sampled_gate(r); }
     void set_mtp_lut_step_penalty(float p) { options_.mtp_lut_step_penalty = p; }
     void set_mtp_ema_decay(float d) { options_.mtp_ema_decay = d; }
+
+    struct HwLatencyReport {
+        double verify_ms[16]{};
+        uint64_t verify_counts[16]{};
+        double draft_ms = 0.0;
+        uint64_t draft_count = 0;
+    };
+    HwLatencyReport hw_latency_report() const;
+    void reset_hw_latency_stats();
     // The GpuFatalError that stopped the engine (empty: none); submit refuses every request after it.
     std::string fatal_error() const;
     const std::string &degraded() const { return options_.degraded; }
