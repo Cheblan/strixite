@@ -2853,11 +2853,12 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     const int64_t qsa_tile = std::min<int64_t>(max_tokens_, 1024);
                     for (int64_t off = 0; off < r.Tr; off += qsa_tile) {
                         const int64_t tile_t = std::min<int64_t>(r.Tr - off, qsa_tile);
+                        const int64_t tile_ld = std::min<int64_t>(cap_blocks_, std::max<int64_t>(16, ((r.p + off + tile_t) / kernels::kQsaBlock + 15) & ~15));
                         void *tile_q = at(proj_, (r.base + off) * D.astride + D.idx_col);
                         kernels::qsa_scores(tile_q, D.astride, D.idx_d, tile_t, r.p + off, D.idx_h, D.idx_d,
                                             sq.block_keys[(size_t)i].get(), cap_blocks_,
-                                            qsa_scores_.get(), cap_blocks_, act, stream_);
-                        kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, tile_t, r.p + off, qsa_k,
+                                            qsa_scores_.get(), tile_ld, act, stream_);
+                        kernels::qsa_topk(qsa_scores_.get(), tile_ld, tile_t, r.p + off, qsa_k,
                                           qsa_sel_.get() + (size_t)((r.base + off) * qsa_k),
                                           qsa_nsel_.get() + r.base + off,
                                           qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
@@ -3038,17 +3039,22 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         // of one state: run_mtp swaps mtp_x_ against that state's chain buffer mid-draft.
         for (Run &r : runs) mtp_input(r.base, r.Tr, r.sq->mtp_prev.get());
         hc_mix(ml.hc_attn, true, false, mtp_x_.get());
-        lin(u_.get(), ml.qkv, proj_.get(), T, act);
+        constexpr int64_t mtp_qkv_stride = 1664;
+        constexpr int64_t mtp_row0 = 12288;
+        constexpr int64_t mtp_k_offset = 0;
+        const int64_t mtp_v_offset = D.hkv * hd;
+        constexpr int64_t mtp_idx_k_offset = 1536;
+        lin(u_.get(), slice_rows(ml.qkv, mtp_row0, mtp_qkv_stride), proj_.get(), T, act);
         for (Run &r : runs) {
             Qwen4ExpSeqState &sq = *r.sq;
             const kernels::NormRopeJob nr[2] = {
-                {at(proj_, r.base * D.astride + D.hq * 2 * hd), D.astride, hd,
+                {at(proj_, r.base * mtp_qkv_stride + mtp_k_offset), mtp_qkv_stride, hd,
                  sq.k_cache_mtp.get() + (size_t)(r.p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, ml.k_norm},
-                {at(proj_, r.base * D.astride + D.hq * 2 * hd + D.hkv * hd), D.astride, hd,
+                {at(proj_, r.base * mtp_qkv_stride + mtp_v_offset), mtp_qkv_stride, hd,
                  sq.v_cache_mtp.get() + (size_t)(r.p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, nullptr}};
             kernels::qk_norm_rope_jobs(nr, 2, r.Tr, D.eps, D.rot, r.rope0, m_.inv_freq(), act, stream_,
                                        m_.rope_scale(), mk_jobs_);  // k, v into the MTP cache (at row base)
-            kernels::qsa_block_keys(at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride,
+            kernels::qsa_block_keys(at(proj_, r.base * mtp_qkv_stride + mtp_idx_k_offset), mtp_qkv_stride,
                                     r.Tr, r.p,
                                     r.p % kernels::kQsaBlock ? sq.tail_mtp[sq.mtp_tail_cur].get() : nullptr,
                                     sq.tail_mtp[1 - sq.mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps,
@@ -3357,8 +3363,10 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
         // single-sequence verify, the run's row base for a batched one); its streams are still in x_.
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
         const int64_t rbase = sq.verify_row_base;
-        kernels::qsa_block_keys(proj_.get() + (size_t)(rbase * D.astride + D.idx_col + D.idx_h * D.idx_d) * e,
-                                D.astride, rows, p0,
+        constexpr int64_t mtp_qkv_stride = 1664;
+        constexpr int64_t mtp_idx_k_offset = 1536;
+        kernels::qsa_block_keys(proj_.get() + (size_t)(rbase * mtp_qkv_stride + mtp_idx_k_offset) * e,
+                                mtp_qkv_stride, rows, p0,
                                 p0 % kernels::kQsaBlock ? sq.tail_mtp[sq.verify_mtp_tail_cur].get() : nullptr,
                                 sq.tail_mtp[1 - sq.verify_mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
                                 D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_, sq.rope_delta);

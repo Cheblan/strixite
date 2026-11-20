@@ -330,11 +330,11 @@ __device__ __forceinline__ float row_xor(float x) {
 }
 // One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied. Defer: kDeferK below
 // (wmma_attention_launch picks it by the call's size).
-template <bool GATHER, bool One, bool Defer, typename R>
+template <bool GATHER, bool One, bool Defer, bool SingleSplit, typename R>
 __global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_eu(7)))
     attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, R kv, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
                                   float *ws, int64_t splits, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
-                                  uint32_t *err) {
+                                  uint32_t *err, const uint16_t *gate = nullptr, uint16_t *out = nullptr) {
     __shared__ __attribute__((aligned(16))) float sp[kWWaves][8][32];  // S partials, [wave][element v][lane]
     __shared__ __attribute__((aligned(16))) uint16_t vt[kWWaves][kDW * kTLd];
     __shared__ __attribute__((aligned(16))) uint16_t ps[2][16 * kTLd];  // P hi, lo [row][key] (shared)
@@ -599,14 +599,41 @@ __global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
     }
     // The block's partial for rows < G: m, l from the wave owning the row, O from each wave's dims.
+    if constexpr (SingleSplit) {
+        (void)ws;
 #pragma unroll
-    for (int v = 0; v < 8; ++v) {
-        const int r = 2 * v + half;
-        if (r >= G) continue;
-        float *out = ws + ((t * Hq + kh * G + r) * splits + sp_i) * (kD + 2);
-        if (v / kEPW == w && col == 0) out[0] = m[v % kEPW], out[1] = l[v % kEPW];
+        for (int v = 0; v < 8; ++v) {
+            const int r = 2 * v + half;
+            if (r < G && v / kEPW == w && col == 0) {
+                s_alpha[r] = l[v % kEPW];
+            }
+        }
+        lds_barrier();
 #pragma unroll
-        for (int j = 0; j < kDW / 16; ++j) out[2 + d_w + j * 16 + col] = o[j][v];
+        for (int v = 0; v < 8; ++v) {
+            const int r = 2 * v + half;
+            if (r >= G) continue;
+            const float L = s_alpha[r];
+#pragma unroll
+            for (int j = 0; j < kDW / 16; ++j) {
+                const int d = d_w + j * 16 + col;
+                const float g = bf16_bits_to_f32(gate[t * q_ts + (kh * G + r) * q_hs + d]);
+                const float val = (o[j][v] / L) * (1.0f / (1.0f + expf(-g)));
+                out[t * Hq * kD + (kh * G + r) * kD + d] = f32_to_bf16_bits(val);
+            }
+        }
+    } else {
+        (void)gate;
+        (void)out;
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const int r = 2 * v + half;
+            if (r >= G) continue;
+            float *out_ptr = ws + ((t * Hq + kh * G + r) * splits + sp_i) * (kD + 2);
+            if (v / kEPW == w && col == 0) out_ptr[0] = m[v % kEPW], out_ptr[1] = l[v % kEPW];
+#pragma unroll
+            for (int j = 0; j < kDW / 16; ++j) out_ptr[2 + d_w + j * 16 + col] = o[j][v];
+        }
     }
 }
 
@@ -1002,6 +1029,8 @@ void wmma_attention_launch(bool gather, const void *q, const void *gate, const K
     dim3 grid((unsigned)splits, (unsigned)s.Hk, (unsigned)s.T), block(kWWaves * 32);
     dim3 cgrid((unsigned)s.Hq, (unsigned)s.T), cblock(kD);
     const auto *qb = static_cast<const uint16_t *>(q);
+    const auto *gb = static_cast<const uint16_t *>(gate);
+    auto *ob = static_cast<uint16_t *>(out);
     STRIX_CHECK(precision == AttnPrecision::Exact || precision == AttnPrecision::Fast,
                 "attention (WMMA): unknown precision ", (int)precision);
     const bool defer = s.T <= kDeferKMaxTokens;
@@ -1009,13 +1038,23 @@ void wmma_attention_launch(bool gather, const void *q, const void *gate, const K
         using R = decltype(rd);
         auto partial = [&](auto one, auto def) {
             constexpr bool One = decltype(one)::value, Defer = decltype(def)::value;
-            if (gather)
-                attention_partial_wmma_kernel<true, One, Defer, R><<<grid, block, 0, stream>>>(
-                    qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld, err);
-            else
-                attention_partial_wmma_kernel<false, One, Defer, R><<<grid, block, 0, stream>>>(
-                    qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
-                    nullptr);
+            if (splits == 1) {
+                if (gather)
+                    attention_partial_wmma_kernel<true, One, Defer, true, R><<<grid, block, 0, stream>>>(
+                        qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld, err, gb, ob);
+                else
+                    attention_partial_wmma_kernel<false, One, Defer, true, R><<<grid, block, 0, stream>>>(
+                        qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
+                        nullptr, gb, ob);
+            } else {
+                if (gather)
+                    attention_partial_wmma_kernel<true, One, Defer, false, R><<<grid, block, 0, stream>>>(
+                        qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, sel, nsel, sel_ld, err, nullptr, nullptr);
+                else
+                    attention_partial_wmma_kernel<false, One, Defer, false, R><<<grid, block, 0, stream>>>(
+                        qb, s.q_ts, s.q_hs, rd, s.Hq, s.Hk, s.pos0, kps, scale, workspace, splits, nullptr, nullptr, 0,
+                        nullptr, nullptr, nullptr);
+            }
         };
         auto with_defer = [&](auto one) {
             if constexpr (R::kKF16 && !R::kStaged) {
@@ -1026,9 +1065,11 @@ void wmma_attention_launch(bool gather, const void *q, const void *gate, const K
         if (precision == AttnPrecision::Fast) with_defer(std::true_type{});
         else with_defer(std::false_type{});
     });
-    attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
-                                                                     static_cast<const uint16_t *>(gate), s.q_ts,
-                                                                     s.q_hs, s.Hq, static_cast<uint16_t *>(out));
+    if (splits > 1) {
+        attention_combine_kernel<uint16_t><<<cgrid, cblock, 0, stream>>>(workspace, splits,
+                                                                         static_cast<const uint16_t *>(gate), s.q_ts,
+                                                                         s.q_hs, s.Hq, static_cast<uint16_t *>(out));
+    }
 }
 void wmma_attention_checks(const char *fn, const void *q, const void *gate, const KvArg &kv, const void *out,
                            const float *workspace, int64_t capacity, const AttentionShape &s, float scale, Act act) {

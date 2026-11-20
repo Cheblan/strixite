@@ -35,6 +35,48 @@ inline QWeightView qweight(const Q8DeviceView &v) { return {8, {}, v, {}, {}}; }
 inline QWeightView qweight(const Q6DeviceView &v) { return {6, {}, {}, v, {}}; }
 inline QWeightView qweight(const Q5DeviceView &v) { return {5, {}, {}, {}, v}; }
 
+// Returns a non-owning zero-copy slice of w's rows [row0, row0 + num_rows).
+inline QWeightView slice_rows(const QWeightView &w, int64_t row0, int64_t num_rows) {
+    STRIX_CHECK(row0 >= 0 && num_rows >= 0 && row0 + num_rows <= w.N(),
+                "slice_rows: invalid range [", row0, ", +", num_rows, ") for N=", w.N());
+    switch (w.bits) {
+        case 4: {
+            const int64_t K = w.q4.K, G = w.q4.G;
+            const int64_t q_byte_offset = row0 * (K / 2);
+            const int64_t sm_offset = row0 * (K / G);
+            STRIX_CHECK(reinterpret_cast<uintptr_t>(w.q4.q + q_byte_offset) % 16 == 0,
+                        "slice_rows: Q4 q slice not 16-byte aligned");
+            return qweight(Q4DeviceView{w.q4.q + q_byte_offset, w.q4.scale + sm_offset, w.q4.minv + sm_offset, num_rows, K, G});
+        }
+        case 8: {
+            const int64_t K = w.q8.K, G = w.q8.G;
+            const int64_t q_byte_offset = row0 * K;
+            const int64_t sm_offset = row0 * (K / G);
+            STRIX_CHECK(reinterpret_cast<uintptr_t>(w.q8.q + q_byte_offset) % 16 == 0,
+                        "slice_rows: Q8 q slice not 16-byte aligned");
+            return qweight(Q8DeviceView{w.q8.q + q_byte_offset, w.q8.scale + sm_offset, w.q8.minv + sm_offset, num_rows, K, G});
+        }
+        case 5: {
+            const int64_t K = w.q5.K, G = w.q5.G;
+            const int64_t q_byte_offset = row0 * (5 * K / 8);
+            const int64_t sm_offset = row0 * (K / G);
+            STRIX_CHECK(reinterpret_cast<uintptr_t>(w.q5.q + q_byte_offset) % 16 == 0,
+                        "slice_rows: Q5 q slice not 16-byte aligned");
+            return qweight(Q5DeviceView{w.q5.q + q_byte_offset, w.q5.scale + sm_offset, w.q5.minv + sm_offset, num_rows, K, G});
+        }
+        case 6: {
+            const int64_t K = w.q6.K, G = w.q6.G;
+            const int64_t q_byte_offset = row0 * (3 * K / 4);
+            const int64_t sm_offset = row0 * (K / G);
+            STRIX_CHECK(reinterpret_cast<uintptr_t>(w.q6.q + q_byte_offset) % 16 == 0,
+                        "slice_rows: Q6 q slice not 16-byte aligned");
+            return qweight(Q6DeviceView{w.q6.q + q_byte_offset, w.q6.scale + sm_offset, w.q6.minv + sm_offset, num_rows, K, G});
+        }
+        default:
+            STRIX_FAIL("slice_rows: unsupported weight bits ", w.bits);
+    }
+}
+
 // The same for a chunk-major weight (hc_mix_up's W_up).
 struct QChunkMajorView {
     int bits = 0;  // 4 or 8; 0 = not loaded
