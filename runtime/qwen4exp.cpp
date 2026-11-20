@@ -637,6 +637,7 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
         ws.logits = DeviceBuffer<float>((size_t)D.vocab, "MTP draft logits");
         ws.mtp_pick = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP draft pick dev");
         ws.host_pick = PinnedHostBuffer(sizeof(kernels::MtpPick), "MTP draft pick host");
+        ws.host_ids = PinnedHostBuffer(sizeof(int32_t), "MTP draft id host");
 
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
         const int64_t cap_blocks = (capacity + kernels::kQsaBlock - 1) / kernels::kQsaBlock;
@@ -3325,6 +3326,24 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
     // exactly like the verify's own forward did.
     prepare_positions(sq, p0, rows);
     try {  // until the state is whole again
+    if (mtp_) {
+        // The MTP layer's projections of this state's rows are in proj_ at sq.verify_row_base (0 for a
+        // single-sequence verify, the run's row base for a batched one); its streams are still in x_.
+        const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
+        const int64_t rbase = sq.verify_row_base;
+        constexpr int64_t mtp_qkv_stride = 1664;
+        constexpr int64_t mtp_idx_k_offset = 1536;
+        kernels::qsa_block_keys(proj_.get() + (size_t)(rbase * mtp_qkv_stride + mtp_idx_k_offset) * e,
+                                mtp_qkv_stride, rows, p0,
+                                p0 % kernels::kQsaBlock ? sq.tail_mtp[sq.verify_mtp_tail_cur].get() : nullptr,
+                                sq.tail_mtp[1 - sq.verify_mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
+                                D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_, sq.rope_delta);
+        STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), x_.get() + (size_t)((rbase + rows - 1) * n4) * e,
+                                       (size_t)n4 * e, hipMemcpyDeviceToDevice, stream_),
+                        "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
+        if (sq.mtp_ws.verify_done_event)
+            STRIX_HIP_CHECK(hipEventRecord(sq.mtp_ws.verify_done_event, stream_), "record verify_done_event on keep_verify_prefix");
+    }
     for (int64_t i = 0; i < D.layers; ++i) {
         const Qwen4ExpModel::Layer &l = m_.layer(i);
         const size_t li = (size_t)i;
@@ -3371,25 +3390,9 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
                                        (size_t)(S * n4) * e, hipMemcpyDeviceToDevice, stream_),
                         "Qwen4ExpSession::keep_verify_prefix: PLE state");
     }
-    if (mtp_) {
-        // The MTP layer's projections of this state's rows are in proj_ at sq.verify_row_base (0 for a
-        // single-sequence verify, the run's row base for a batched one); its streams are still in x_.
-        const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        const int64_t rbase = sq.verify_row_base;
-        constexpr int64_t mtp_qkv_stride = 1664;
-        constexpr int64_t mtp_idx_k_offset = 1536;
-        kernels::qsa_block_keys(proj_.get() + (size_t)(rbase * mtp_qkv_stride + mtp_idx_k_offset) * e,
-                                mtp_qkv_stride, rows, p0,
-                                p0 % kernels::kQsaBlock ? sq.tail_mtp[sq.verify_mtp_tail_cur].get() : nullptr,
-                                sq.tail_mtp[1 - sq.verify_mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_, m_.rope_scale(), mk_block_, sq.rope_delta);
-        STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), x_.get() + (size_t)((rbase + rows - 1) * n4) * e,
-                                       (size_t)n4 * e, hipMemcpyDeviceToDevice, stream_),
-                        "Qwen4ExpSession::keep_verify_prefix: MTP previous streams");
-        if (sq.mtp_ws.verify_done_event)
-            STRIX_HIP_CHECK(hipEventRecord(sq.mtp_ws.verify_done_event, stream_), "record verify_done_event on keep_verify_prefix");
+    if (mk_block_.pos3 != nullptr) {
+        STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::keep_verify_prefix");
     }
-    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::keep_verify_prefix");
     // The n-gram history: the one before the verify, advanced over the kept ids.
     PleHistory h = sq.verify_hist;
     if (D.ple_layer >= 0) {
@@ -3476,7 +3479,8 @@ void Qwen4ExpSession::mtp_input_seq(Qwen4ExpSeqState &sq, int32_t token_id, cons
     const Qwen4ExpModel::MtpHead &mtp = m_.mtp();
     hipStream_t stream = ws.stream;
 
-    STRIX_HIP_CHECK(hipMemcpyAsync(ws.ids.get(), &token_id, sizeof(int32_t), hipMemcpyHostToDevice, stream),
+    *reinterpret_cast<int32_t *>(ws.host_ids.get()) = token_id;
+    STRIX_HIP_CHECK(hipMemcpyAsync(ws.ids.get(), ws.host_ids.get(), sizeof(int32_t), hipMemcpyHostToDevice, stream),
                     "uploading MTP token id");
     kernels::reset_embedding_error(ws.emb_err.get(), stream);
 

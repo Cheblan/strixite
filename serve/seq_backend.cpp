@@ -373,7 +373,7 @@ std::vector<float> SeqBackend::forward(const std::vector<int32_t> &ids, int64_t 
 }
 
 void SeqBackend::set_lookahead(const std::vector<int32_t> &next_ids) {
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { arb_.backend().set_lookahead(next_ids); });
+    arb_.run_concurrent(seq_, true, [&] { arb_.backend().set_lookahead(next_ids); });
 }
 
 Top2 SeqBackend::forward_mtp_top2(int32_t token_id, int64_t step) {
@@ -414,7 +414,7 @@ LogitRows SeqBackend::forward_image_prefill(const std::vector<int32_t> &ids, con
 }
 
 void SeqBackend::prefetch_ple(const std::vector<int32_t> &ids, int64_t first) {
-    arb_.run(seq_, GpuArbiter::Kind::Hint, [&] { arb_.backend().prefetch_ple(seq_, ids, first); });
+    arb_.run_concurrent(seq_, true, [&] { arb_.backend().prefetch_ple(seq_, ids, first); });
 }
 
 void SeqBackend::keep_verify() {
