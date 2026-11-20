@@ -96,56 +96,104 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
         const uint16_t *mrow = minv + n * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
             if constexpr (std::is_same_v<TX, uint16_t>) {
-                uint4 u0[MR], u1[MR], u2[MR], u3[MR];
+                if constexpr (MR <= 8) {
+                    uint4 u0[MR], u1[MR], u2[MR], u3[MR];
 #pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    if (r < rows) {
-                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
-                        u0[r] = xp[0];
-                        u1[r] = xp[1];
-                        u2[r] = xp[2];
-                        u3[r] = xp[3];
+                    for (int r = 0; r < MR; ++r) {
+                        if (r < rows) {
+                            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                            u0[r] = xp[0];
+                            u1[r] = xp[1];
+                            u2[r] = xp[2];
+                            u3[r] = xp[3];
+                        }
                     }
-                }
 
-                const uint4 packed = qrow[k / kChunk];
-                const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-                const float s = bf16_bits_to_f32(srow[k / G]);
-                const float mn = bf16_bits_to_f32(mrow[k / G]);
+                    const uint4 packed = qrow[k / kChunk];
+                    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+                    const float s = bf16_bits_to_f32(srow[k / G]);
+                    const float mn = bf16_bits_to_f32(mrow[k / G]);
 
-                uint32_t cp[kChunk / 2];
+                    uint32_t cp[kChunk / 2];
 #pragma unroll
-                for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+                    for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
 
 #pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    if (r < rows) {
-                        const uint32_t xw0[4] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w};
-                        const uint32_t xw1[4] = {u1[r].x, u1[r].y, u1[r].z, u1[r].w};
-                        const uint32_t xw2[4] = {u2[r].x, u2[r].y, u2[r].z, u2[r].w};
-                        const uint32_t xw3[4] = {u3[r].x, u3[r].y, u3[r].z, u3[r].w};
-                        float dot = 0.f, xsum = 0.f;
+                    for (int r = 0; r < MR; ++r) {
+                        if (r < rows) {
+                            const uint32_t xw0[4] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w};
+                            const uint32_t xw1[4] = {u1[r].x, u1[r].y, u1[r].z, u1[r].w};
+                            const uint32_t xw2[4] = {u2[r].x, u2[r].y, u2[r].z, u2[r].w};
+                            const uint32_t xw3[4] = {u3[r].x, u3[r].y, u3[r].z, u3[r].w};
+                            float dot = 0.f, xsum = 0.f;
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            dot = dot2(xw0[j], cp[j], dot);
-                            xsum = dot2(xw0[j], kOnePair, xsum);
-                        }
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw0[j], cp[j], dot);
+                                xsum = dot2(xw0[j], kOnePair, xsum);
+                            }
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            dot = dot2(xw1[j], cp[4 + j], dot);
-                            xsum = dot2(xw1[j], kOnePair, xsum);
-                        }
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw1[j], cp[4 + j], dot);
+                                xsum = dot2(xw1[j], kOnePair, xsum);
+                            }
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            dot = dot2(xw2[j], cp[8 + j], dot);
-                            xsum = dot2(xw2[j], kOnePair, xsum);
-                        }
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw2[j], cp[8 + j], dot);
+                                xsum = dot2(xw2[j], kOnePair, xsum);
+                            }
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            dot = dot2(xw3[j], cp[12 + j], dot);
-                            xsum = dot2(xw3[j], kOnePair, xsum);
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw3[j], cp[12 + j], dot);
+                                xsum = dot2(xw3[j], kOnePair, xsum);
+                            }
+                            acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                         }
-                        acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
+                    }
+                } else {
+                    const uint4 packed = qrow[k / kChunk];
+                    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+                    const float s = bf16_bits_to_f32(srow[k / G]);
+                    const float mn = bf16_bits_to_f32(mrow[k / G]);
+
+                    uint32_t cp[kChunk / 2];
+#pragma unroll
+                    for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair(words, p);
+
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        if (r < rows) {
+                            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                            const uint4 u0_val = xp[0];
+                            const uint4 u1_val = xp[1];
+                            const uint4 u2_val = xp[2];
+                            const uint4 u3_val = xp[3];
+                            const uint32_t xw0[4] = {u0_val.x, u0_val.y, u0_val.z, u0_val.w};
+                            const uint32_t xw1[4] = {u1_val.x, u1_val.y, u1_val.z, u1_val.w};
+                            const uint32_t xw2[4] = {u2_val.x, u2_val.y, u2_val.z, u2_val.w};
+                            const uint32_t xw3[4] = {u3_val.x, u3_val.y, u3_val.z, u3_val.w};
+                            float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw0[j], cp[j], dot);
+                                xsum = dot2(xw0[j], kOnePair, xsum);
+                            }
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw1[j], cp[4 + j], dot);
+                                xsum = dot2(xw1[j], kOnePair, xsum);
+                            }
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw2[j], cp[8 + j], dot);
+                                xsum = dot2(xw2[j], kOnePair, xsum);
+                            }
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dot = dot2(xw3[j], cp[12 + j], dot);
+                                xsum = dot2(xw3[j], kOnePair, xsum);
+                            }
+                            acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
+                        }
                     }
                 }
                 continue;

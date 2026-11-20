@@ -16,6 +16,7 @@ double now_s() {
 GpuArbiter::GpuArbiter(LmBackend &be)
     : be_(be),
       epoch_((size_t)be.n_seqs(), 0),
+      last_prefill_batch_(-kPrefillYieldBatches),
       concurrent_((size_t)be.n_seqs(), 0) {
     STRIX_CHECK(be.n_seqs() >= 1, "GpuArbiter: the backend holds ", be.n_seqs(), " conversations, expected >= 1");
 }
@@ -53,25 +54,22 @@ bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
     if (kind == Kind::Resolve) return resolving_.count(seq) > 0;
     if (!resolving_.empty()) return false;  // the batch's resolutions first (its shared workspaces)
 
-    // A batch ready to go runs before a new call.
-    if (lead_ready_locked(now_s())) return false;
-
-    // If any verify run is waiting for the GPU, an exclusive Call must not preempt it!
-    // The batched verify forward takes ~35 ms; running an exclusive prefill chunk here
-    // would lock the GPU for 500-2500 ms and starve the waiting decode slots.
-    if (has_pending_verifies_locked()) return false;
+    // Batch runs before heavy Prefill, but lightweight Call (restore_snapshot, short prefill <= 128)
+    // must slip in so waiting slots can join the active decode batch immediately.
+    if (kind == Kind::Prefill && lead_ready_locked(now_s())) return false;
+    if (kind == Kind::Prefill && has_pending_verifies_locked()) return false;
 
     // Deficit Round Robin Event-Driven Quantum Interleaving:
     // If other slots are actively decoding and this slot is running an exclusive prefill chunk (not decoding itself),
     // it must yield until active decode slots complete their quantum of verify batches.
-    if (kind == Kind::Call && others_decoding_locked(seq) && !decoding_.count(seq)) {
+    if (kind == Kind::Prefill && others_decoding_locked(seq) && !decoding_.count(seq)) {
         if (stats_.verify_batches - last_prefill_batch_ < kPrefillYieldBatches) {
             return false;  // yield GPU until active decode slots run their verify batch quantum
         }
         // Fair round-robin across concurrent prefill slots:
         // If this slot was the last one to run a prefill chunk and another prefill slot is waiting, let the other run first.
-        if (last_prefill_seq_ == seq && calls_waiting_.size() > 1) {
-            for (int s : calls_waiting_) {
+        if (last_prefill_seq_ == seq && prefill_waiting_.size() > 1) {
+            for (int s : prefill_waiting_) {
                 if (s != seq && !decoding_.count(s)) {
                     return false;
                 }
@@ -88,19 +86,7 @@ bool GpuArbiter::poisoned_locked(int seq) const {
 
 bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     if (kind == Kind::Draft) {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            check_ok_locked(seq);
-        }
-        try {
-            f();
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(mu_);
-            if (be_.failed()) fail_locked();
-            cv_.notify_all();
-            throw;
-        }
-        return true;
+        return run_concurrent(seq, false, f);
     }
 
     std::unique_lock<std::mutex> lock(mu_);
@@ -110,12 +96,17 @@ bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     if (kind == Kind::Hint && poisoned_locked(seq)) return false;
     check_ok_locked(seq);
     const bool call = kind == Kind::Call;
-    auto waiting = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
+    const bool prefill = kind == Kind::Prefill;
+    auto waiting_call = call ? calls_waiting_.insert(seq) : calls_waiting_.end();
+    auto waiting_prefill = prefill ? prefill_waiting_.insert(seq) : prefill_waiting_.end();
     while (!failed_ && !can_run_locked(seq, kind)) {
         cv_.wait(lock);
     }
     if (call) {
-        calls_waiting_.erase(waiting);
+        calls_waiting_.erase(waiting_call);
+    }
+    if (prefill) {
+        prefill_waiting_.erase(waiting_prefill);
         if (!decoding_.count(seq)) {
             last_prefill_batch_ = stats_.verify_batches;
             last_prefill_seq_ = seq;
@@ -176,7 +167,7 @@ bool GpuArbiter::run_concurrent(int seq, bool advisory, const std::function<void
 }
 
 bool GpuArbiter::lead_ready_locked(double now) const {
-    if (busy_ || !resolving_.empty()) return false;
+    if (busy_ || !resolving_.empty() || !calls_waiting_.empty()) return false;
     double first = 0;
     int waiting = 0;
     bool first_alone = false;  // the oldest waiting run can't share a forward: no partner to wait for
@@ -193,10 +184,10 @@ bool GpuArbiter::lead_ready_locked(double now) const {
 }
 
 double GpuArbiter::batch_wait_locked() const {
-    if (!calls_waiting_.empty()) {
+    if (!calls_waiting_.empty() || !prefill_waiting_.empty()) {
         return kBatchWaitMinSeconds;
     }
-    return std::clamp(0.4 * last_batch_seconds_, kBatchWaitMinSeconds, kBatchWaitMaxSeconds);
+    return std::clamp(0.12 * last_batch_seconds_, kBatchWaitMinSeconds, kBatchWaitMaxSeconds);
 }
 
 void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
@@ -302,7 +293,10 @@ void GpuArbiter::reset(int seq) {
     lock.lock();
     busy_ = false;
     if (!err) {
-        if (whole) failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
+        if (whole) {
+            failed_ = false;  // the other seqs' epochs stay behind: each resets before its next call
+            last_prefill_batch_ = -kPrefillYieldBatches;
+        }
         epoch_[(size_t)seq] = failures_;
         if (last_prefill_seq_ == seq) last_prefill_seq_ = -1;
         resolving_.erase(seq);
@@ -389,7 +383,8 @@ std::vector<float> SeqBackend::forward_verify(const std::vector<int32_t> &ids, i
 LogitRows SeqBackend::forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                                    const LogitMasks *masks) {
     LogitRows l;
-    arb_.run(seq_, GpuArbiter::Kind::Call,
+    const GpuArbiter::Kind k = (ids.size() > 128) ? GpuArbiter::Kind::Prefill : GpuArbiter::Kind::Call;
+    arb_.run(seq_, k,
              [&] { l = arb_.backend().forward_rows(seq_, ids, n_logits, cands, n_valid, masks); });
     return l;
 }
@@ -407,7 +402,7 @@ LogitRows SeqBackend::forward_image_prefill(const std::vector<int32_t> &ids, con
                                             const std::vector<int64_t> &pos3, int64_t n_logits, bool cands,
                                             int64_t n_valid, const LogitMasks *masks) {
     LogitRows l;
-    arb_.run(seq_, GpuArbiter::Kind::Call, [&] {
+    arb_.run(seq_, GpuArbiter::Kind::Prefill, [&] {
         l = arb_.backend().forward_image_prefill(seq_, ids, image, pos3, n_logits, cands, n_valid, masks);
     });
     return l;

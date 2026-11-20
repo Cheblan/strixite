@@ -35,7 +35,8 @@ public:
     const LmBackend &backend() const { return be_; }
 
     enum class Kind {
-        Call,     // a plain call (a forward, a snapshot, an import, a reset); ends the seq's draft chain
+        Call,     // a plain call (a snapshot, an import, a reset); ends the seq's draft chain
+        Prefill,  // a heavy prefill forward chunk (forward_rows / forward_image_prefill); yields under DRR
         Draft,    // a draft step: step 0 starts the seq's chain, the GPU stays the seq's until it verifies / forwards
         Resolve,  // keep / drop of the seq's run of the batched verify awaiting resolution
         Hint,     // prefetch / lookahead / reads: never blocked by a chain or a pending batch
@@ -67,7 +68,7 @@ public:
 
     // How long a waiting verify holds its batch for a decoding seq that hasn't sent its own yet,
     // within [kBatchWaitMinSeconds, kBatchWaitMaxSeconds].
-    static constexpr double kBatchWaitMinSeconds = 0.010, kBatchWaitMaxSeconds = 0.020;
+    static constexpr double kBatchWaitMinSeconds = 0.002, kBatchWaitMaxSeconds = 0.008;
     static constexpr int64_t kPrefillYieldBatches = 4;
     double batch_wait_locked() const;
 
@@ -116,7 +117,8 @@ private:
     // chunk can execute before decode receives another verify quantum, eliminating multi-slot prefill
     // gang-up and reducing inter-token latency spikes.
     std::multiset<int> calls_waiting_;
-    int64_t last_prefill_batch_ = 0;        // stats_.verify_batches when the last prefill chunk ran
+    std::multiset<int> prefill_waiting_;
+    int64_t last_prefill_batch_ = -kPrefillYieldBatches;  // stats_.verify_batches when the last prefill chunk ran
     int last_prefill_seq_ = -1;             // seq that ran the last prefill chunk (for round-robin)
     std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
     int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
