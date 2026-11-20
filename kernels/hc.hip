@@ -210,13 +210,40 @@ __global__ void __launch_bounds__(kThreads)
             for (int i = 0; i < BITS; ++i) words[i] = nwords[i];
             const float sc = nsc, mn = nmn;
             if (c + 1 < r / kChunk) fetch(c + 1);
+
+            float dot[MT] = {};
+#pragma unroll
+            for (int s4 = 0; s4 < 8; ++s4) {
+                float w0, w1, w2, w3;
+                if constexpr (BITS == 8) {
+                    const uint32_t w = words[s4];
+                    w0 = (float)(w & 0xFFu);
+                    w1 = (float)((w >> 8) & 0xFFu);
+                    w2 = (float)((w >> 16) & 0xFFu);
+                    w3 = (float)((w >> 24) & 0xFFu);
+                } else {
+                    const uint32_t w = words[s4 >> 1] >> ((s4 & 1) * 16);
+                    w0 = (float)(w & 0xFu);
+                    w1 = (float)((w >> 4) & 0xFu);
+                    w2 = (float)((w >> 8) & 0xFu);
+                    w3 = (float)((w >> 12) & 0xFu);
+                }
+#pragma unroll
+                for (int tt = 0; tt < MT; ++tt) {
+                    if (tt < nt) {
+                        const float4 h4 = *reinterpret_cast<const float4 *>(&hs[tt][c * kChunk + 4 * s4]);
+                        dot[tt] = fmaf(h4.x, w0, dot[tt]);
+                        dot[tt] = fmaf(h4.y, w1, dot[tt]);
+                        dot[tt] = fmaf(h4.z, w2, dot[tt]);
+                        dot[tt] = fmaf(h4.w, w3, dot[tt]);
+                    }
+                }
+            }
 #pragma unroll
             for (int tt = 0; tt < MT; ++tt) {
-                if (tt >= nt) break;
-                float dot = 0.f;
-#pragma unroll
-                for (int i = 0; i < kChunk; ++i) dot = fmaf(hs[tt][c * kChunk + i], code<BITS>(words, i), dot);
-                acc[tt] = fmaf(sc, dot, fmaf(mn, hsums[tt][c], acc[tt]));
+                if (tt < nt) {
+                    acc[tt] = fmaf(sc, dot[tt], fmaf(mn, hsums[tt][c], acc[tt]));
+                }
             }
         }
         const float nw = 1.0f + norm_w[row];
@@ -259,9 +286,11 @@ __global__ void __launch_bounds__(kThreads)
 int split_k(int64_t T) { return T == 1 ? 2 : 1; }
 int rows_per_wave(int64_t T) { return T == 1 ? 1 : 2; }
 
-// Tokens per block (MT) for hc_mix_up: every token of a block shares each weight load. The instantiated sizes; a
-// verify is T = drafts + 1 = 5; above 8 the tokens go in blocks of 8 (a partial last block).
-int tokens_per_block(int64_t T) { return T == 1 ? 1 : T == 2 ? 2 : T <= 4 ? 4 : T == 5 ? 5 : 8; }
+// Tokens per block (MT) for hc_mix_up: every token of a block shares each weight load. Instantiated for 1..8.
+int tokens_per_block(int64_t T) {
+    if (T <= 8) return (int)T;
+    return 8;
+}
 
 // A weight's arrays whichever format it's in (the kernels take raw pointers + BITS).
 struct QArrays {
@@ -360,8 +389,11 @@ void mix_up(const float *h, const QArrays &w_up, const void *x, const float *nor
     switch (MT) {                                                                               \
         case 1: STRIX_HC_UP_MT(TT, G, 1); break;                                                \
         case 2: STRIX_HC_UP_MT(TT, G, 2); break;                                                \
+        case 3: STRIX_HC_UP_MT(TT, G, 3); break;                                                \
         case 4: STRIX_HC_UP_MT(TT, G, 4); break;                                                \
         case 5: STRIX_HC_UP_MT(TT, G, 5); break;                                                \
+        case 6: STRIX_HC_UP_MT(TT, G, 6); break;                                                \
+        case 7: STRIX_HC_UP_MT(TT, G, 7); break;                                                \
         default: STRIX_HC_UP_MT(TT, G, 8); break;                                               \
     }
 #define STRIX_HC_UP_G(TT)                                                                       \
