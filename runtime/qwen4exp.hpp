@@ -442,6 +442,7 @@ struct MtpDraftWorkspace {
     DeviceBuffer<float> logits;
     DeviceBuffer<uint8_t> mtp_pick;
     PinnedHostBuffer host_pick;
+    PinnedHostBuffer host_ids;
     DeviceBuffer<float> qsa_scores;
     DeviceBuffer<int32_t> qsa_sel, qsa_nsel;
     DeviceBuffer<uint8_t> qsa_topk_ws;
