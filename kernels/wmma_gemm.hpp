@@ -27,6 +27,14 @@ constexpr int kWmmaThreads = 256;       // 8 waves of 32
 
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
 
+// A workgroup barrier that orders LDS only: __syncthreads' workgroup fence also waits
+// for every global load in flight (s_waitcnt vmcnt(0)), which drains the K loops' loads issued ahead.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 __device__ inline uint16_t wmma_f32_to_bf16(float f) {
     uint32_t u = __float_as_uint(f);
     if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t)((u >> 16) | ((u & 0x007fffffu) ? 0x0040u : 0u));

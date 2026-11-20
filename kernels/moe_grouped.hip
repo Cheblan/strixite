@@ -56,14 +56,6 @@ __device__ inline float get_partial(const float *p, int64_t i, bool bf16) {
     return bf16 ? bf16_bits_to_f32(reinterpret_cast<const uint16_t *>(p)[i]) : p[i];
 }
 
-// A workgroup barrier that orders LDS only (as attention.hip's lds_barrier): __syncthreads' workgroup fence also waits
-// for every global load in flight (s_waitcnt vmcnt(0)), which drains the K loops' loads issued ahead.
-__device__ __forceinline__ void lds_barrier() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
-}
-
 __device__ inline void load_x32(const float *x, int64_t off, float (&v)[kChunk]) {
     const float4 *p = reinterpret_cast<const float4 *>(x + off);
 #pragma unroll

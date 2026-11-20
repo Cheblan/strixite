@@ -43,13 +43,13 @@ __global__ void __launch_bounds__(kWmmaThreads)
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         xt.stage(xs, rs);
         wt.stage(ws, sw, mw);
-        __syncthreads();
+        lds_barrier();
         if (k0 + kWmmaKC < K) {
             xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
             wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
         }
         wmma_step_scaled<TM, 2, G>(xs, ws, rs, sw, mw, k0, wm * (BMT / 2), wn * 32, acc);
-        __syncthreads();
+        lds_barrier();
     }
 #pragma unroll
     for (int i = 0; i < TM; ++i)
@@ -89,17 +89,17 @@ __global__ void __launch_bounds__(kWmmaThreads)
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         if (wt.win) {  // uniform: depends on k0 only
             wt.stage_window(sw, mw);
-            __syncthreads();
+            lds_barrier();
         }
         xt.stage_f16(xs);
         wt.stage_f16(ws, sw, mw, k0);
-        __syncthreads();
+        lds_barrier();
         if (k0 + kWmmaKC < K) {
             xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
             wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
         }
         wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
-        __syncthreads();
+        lds_barrier();
     }
 #pragma unroll
     for (int i = 0; i < TM; ++i)
@@ -131,13 +131,13 @@ __global__ void __launch_bounds__(kWmmaThreads)
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         xt.stage(xs, nullptr);
         wt.stage(ws);
-        __syncthreads();
+        lds_barrier();
         if (k0 + kWmmaKC < K) {
             xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
             wt.fetch(w, n0, rows_w, K, k0 + kWmmaKC);
         }
         wmma_step<2, 2>(xs, ws, wm * 32, wn * 32, acc);
-        __syncthreads();
+        lds_barrier();
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i)
