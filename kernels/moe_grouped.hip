@@ -85,21 +85,25 @@ __device__ inline void load_x32(const uint16_t *x, int64_t off, float (&v)[kChun
 constexpr int RW = kMoeWmmaTileRows, RX = kMoeWmmaWideRows;
 struct RouteLayout {
     int64_t S, E, Tmax, WTmax, XTmax;
-    int64_t offsets() const { return 4; }
-    int64_t slots() const { return offsets() + E + 2; }
-    int64_t tile_bucket() const { return slots() + S; }
-    int64_t tile_start() const { return tile_bucket() + Tmax; }
-    int64_t wtile_bucket() const { return tile_start() + Tmax; }
-    int64_t wtile_start() const { return wtile_bucket() + WTmax; }
-    int64_t xtile_bucket() const { return wtile_start() + WTmax; }
-    int64_t xtile_start() const { return xtile_bucket() + XTmax; }
-    int64_t n_xtiles() const { return xtile_start() + XTmax; }
-    int64_t ints() const { return n_xtiles() + 1; }
+    __host__ __device__ int64_t offsets() const { return 4; }
+    __host__ __device__ int64_t slots() const { return offsets() + E + 2; }
+    __host__ __device__ int64_t tile_bucket() const { return slots() + S; }
+    __host__ __device__ int64_t tile_start() const { return tile_bucket() + Tmax; }
+    __host__ __device__ int64_t wtile_bucket() const { return tile_start() + Tmax; }
+    __host__ __device__ int64_t wtile_start() const { return wtile_bucket() + WTmax; }
+    __host__ __device__ int64_t xtile_bucket() const { return wtile_start() + WTmax; }
+    __host__ __device__ int64_t xtile_start() const { return xtile_bucket() + XTmax; }
+    __host__ __device__ int64_t n_xtiles() const { return xtile_start() + XTmax; }
+    __host__ __device__ int64_t ints() const { return n_xtiles() + 1; }
 };
-RouteLayout route_layout(int64_t M, int64_t A, int64_t E) {
-    const int64_t S = M * A;
-    // sum over buckets of ceil(count / R) <= S / R + (E + 1), likewise for RW and RX
-    return {S, E, S / R + E + 2, S / RW + E + 2, S / RX + E + 2};
+__host__ __device__ inline RouteLayout route_layout(int64_t S, int64_t E) {
+    const int64_t Tmax = S <= 0 ? 0 : (S < S / R + E + 2 ? S : S / R + E + 2);
+    const int64_t WTmax = S <= 0 ? 0 : (S < S / RW + E + 2 ? S : S / RW + E + 2);
+    const int64_t XTmax = S <= 0 ? 0 : (S < S / RX + E + 2 ? S : S / RX + E + 2);
+    return {S, E, Tmax, WTmax, XTmax};
+}
+inline RouteLayout route_layout(int64_t M, int64_t A, int64_t E) {
+    return route_layout(M * A, E);
 }
 
 // Exclusive scan of v over the block's kRouteThreads threads (Hillis-Steele in LDS); returns the prefix, *total
@@ -192,9 +196,9 @@ __global__ void __launch_bounds__(kThreads)
     const int32_t n_tiles = ws[0], S = ws[1], E = ws[2];
     const int64_t tile = blockIdx.y;
     if (tile >= n_tiles) return;  // the bound over-provisions tiles; uniform per block, before any barrier
+    const RouteLayout L = route_layout(S, E);
     const int32_t *offsets = ws + 4, *slots = offsets + E + 2, *tile_bucket = slots + S;
-    const int64_t Tmax = (int64_t)S / R + E + 2;
-    const int32_t *tile_start = tile_bucket + Tmax;
+    const int32_t *tile_start = tile_bucket + L.Tmax;
     const int32_t bucket = tile_bucket[tile], st = tile_start[tile];
     const int rows = min(R, offsets[bucket + 1] - st);
     if ((int)threadIdx.x < rows) {
@@ -285,10 +289,10 @@ __global__ void __launch_bounds__(kWmmaThreads)
     const int32_t S = ws[1], E = ws[2], n_tiles = TR == R ? ws[0] : ws[3];
     const int64_t tile = blockIdx.y;
     if (tile >= n_tiles) return;  // uniform per block, before any barrier
+    const RouteLayout L = route_layout(S, E);
     const int32_t *offsets = ws + 4, *slots = offsets + E + 2;
-    const int64_t Tmax = (int64_t)S / R + E + 2, WTmax = (int64_t)S / RW + E + 2;
-    const int32_t *tile_bucket = TR == R ? slots + S : slots + S + 2 * Tmax;
-    const int32_t *tile_start = tile_bucket + (TR == R ? Tmax : WTmax);
+    const int32_t *tile_bucket = TR == R ? slots + S : slots + S + 2 * L.Tmax;
+    const int32_t *tile_start = tile_bucket + (TR == R ? L.Tmax : L.WTmax);
     const int32_t bucket = tile_bucket[tile], st = tile_start[tile];
     const int rows = min(TR, offsets[bucket + 1] - st), tm = (rows + 15) / 16;
     if ((int)threadIdx.x < rows) {
@@ -372,9 +376,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
     const int32_t S = ws[1], E = ws[2], n_tiles = ws[3];
     const int64_t tile = blockIdx.y;
     if (tile >= n_tiles) return;  // uniform per block, before any barrier
+    const RouteLayout L = route_layout(S, E);
     const int32_t *offsets = ws + 4, *slots = offsets + E + 2;
-    const int64_t Tmax = (int64_t)S / R + E + 2, WTmax = (int64_t)S / RW + E + 2;
-    const int32_t *tile_bucket = slots + S + 2 * Tmax, *tile_start = tile_bucket + WTmax;
+    const int32_t *tile_bucket = slots + S + 2 * L.Tmax, *tile_start = tile_bucket + L.WTmax;
     const int32_t bucket = tile_bucket[tile], st = tile_start[tile];
     const int rows = min(TR, offsets[bucket + 1] - st), tm = (rows + 15) / 16;
     if ((int)threadIdx.x < rows) {
@@ -442,7 +446,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
 #pragma unroll
             for (int p = 0; p < kPasses; ++p) {
                 const int seg = (int)threadIdx.x + p * kWmmaThreads;
-                if (seg >= TR * kSegs) break;  // wave-uniform
+                if (seg >= TMA * 16 * kSegs) break;  // wave-uniform
                 uint32_t h[4];
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
@@ -547,11 +551,11 @@ __global__ void __launch_bounds__(kWmmaThreads)
     __shared__ uint16_t sw[kWmmaBN * WT::kWin], mw[kWmmaBN * WT::kWin];
     __shared__ int64_t xoff[TR], ooff[TR];
     const int32_t S = ws[1], E = ws[2];
-    const int64_t Tmax = (int64_t)S / R + E + 2, WTmax = (int64_t)S / RW + E + 2, XTmax = (int64_t)S / RX + E + 2;
+    const RouteLayout L = route_layout(S, E);
     const int32_t *offsets = ws + 4, *slots = offsets + E + 2;
-    const int32_t *xtile_bucket = slots + S + 2 * Tmax + 2 * WTmax, *xtile_start = xtile_bucket + XTmax;
+    const int32_t *xtile_bucket = slots + S + 2 * L.Tmax + 2 * L.WTmax, *xtile_start = xtile_bucket + L.XTmax;
     const int64_t tile = blockIdx.y;
-    if (tile >= xtile_start[XTmax]) return;  // n_xtiles; uniform per block, before any barrier
+    if (tile >= xtile_start[L.XTmax]) return;  // n_xtiles; uniform per block, before any barrier
     const int32_t bucket = xtile_bucket[tile], st = xtile_start[tile];
     const int rows = min(TR, offsets[bucket + 1] - st), nt = (rows + 15) / 16;
     constexpr int kCols = SWI ? kHalf : kWmmaBN;
@@ -704,11 +708,11 @@ __global__ void __launch_bounds__(kWmmaThreads)
     __shared__ __attribute__((aligned(16))) uint16_t xs[TR * LD], wsm[BW * LD];
     __shared__ int64_t xoff[TR], ooff[TR];
     const int32_t S = ws[1], E = ws[2];
-    const int64_t Tmax = (int64_t)S / R + E + 2, WTmax = (int64_t)S / RW + E + 2, XTmax = (int64_t)S / RX + E + 2;
+    const RouteLayout L = route_layout(S, E);
     const int32_t *offsets = ws + 4, *slots = offsets + E + 2;
-    const int32_t *xtile_bucket = slots + S + 2 * Tmax + 2 * WTmax, *xtile_start = xtile_bucket + XTmax;
+    const int32_t *xtile_bucket = slots + S + 2 * L.Tmax + 2 * L.WTmax, *xtile_start = xtile_bucket + L.XTmax;
     const int64_t tile = blockIdx.y;
-    if (tile >= xtile_start[XTmax]) return;  // n_xtiles; uniform per block, before any barrier
+    if (tile >= xtile_start[L.XTmax]) return;  // n_xtiles; uniform per block, before any barrier
     const int32_t bucket = xtile_bucket[tile], st = xtile_start[tile];
     const int rows = min(TR, offsets[bucket + 1] - st), nt = (rows + 15) / 16;
     constexpr int kCols = SWI ? BW / 2 : BW;

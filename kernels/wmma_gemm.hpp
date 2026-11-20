@@ -386,6 +386,7 @@ struct WmmaXTile {
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
             b[p][0] = b[p][1] = b[p][2] = b[p][3] = 0;
+            if (p > 0 && rows_valid <= p * (kWmmaThreads / kSegs)) continue;
             if (seg >= BM * kSegs || r >= rows_valid) continue;
             const T *src = x + xoff[r] + k0 + (seg % kSegs) * 8;
             if constexpr (sizeof(T) == 2) {
@@ -405,6 +406,7 @@ struct WmmaXTile {
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
             b[p][0] = b[p][1] = b[p][2] = b[p][3] = 0;
+            if (p > 0 && rows_valid <= p * (kWmmaThreads / kSegs)) continue;
             if (seg >= BM * kSegs || r >= rows_valid) continue;
             const T *src = x + (m0 + r) * K + k0 + (seg % kSegs) * 8;
             if constexpr (sizeof(T) == 2) {
@@ -463,6 +465,7 @@ struct WmmaXTileF32ToF16 {
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
             b[p][0] = b[p][1] = b[p][2] = b[p][3] = 0;
+            if (p > 0 && rows_valid <= p * (kWmmaThreads / kSegs)) continue;
             if (seg >= BM * kSegs || r >= rows_valid) continue;
             const float *src = x + xoff[r] + k0 + (seg % kSegs) * 8;
             const float4 f0 = reinterpret_cast<const float4 *>(src)[0], f1 = reinterpret_cast<const float4 *>(src)[1];
