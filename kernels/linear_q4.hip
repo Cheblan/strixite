@@ -96,7 +96,7 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
         const uint16_t *mrow = minv + n * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
             if constexpr (std::is_same_v<TX, uint16_t>) {
-                if constexpr (MR <= 8) {
+                if constexpr (MR <= 11) {
                     uint4 u0[MR], u1[MR], u2[MR], u3[MR];
 #pragma unroll
                     for (int r = 0; r < MR; ++r) {
@@ -199,25 +199,21 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
                 continue;
             }
 
-            float xv[MR][kChunk];
-#pragma unroll
-            for (int r = 0; r < MR; ++r) {
-                if (r < rows) load_x32(x, (m0 + r) * K + k, xv[r]);
-            }
-
             const uint4 packed = qrow[k / kChunk];
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
             const float mn = bf16_bits_to_f32(mrow[k / G]);
 
-#pragma unroll
+#pragma nounroll
             for (int r = 0; r < MR; ++r) {
                 if (r < rows) {
+                    float xv[kChunk];
+                    load_x32(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
                     for (int i = 0; i < kChunk; ++i) {
-                        dot = fmaf(xv[r][i], (float)((words[i / 8] >> (4 * (i % 8))) & 0xFu), dot);
-                        xsum += xv[r][i];
+                        dot = fmaf(xv[i], (float)((words[i / 8] >> (4 * (i % 8))) & 0xFu), dot);
+                        xsum += xv[i];
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -438,12 +434,18 @@ template <typename TX, typename TY>
 void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t stream) {
     // Rows of x per weight pass: as many as there are, up to kRowsPerPass - fewer accumulators for short M
     // (MTP verify, M = 2-5) keep the occupancy of the M = 1 kernel.
+    // Exact short-M unrolling for MTP speculative verify and batched verification (M = 1-11)
     if (M == 1) launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
     else if (M == 2) launch_mr<TX, TY, 2>(x, w, y, M, split_k(w.K), stream);
     else if (M == 3) launch_mr<TX, TY, 3>(x, w, y, M, split_k(w.K), stream);
     else if (M == 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
     else if (M == 5) launch_mr<TX, TY, 5>(x, w, y, M, split_k(w.K), stream);
-    else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 6) launch_mr<TX, TY, 6>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 7) launch_mr<TX, TY, 7>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 8) launch_mr<TX, TY, 8>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 9) launch_mr<TX, TY, 9>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 10) launch_mr<TX, TY, 10>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 11) launch_mr<TX, TY, 11>(x, w, y, M, split_k(w.K), stream);
     else launch_mr<TX, TY, kWideRowsPerPass>(x, w, y, M, split_k(w.K), stream);
 }
 

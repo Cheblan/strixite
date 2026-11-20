@@ -20,11 +20,11 @@ struct Part {
     uint32_t nan;
 };
 
-__device__ inline Part merge(const Part &a, const Part &b) {
+__device__ inline Part merge(Part a, Part b) {
     if (b.i1 == INT_MAX) return {a.b1, a.b2, a.i1, a.nan | b.nan};
     if (a.i1 == INT_MAX) return {b.b1, b.b2, b.i1, a.nan | b.nan};
     const bool a_wins = a.b1 > b.b1 || (a.b1 == b.b1 && a.i1 < b.i1);
-    const Part &w = a_wins ? a : b, &l = a_wins ? b : a;
+    const Part w = a_wins ? a : b, l = a_wins ? b : a;
     // The loser's best is at least its own runner-up, so it and the winner's runner-up are the candidates.
     return {w.b1, fmaxf(w.b2, l.b1), w.i1, a.nan | b.nan};
 }

@@ -198,7 +198,13 @@ void launch(const TX *x, const View &w, TY *y, int64_t M, hipStream_t stream) {
             }
         } else {
             switch (w.G) {
-                case 32: linear_wmma_kernel<TX, TY, BITS, 32, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
+                case 32: {
+                    // For BITS 5 and 6, G=32 at BMT=128 exceeds 256 VGPRs and spills to DRAM scratch.
+                    // BMT=64 runs at 0 scratch with full occupancy and much higher throughput.
+                    const dim3 grid32((unsigned)col_blocks, (unsigned)((M + 63) / 64));
+                    linear_wmma_kernel<TX, TY, BITS, 32, 64><<<grid32, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K);
+                    break;
+                }
                 case 64: linear_wmma_kernel<TX, TY, BITS, 64, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
                 default: linear_wmma_kernel<TX, TY, BITS, 128, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
             }

@@ -113,19 +113,7 @@ __global__ void __launch_bounds__(kThreads) linear_q6_kernel(const TX *x, const 
         const uint16_t *mrow = minv + n * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
             if constexpr (std::is_same_v<TX, uint16_t>) {
-                if constexpr (MR <= 8) {
-                    uint4 u0[MR], u1[MR], u2[MR], u3[MR];
-#pragma unroll
-                    for (int r = 0; r < MR; ++r) {
-                        if (r < rows) {
-                            const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
-                            u0[r] = xp[0];
-                            u1[r] = xp[1];
-                            u2[r] = xp[2];
-                            u3[r] = xp[3];
-                        }
-                    }
-
+                if constexpr (MR <= 11) {
                     const uint4 lo = lo_row[k / kChunk];
                     const HighBitsQ6 hb = HighBitsQ6::load(hi_plane, k);
                     const uint32_t words[4] = {lo.x, lo.y, lo.z, lo.w};
@@ -136,35 +124,66 @@ __global__ void __launch_bounds__(kThreads) linear_q6_kernel(const TX *x, const 
 #pragma unroll
                     for (int p = 0; p < kChunk / 2; ++p) cp[p] = code_pair_q6(words, hb, p);
 
+                    // Phase 0: items 0..15 (u0, u1)
+                    {
+                        uint4 u0[MR], u1[MR];
 #pragma unroll
-                    for (int r = 0; r < MR; ++r) {
-                        if (r < rows) {
-                            const uint32_t xw0[4] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w};
-                            const uint32_t xw1[4] = {u1[r].x, u1[r].y, u1[r].z, u1[r].w};
-                            const uint32_t xw2[4] = {u2[r].x, u2[r].y, u2[r].z, u2[r].w};
-                            const uint32_t xw3[4] = {u3[r].x, u3[r].y, u3[r].z, u3[r].w};
-                            float dot = 0.f, xsum = 0.f;
-#pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                dot = dot2(xw0[j], cp[j], dot);
-                                xsum = dot2(xw0[j], kOnePair, xsum);
+                        for (int r = 0; r < MR; ++r) {
+                            if (r < rows) {
+                                const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                                u0[r] = xp[0];
+                                u1[r] = xp[1];
                             }
+                        }
 #pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                dot = dot2(xw1[j], cp[4 + j], dot);
-                                xsum = dot2(xw1[j], kOnePair, xsum);
-                            }
+                        for (int r = 0; r < MR; ++r) {
+                            if (r < rows) {
+                                const uint32_t xw0[4] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w};
+                                const uint32_t xw1[4] = {u1[r].x, u1[r].y, u1[r].z, u1[r].w};
+                                float dot = 0.f, xsum = 0.f;
 #pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                dot = dot2(xw2[j], cp[8 + j], dot);
-                                xsum = dot2(xw2[j], kOnePair, xsum);
-                            }
+                                for (int j = 0; j < 4; ++j) {
+                                    dot = dot2(xw0[j], cp[j], dot);
+                                    xsum = dot2(xw0[j], kOnePair, xsum);
+                                }
 #pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                dot = dot2(xw3[j], cp[12 + j], dot);
-                                xsum = dot2(xw3[j], kOnePair, xsum);
+                                for (int j = 0; j < 4; ++j) {
+                                    dot = dot2(xw1[j], cp[4 + j], dot);
+                                    xsum = dot2(xw1[j], kOnePair, xsum);
+                                }
+                                acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                             }
-                            acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
+                        }
+                    }
+                    // Phase 1: items 16..31 (u2, u3)
+                    {
+                        uint4 u2[MR], u3[MR];
+#pragma unroll
+                        for (int r = 0; r < MR; ++r) {
+                            if (r < rows) {
+                                const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                                u2[r] = xp[2];
+                                u3[r] = xp[3];
+                            }
+                        }
+#pragma unroll
+                        for (int r = 0; r < MR; ++r) {
+                            if (r < rows) {
+                                const uint32_t xw2[4] = {u2[r].x, u2[r].y, u2[r].z, u2[r].w};
+                                const uint32_t xw3[4] = {u3[r].x, u3[r].y, u3[r].z, u3[r].w};
+                                float dot = 0.f, xsum = 0.f;
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    dot = dot2(xw2[j], cp[8 + j], dot);
+                                    xsum = dot2(xw2[j], kOnePair, xsum);
+                                }
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    dot = dot2(xw3[j], cp[12 + j], dot);
+                                    xsum = dot2(xw3[j], kOnePair, xsum);
+                                }
+                                acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
+                            }
                         }
                     }
                 } else {
@@ -219,25 +238,22 @@ __global__ void __launch_bounds__(kThreads) linear_q6_kernel(const TX *x, const 
             }
 
             // Fallback for non-BF16 activations (float)
-            float xv[MR][kChunk];
-#pragma unroll
-            for (int r = 0; r < MR; ++r) {
-                if (r < rows) load_x32(x, (m0 + r) * K + k, xv[r]);
-            }
             const uint4 lo = lo_row[k / kChunk];
             const HighBitsQ6 hb = HighBitsQ6::load(hi_plane, k);
             const uint32_t lw[4] = {lo.x, lo.y, lo.z, lo.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
             const float mn = bf16_bits_to_f32(mrow[k / G]);
-#pragma unroll
+#pragma nounroll
             for (int r = 0; r < MR; ++r) {
                 if (r < rows) {
+                    float xv[kChunk];
+                    load_x32(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
                     for (int i = 0; i < kChunk; ++i) {
                         const uint32_t c = ((lw[i / 8] >> (4 * (i % 8))) & 0xFu) | (hb.at(i) << 4);
-                        dot = fmaf(xv[r][i], (float)c, dot);
-                        xsum += xv[r][i];
+                        dot = fmaf(xv[i], (float)c, dot);
+                        xsum += xv[i];
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -288,13 +304,18 @@ void launch_mr(const char *fn, const TX *x, const Q6DeviceView &w, TY *y, int64_
 
 template <typename TX, typename TY>
 void launch(const char *fn, const TX *x, const Q6DeviceView &w, TY *y, int64_t M, hipStream_t stream) {
-    // Exact short-M unrolling for MTP speculative verify (M = 1-5) to maintain full wave occupancy.
+    // Exact short-M unrolling for MTP speculative verify and batched verification (M = 1-11)
     if (M == 1) launch_mr<TX, TY, 1>(fn, x, w, y, M, split_k(w.K), stream);
     else if (M == 2) launch_mr<TX, TY, 2>(fn, x, w, y, M, split_k(w.K), stream);
     else if (M == 3) launch_mr<TX, TY, 3>(fn, x, w, y, M, split_k(w.K), stream);
     else if (M == 4) launch_mr<TX, TY, 4>(fn, x, w, y, M, split_k(w.K), stream);
     else if (M == 5) launch_mr<TX, TY, 5>(fn, x, w, y, M, split_k(w.K), stream);
-    else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 6) launch_mr<TX, TY, 6>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 7) launch_mr<TX, TY, 7>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 8) launch_mr<TX, TY, 8>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 9) launch_mr<TX, TY, 9>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 10) launch_mr<TX, TY, 10>(fn, x, w, y, M, split_k(w.K), stream);
+    else if (M == 11) launch_mr<TX, TY, 11>(fn, x, w, y, M, split_k(w.K), stream);
     else launch_mr<TX, TY, kWideRowsPerPass>(fn, x, w, y, M, split_k(w.K), stream);
 }
 

@@ -141,7 +141,7 @@ int main() {
     std::cout << "=================================================================\n";
 
     // Test across various M (MTP verify sizes and batched sizes)
-    for (int m : {1, 2, 3, 4, 5, 8, 16}) {
+    for (int m : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16}) {
         test_q6_shape(m, 256, 2560, 64);
     }
 
