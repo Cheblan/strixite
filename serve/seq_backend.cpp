@@ -49,7 +49,7 @@ bool GpuArbiter::others_decoding_locked(int seq) const {
 }
 
 bool GpuArbiter::can_run_locked(int seq, Kind kind) const {
-    if (busy_) return false;
+    if (busy_ || active_drafts_ > 0) return false;
     if (kind == Kind::Hint) return true;
     if (kind == Kind::Resolve) return resolving_.count(seq) > 0;
     if (!resolving_.empty()) return false;  // the batch's resolutions first (its shared workspaces)
@@ -86,7 +86,31 @@ bool GpuArbiter::poisoned_locked(int seq) const {
 
 bool GpuArbiter::run(int seq, Kind kind, const std::function<void()> &f) {
     if (kind == Kind::Draft) {
-        return run_concurrent(seq, false, f);
+        std::unique_lock<std::mutex> lock(mu_);
+        STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter: seq ", seq, ", expected 0..", epoch_.size() - 1);
+        check_ok_locked(seq);
+        while (!failed_ && busy_) {
+            cv_.wait(lock);
+        }
+        if (failed_) check_ok_locked(seq);
+        ++active_drafts_;
+        lock.unlock();
+        auto finish = [&](bool thrown) {
+            lock.lock();
+            const bool zero_drafts = --active_drafts_ == 0;
+            const bool failed = thrown && !failed_ && !busy_ && be_.failed();
+            if (failed) fail_locked();
+            lock.unlock();
+            if (zero_drafts || failed) cv_.notify_all();
+        };
+        try {
+            f();
+        } catch (...) {
+            finish(true);
+            throw;
+        }
+        finish(false);
+        return true;
     }
 
     std::unique_lock<std::mutex> lock(mu_);
@@ -167,7 +191,7 @@ bool GpuArbiter::run_concurrent(int seq, bool advisory, const std::function<void
 }
 
 bool GpuArbiter::lead_ready_locked(double now) const {
-    if (busy_ || !resolving_.empty() || !calls_waiting_.empty()) return false;
+    if (busy_ || active_drafts_ > 0 || !resolving_.empty() || !calls_waiting_.empty()) return false;
     double first = 0;
     int waiting = 0;
     bool first_alone = false;  // the oldest waiting run can't share a forward: no partner to wait for
@@ -202,6 +226,7 @@ void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
     const int64_t budget = be_.max_verify_rows();
     bool cands = false;
     int64_t n_valid = 0;
+    cv_.wait(lock, [&] { return !busy_ && active_drafts_ == 0; });
     for (int s : order) {
         const Pending &p = pending_[s];
         const int64_t r = (int64_t)p.run.ids.size();
@@ -275,7 +300,7 @@ void GpuArbiter::reset(int seq) {
     std::unique_lock<std::mutex> lock(mu_);
     STRIX_CHECK(seq >= 0 && seq < (int)epoch_.size(), "GpuArbiter::reset: seq ", seq, ", expected 0..",
                 epoch_.size() - 1);
-    cv_.wait(lock, [&] { return !busy_ && (failed_ ? concurrent_total_ == 0 : concurrent_[(size_t)seq] == 0); });
+    cv_.wait(lock, [&] { return !busy_ && active_drafts_ == 0 && (failed_ ? concurrent_total_ == 0 : concurrent_[(size_t)seq] == 0); });
     busy_ = true;
     const bool whole = failed_;
     const bool drop = !whole && resolving_.count(seq) > 0;  // a request failed between its verify and its resolution

@@ -120,6 +120,7 @@ private:
     std::multiset<int> prefill_waiting_;
     int64_t last_prefill_batch_ = -kPrefillYieldBatches;  // stats_.verify_batches when the last prefill chunk ran
     int last_prefill_seq_ = -1;             // seq that ran the last prefill chunk (for round-robin)
+    int active_drafts_ = 0;                 // total active Kind::Draft calls across all seqs
     std::vector<int> concurrent_;           // per-seq active run_concurrent calls (awaited by reset)
     int concurrent_total_ = 0;              // total active across all seqs (awaited by whole reset)
 };
