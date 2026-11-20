@@ -178,7 +178,7 @@ add_executable(transcode_ngram_table tools/transcode_ngram_table.cpp)
 target_link_libraries(transcode_ngram_table PRIVATE strix_model)
 
 add_library(strix_kernels STATIC)
-strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/linear.hip kernels/linear_q4.hip kernels/linear_q56.hip kernels/linear_q8.hip
+strix_hip_sources(strix_kernels kernels/norm.hip kernels/embedding.hip kernels/linear.hip kernels/linear_q4.hip kernels/linear_q5.hip kernels/linear_q6.hip kernels/linear_q8.hip
     kernels/swiglu.hip kernels/rope.hip kernels/attention.hip kernels/gdn.hip
     kernels/residual.hip kernels/moe_router.hip kernels/moe_grouped.hip kernels/wmma.hip kernels/linear_wmma.hip kernels/hc_wmma.hip kernels/hc.hip kernels/ple.hip kernels/qsa.hip
     kernels/mtp_pick.hip kernels/logits_topk.hip kernels/logits_bias.hip kernels/vision.hip kernels/kv8.hip)
@@ -263,6 +263,9 @@ target_link_libraries(test_split_invariance PRIVATE strix_serve_model)
 
 add_executable(test_vision_batchable_edge_cases tools/test_vision_batchable_edge_cases.cpp)
 target_link_libraries(test_vision_batchable_edge_cases PRIVATE strix_serve_model)
+
+add_executable(test_linear_q6 tools/test_linear_q6.cpp)
+target_link_libraries(test_linear_q6 PRIVATE strix_kernels strix_formats)
 
 
 

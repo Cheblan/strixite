@@ -1,6 +1,6 @@
 #pragma once
 // Q5-weight linear layer: y[M, N] = x[M, K] * dequant(W)^T, W in the Q5 layout (formats/q5.hpp), x/y F32 or BF16
-// activations, FP32 accumulation. linear_q6's kernel (kernels/linear_q56.hip) with a 1-bit high plane: each lane
+// activations, FP32 accumulation. linear_q6's kernel (kernels/linear_q5.hip) with a 1-bit high plane: each lane
 // loads 32 codes as their low nibbles (16 bytes, Q4's packing) and high bits (4 bytes), always within one group
 // (G >= 32), and computes s * sum(x*q) + m * sum(x) per chunk; 1-8 waves per output row (split-K, ~2048 codes a
 // wave as Q4), partial sums meet in LDS; M == 1 has its own instantiation.
