@@ -400,6 +400,25 @@ struct WmmaXTile {
             }
         }
     }
+    __device__ void fetch_dense(const T *x, int64_t m0, int64_t K, int rows_valid, int64_t k0) {
+#pragma unroll
+        for (int p = 0; p < kPasses; ++p) {
+            const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
+            b[p][0] = b[p][1] = b[p][2] = b[p][3] = 0;
+            if (seg >= BM * kSegs || r >= rows_valid) continue;
+            const T *src = x + (m0 + r) * K + k0 + (seg % kSegs) * 8;
+            if constexpr (sizeof(T) == 2) {
+                const uint4 u = *reinterpret_cast<const uint4 *>(src);
+                b[p][0] = u.x, b[p][1] = u.y, b[p][2] = u.z, b[p][3] = u.w;
+            } else {
+                const float4 f0 = reinterpret_cast<const float4 *>(src)[0], f1 = reinterpret_cast<const float4 *>(src)[1];
+                const float v[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    b[p][i] = (uint32_t)wmma_f32_to_bf16(v[2 * i]) | ((uint32_t)wmma_f32_to_bf16(v[2 * i + 1]) << 16);
+            }
+        }
+    }
     // F16 path: the fetched (BF16) values to LDS as F16 bits - exact in F16's normal range (the activations' measured
     // |x| <= 180), round-toward-zero only below it.
     __device__ void stage_f16(uint16_t *lds) const {

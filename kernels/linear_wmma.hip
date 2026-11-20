@@ -71,20 +71,19 @@ __global__ void __launch_bounds__(kWmmaThreads)
     linear_wmma_f16_kernel(const TX *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv, TY *y, int64_t M,
                            int64_t N, int64_t K) {
     static_assert(BITS == 4 || BITS == 8, "F16 path: Q4 / Q8 weights");
-    constexpr int TM = BMT / 32;
+    constexpr int TM = BMT / 32, kOutLd = BN + 8;
+    constexpr int kTileElems = (BMT + BN) * kWmmaLd > BMT * kOutLd ? (BMT + BN) * kWmmaLd : BMT * kOutLd;
     using WT = WmmaWCodes<BITS, G, BN>;
-    __shared__ __attribute__((aligned(16))) uint16_t xs[BMT * kWmmaLd], ws[BN * kWmmaLd];
+    __shared__ __attribute__((aligned(16))) uint16_t tiles_lds[kTileElems];
+    uint16_t *xs = tiles_lds, *ws = tiles_lds + BMT * kWmmaLd;
     __shared__ uint16_t sw[BN * WT::kWin], mw[BN * WT::kWin];
-    __shared__ int64_t xoff[BMT];
     const int64_t m0 = (int64_t)blockIdx.y * BMT, n0 = (int64_t)blockIdx.x * BN;
     const int rows_x = (int)(M - m0 < BMT ? M - m0 : BMT), rows_w = (int)(N - n0 < BN ? N - n0 : BN);
-    if (threadIdx.x < BMT) xoff[threadIdx.x] = (m0 + threadIdx.x) * K;
     const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
     wmma_f32x8 acc[TM][2] = {};
-    __syncthreads();
     WmmaXTile<TX, BMT, G, false> xt;
     WT wt;
-    xt.fetch(x, xoff, rows_x, 0);
+    xt.fetch_dense(x, m0, K, rows_x, 0);
     wt.fetch(q, scale, minv, n0, rows_w, K, 0);
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         if (wt.win) {  // uniform: depends on k0 only
@@ -95,11 +94,35 @@ __global__ void __launch_bounds__(kWmmaThreads)
         wt.stage_f16(ws, sw, mw, k0);
         lds_barrier();
         if (k0 + kWmmaKC < K) {
-            xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
+            xt.fetch_dense(x, m0, K, rows_x, k0 + kWmmaKC);
             wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
         }
         wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
         lds_barrier();
+    }
+    if constexpr (std::is_same_v<TY, uint16_t>) {
+        if (N % 8 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0) {
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const int r = wm * (BMT / 2) + i * 16 + wmma_c_row(v);
+                        const int c = wn * 32 + j * 16 + threadIdx.x % 16;
+                        tiles_lds[r * kOutLd + c] = wmma_f32_to_bf16(acc[i][j][v]);
+                    }
+            lds_barrier();
+            constexpr int kChunks = BN / 8;
+            uint16_t *yb = reinterpret_cast<uint16_t *>(y);
+            for (int e = (int)threadIdx.x; e < rows_x * kChunks; e += kWmmaThreads) {
+                const int r = e / kChunks, c = (e % kChunks) * 8;
+                if (c >= rows_w) continue;
+                *reinterpret_cast<uint4 *>(yb + (m0 + r) * N + n0 + c) =
+                    *reinterpret_cast<const uint4 *>(tiles_lds + r * kOutLd + c);
+            }
+            return;
+        }
     }
 #pragma unroll
     for (int i = 0; i < TM; ++i)
