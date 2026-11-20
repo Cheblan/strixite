@@ -2924,8 +2924,19 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         // combine's reduce (kernels::MoeSharedAdd, bit-identical to moe_shared_add after it), so it runs first.
         const bool fold_shared = sep && fuse_inv && T >= kGroupedMinTokens;
         if (fold_shared) shared_expert();
-        const kernels::MoeSharedAdd shared_add{sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1,
-                                               (uint32_t)D.experts, router_err_.get()};
+        const bool can_fuse_inject = fold_shared && !probe && act == Act::BF16 && D.d == 2560 && D.H == 4;
+        const kernels::MoeSharedAdd shared_add{
+            sh_y_.get(),
+            router_logits_.get() + D.experts,
+            D.experts + 1,
+            (uint32_t)D.experts,
+            router_err_.get(),
+            can_fuse_inject ? x_.get() : nullptr,
+            can_fuse_inject ? w_in_.get() : nullptr,
+            can_fuse_inject ? D.eps : 0.f,
+            can_fuse_inject ? inv_.get() : nullptr,
+            can_fuse_inject ? (int)D.H : 0
+        };
         bool h_f16 = false;
         if (T >= kGroupedMinTokens) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
@@ -2960,7 +2971,9 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         }
         show(L + "experts_h", hh_.get(), A * D.inter, h_f16 ? ProbeType::F16 : pt);  // the routed experts' down input, T rows of A slots
         if (sep && !fold_shared) shared_expert();  // then y += sigmoid(its gate logit) * its output
-        if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
+        if (can_fuse_inject) {
+            inv_ready = true;
+        } else if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,
                                            router_err_.get(), stream_);

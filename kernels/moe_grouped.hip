@@ -951,6 +951,111 @@ __global__ void __launch_bounds__(kThreads)
     store_v<T, V>(y, i, v);
 }
 
+// Fused combine_reduce + hc_inject_inv for prefill (BF16, N=2560, H=4, 320 threads = 10 waves).
+// Partial reduction in registers, shared expert add in registers, x updated and stored,
+// and exact stride-256 warp-shfl tree reduction for 100% bit-identical inv[m, s].
+template <typename T>
+__global__ void __launch_bounds__(320)
+combine_reduce_inject_inv_kernel(const float *partial, const int32_t *ids, const float *coef,
+                                 int64_t M, int64_t A, int64_t E, int64_t N, bool pbf16,
+                                 const T *s, const float *gate_logit, int64_t gate_ld,
+                                 uint32_t gate_index, uint32_t *err,
+                                 T *x, const float *w_in, float eps, float *inv) {
+    constexpr int V = 8;
+    const int64_t m = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int64_t n = (int64_t)tid * V;
+    const int64_t i = m * N + n;
+
+    bool ok = true;
+    float v[V] = {};
+    for (int64_t a = 0; a < A; ++a) {
+        const int32_t id = ids[m * A + a];
+        ok = ok && id >= 0 && id < E;
+        const float c = coef[m * A + a];
+        float p[V];
+        PartialLoad<V>::run(partial, (m * A + a) * N + n, pbf16, p);
+#pragma unroll
+        for (int j = 0; j < V; ++j) v[j] = fmaf(c, p[j], v[j]);
+    }
+    if (!ok)
+#pragma unroll
+        for (int j = 0; j < V; ++j) v[j] = __int_as_float(0x7fc00000);
+
+    const float gl = gate_logit[m * gate_ld];
+    const bool gok = isfinite(gl);
+    if (!gok && n == 0 && atomicCAS(&err[0], 0u, 1u) == 0u) {
+        err[1] = (uint32_t)m;
+        err[2] = gate_index;
+    }
+    const float g = gok ? 1.f / (1.f + expf(-gl)) : __builtin_nanf("");
+    float sv[V];
+    load_v<T, V>(s, i, sv);
+    float yv[V];
+#pragma unroll
+    for (int j = 0; j < V; ++j) yv[j] = as_stored<T>(as_stored<T>(v[j]) + g * sv[j]);
+
+    __shared__ __attribute__((aligned(16))) uint16_t x_lds[2560];
+    __shared__ float red[256];
+
+    for (int stream_s = 0; stream_s < 4; ++stream_s) {
+        const float ws = w_in[m * 4 + stream_s];
+        T *xs = x + (m * 4 + stream_s) * N;
+        float xv[V];
+        load_v<T, V>(xs, n, xv);
+
+        uint16_t b[V];
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+            b[j] = f32_to_bf16_bits(fmaf(ws, yv[j], xv[j]));
+        }
+
+        uint32_t w4[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w4[j] = (uint32_t)b[2 * j] | ((uint32_t)b[2 * j + 1] << 16);
+        }
+        const uint4 u4 = make_uint4(w4[0], w4[1], w4[2], w4[3]);
+        *reinterpret_cast<uint4 *>(xs + n) = u4;
+        *reinterpret_cast<uint4 *>(x_lds + n) = u4;
+
+        lds_barrier();
+
+        if (tid < 256) {
+            float ss = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 10; ++k) {
+                const float val = bf16_bits_to_f32(x_lds[tid + k * 256]);
+                ss = fmaf(val, val, ss);
+            }
+            red[tid] = ss;
+        }
+        lds_barrier();
+
+        if (tid < 128) {
+            red[tid] += red[tid + 128];
+        }
+        lds_barrier();
+
+        if (tid < 64) {
+            red[tid] += red[tid + 64];
+        }
+        lds_barrier();
+
+        if (tid < 32) {
+            float val = red[tid] + red[tid + 32];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                val += __shfl_down(val, off, 32);
+            }
+            if (tid == 0) {
+                inv[m * 4 + stream_s] = 1.0f / sqrtf(val / (float)N + eps);
+            }
+        }
+        lds_barrier();
+    }
+}
+
 // Split-K as linear_q4 (each wave ~2048 codes of a row): K = 2560 and 640 give 1.
 int split_k(int64_t K) {
     int ks = 1;
@@ -1204,6 +1309,15 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
         const int64_t gld = shared ? shared->gate_ld : 0;
         const uint32_t gi = shared ? shared->gate_index : 0;
         uint32_t *err = shared ? shared->err : nullptr;
+        const bool can_fuse_inject = shared != nullptr && shared->x != nullptr && act == Act::BF16 && N == 2560 && shared->H == 4;
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            if (can_fuse_inject) {
+                combine_reduce_inject_inv_kernel<uint16_t><<<(unsigned)M, 320, 0, stream>>>(
+                    partial, ids, coef, M, A, E, N, pbf16, s, gl, gld, gi, err,
+                    static_cast<uint16_t *>(shared->x), shared->w_in, shared->eps, shared->inv);
+                return;
+            }
+        }
         auto go = [&](auto v_c, auto sh_c) {
             combine_reduce_kernel<T, decltype(v_c)::value, decltype(sh_c)::value><<<blocks, kThreads, 0, stream>>>(
                 partial, ids, coef, M, A, E, N, yt, pbf16, s, gl, gld, gi, err);

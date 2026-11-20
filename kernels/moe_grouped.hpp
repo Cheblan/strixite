@@ -78,6 +78,12 @@ struct MoeSharedAdd {
     int64_t gate_ld = 0;
     uint32_t gate_index = 0;
     uint32_t *err = nullptr;
+    // Fused HC inject inv fields:
+    void *x = nullptr;                  // [M, H, N]
+    const float *w_in = nullptr;        // [M, H]
+    float eps = 0.f;
+    float *inv = nullptr;               // [M, H]
+    int H = 0;                          // 4
 };
 
 
