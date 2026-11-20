@@ -94,6 +94,16 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
         const uint16_t *mrow = minv + n * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
             if constexpr (std::is_same_v<TX, uint16_t>) {
+                uint4 u0[MR], u1[MR];
+#pragma unroll
+                for (int r = 0; r < MR; ++r) {
+                    if (r < rows) {
+                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                        u0[r] = xp[0];
+                        u1[r] = xp[1];
+                    }
+                }
+
                 const uint4 packed = qrow[k / kChunk];
                 const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
                 const float s = bf16_bits_to_f32(srow[k / G]);
@@ -106,10 +116,8 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     if (r < rows) {
-                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
-                        const uint4 u0 = xp[0], u1 = xp[1];
-                        const uint32_t xw[kChunk / 2] = {u0.x, u0.y, u0.z, u0.w,
-                                                         u1.x, u1.y, u1.z, u1.w};
+                        const uint32_t xw[kChunk / 2] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w,
+                                                         u1[r].x, u1[r].y, u1[r].z, u1[r].w};
                         float dot = 0.f, xsum = 0.f;
 #pragma unroll
                         for (int p = 0; p < kChunk / 2; ++p) {
@@ -122,6 +130,12 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
                 continue;
             }
 
+            float xv[MR][kChunk];
+#pragma unroll
+            for (int r = 0; r < MR; ++r) {
+                if (r < rows) load_x16(x, (m0 + r) * K + k, xv[r]);
+            }
+
             const uint4 packed = qrow[k / kChunk];
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
@@ -130,13 +144,11 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
 #pragma unroll
             for (int r = 0; r < MR; ++r) {
                 if (r < rows) {
-                    float xv[kChunk];
-                    load_x16(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
                     for (int i = 0; i < kChunk; ++i) {
-                        dot = fmaf(xv[i], (float)((words[i / 4] >> (8 * (i % 4))) & 0xFFu), dot);
-                        xsum += xv[i];
+                        dot = fmaf(xv[r][i], (float)((words[i / 4] >> (8 * (i % 4))) & 0xFFu), dot);
+                        xsum += xv[r][i];
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -198,8 +210,6 @@ void launch(const TX *x, const Q8DeviceView &w, TY *y, int64_t M, hipStream_t st
     else if (M == 3) launch_mr<TX, TY, 3>(x, w, y, M, split_k(w.K), stream);
     else if (M == 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
     else if (M == 5) launch_mr<TX, TY, 5>(x, w, y, M, split_k(w.K), stream);
-    else if (M == 6) launch_mr<TX, TY, 6>(x, w, y, M, split_k(w.K), stream);
-    else if (M == 7) launch_mr<TX, TY, 7>(x, w, y, M, split_k(w.K), stream);
     else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
     else launch_mr<TX, TY, kWideRowsPerPass>(x, w, y, M, split_k(w.K), stream);
 }
