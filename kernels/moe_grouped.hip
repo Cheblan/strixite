@@ -729,9 +729,11 @@ __global__ void __launch_bounds__(kWmmaThreads)
         return;
     }
     const int wave = (int)threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
-    // SWI: 16-byte h stores - every slot row's columns start 16-byte aligned and the block's columns are whole 8-column
-    // chunks (uniform per launch)
-    const bool vec_out = (N / 2) % 8 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0;
+    // SWI / COMBINE: 16-byte stores - every slot row's columns start 16-byte aligned and the block's columns are whole
+    // 8-column chunks (uniform per launch)
+    const bool vec_out = SWI ? ((N / 2) % 8 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0)
+                             : (COMBINE ? (N % 8 == 0 && reinterpret_cast<uintptr_t>(partial) % 16 == 0)
+                                        : (N % 8 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0));
     // This thread's staged weight row (< 0: past the block's columns, staged as zeros).
     const int64_t wrow = [&]() -> int64_t {
         const int r = (int)threadIdx.x;
@@ -833,6 +835,39 @@ __global__ void __launch_bounds__(kWmmaThreads)
                             *reinterpret_cast<const uint4 *>(wsm + rl * kOutLd + c);
                     }
                     __syncthreads();  // the next half overwrites the staged rows
+                }
+                return;
+            }
+        } else if constexpr (COMBINE) {
+            if (pbf16 && vec_out) {
+                // BF16 partials through LDS (the weight tile's bytes wsm, free after the loop's last barrier) in four 32-row quarters,
+                // each value rounded as put_partial does (f32_to_bf16_bits), then written a 16-byte chunk (8 columns of one slot's row)
+                // a store.
+                constexpr int kOutLd = BW + 8, kChunks = BW / 8;
+                static_assert(32 * kOutLd <= BW * LD && kOutLd * 2 % 16 == 0, "COMBINE: quarter of the partial tile fits in LDS");
+                uint16_t *pb = reinterpret_cast<uint16_t *>(partial);
+#pragma unroll
+                for (int qtr = 0; qtr < 4; ++qtr) {
+#pragma unroll
+                    for (int i = 0; i < TMA; ++i) {
+                        if (i != qtr) continue;  // row tile 2 i + wm lies in rows [32 qtr, 32 qtr + 32)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+#pragma unroll
+                            for (int v = 0; v < 8; ++v) {
+                                const int rl = 16 * wm + wmma_c_row(v);
+                                const int c = wn * 64 + 16 * j + (int)threadIdx.x % 16;
+                                wsm[rl * kOutLd + c] = f32_to_bf16_bits(acc[i][j][v]);
+                            }
+                    }
+                    __syncthreads();
+                    for (int e = (int)threadIdx.x; e < 32 * kChunks; e += kWmmaThreads) {
+                        const int rl = e / kChunks, r = 32 * qtr + rl, c = e % kChunks * 8;
+                        if (r >= rows || c >= rows_w) continue;  // rows_w % 8 == 0: whole chunks only
+                        *reinterpret_cast<uint4 *>(pb + ooff[r] + n0 + c) =
+                            *reinterpret_cast<const uint4 *>(wsm + rl * kOutLd + c);
+                    }
+                    __syncthreads();  // the next quarter overwrites the staged rows
                 }
                 return;
             }
@@ -1121,7 +1156,7 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
                     float *partial, MoeMath math, hipStream_t stream) {
     const int64_t N = w.N / E;
     if (math == MoeMath::WmmaF16)
-        math = COMBINE ? (M >= kWideMinMCombine ? MoeMath::WmmaF16Wide : MoeMath::WmmaF16Narrow)
+        math = COMBINE ? (M >= kWideMinMCombine ? MoeMath::WmmaF16Wide256 : MoeMath::WmmaF16Narrow)
                        : (M >= kWideMinMGather ? MoeMath::WmmaF16Wide256 : MoeMath::WmmaF16Narrow);
     STRIX_CHECK(!SWI || (is_f16(math) && N % 2 == 0), "moe grouped (SwiGLU): needs a MoeMath::WmmaF16 kind and an ",
                 "even gate_up width, got math ", (int)math, ", N = ", N);
