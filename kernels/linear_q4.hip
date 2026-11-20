@@ -96,18 +96,6 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
         const uint16_t *mrow = minv + n * (K / G);
         for (int64_t k = ((int64_t)ks * warpSize + lane) * kChunk; k < K; k += (int64_t)KS * warpSize * kChunk) {
             if constexpr (std::is_same_v<TX, uint16_t>) {
-                uint4 u0[MR], u1[MR], u2[MR], u3[MR];
-#pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    if (r < rows) {
-                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
-                        u0[r] = xp[0];
-                        u1[r] = xp[1];
-                        u2[r] = xp[2];
-                        u3[r] = xp[3];
-                    }
-                }
-
                 const uint4 packed = qrow[k / kChunk];
                 const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
                 const float s = bf16_bits_to_f32(srow[k / G]);
@@ -120,10 +108,12 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
 #pragma unroll
                 for (int r = 0; r < MR; ++r) {
                     if (r < rows) {
-                        const uint32_t xw0[4] = {u0[r].x, u0[r].y, u0[r].z, u0[r].w};
-                        const uint32_t xw1[4] = {u1[r].x, u1[r].y, u1[r].z, u1[r].w};
-                        const uint32_t xw2[4] = {u2[r].x, u2[r].y, u2[r].z, u2[r].w};
-                        const uint32_t xw3[4] = {u3[r].x, u3[r].y, u3[r].z, u3[r].w};
+                        const uint4 *xp = reinterpret_cast<const uint4 *>(x + (m0 + r) * K + k);
+                        const uint4 u0 = xp[0], u1 = xp[1], u2 = xp[2], u3 = xp[3];
+                        const uint32_t xw0[4] = {u0.x, u0.y, u0.z, u0.w};
+                        const uint32_t xw1[4] = {u1.x, u1.y, u1.z, u1.w};
+                        const uint32_t xw2[4] = {u2.x, u2.y, u2.z, u2.w};
+                        const uint32_t xw3[4] = {u3.x, u3.y, u3.z, u3.w};
                         float dot = 0.f, xsum = 0.f;
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
@@ -151,12 +141,6 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
                 continue;
             }
 
-            float xv[MR][kChunk];
-#pragma unroll
-            for (int r = 0; r < MR; ++r) {
-                if (r < rows) load_x32(x, (m0 + r) * K + k, xv[r]);
-            }
-
             const uint4 packed = qrow[k / kChunk];
             const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
             const float s = bf16_bits_to_f32(srow[k / G]);
@@ -165,11 +149,13 @@ __global__ void __launch_bounds__(kThreads) linear_q4_kernel(const TX *x, const 
 #pragma unroll
             for (int r = 0; r < MR; ++r) {
                 if (r < rows) {
+                    float xv[kChunk];
+                    load_x32(x, (m0 + r) * K + k, xv);
                     float dot = 0.f, xsum = 0.f;
 #pragma unroll
                     for (int i = 0; i < kChunk; ++i) {
-                        dot = fmaf(xv[r][i], (float)((words[i / 8] >> (4 * (i % 8))) & 0xFu), dot);
-                        xsum += xv[r][i];
+                        dot = fmaf(xv[i], (float)((words[i / 8] >> (4 * (i % 8))) & 0xFu), dot);
+                        xsum += xv[i];
                     }
                     acc[r] = fmaf(s, dot, fmaf(mn, xsum, acc[r]));
                 }
@@ -235,6 +221,55 @@ __device__ inline float q4_row_partial(const uint8_t *qrow, const uint16_t *srow
     return acc;
 }
 
+// Dual-row partial for gather_swiglu: loads x and computes xsum once per chunk for both gate and up rows.
+template <typename T, int G, int HB = 0>
+__device__ inline void q4_dual_row_partial(const uint8_t *qrow_g, const uint16_t *srow_g, const uint16_t *mrow_g,
+                                           const uint8_t *qrow_u, const uint16_t *srow_u, const uint16_t *mrow_u,
+                                           const T *xrow, int64_t chunks, int ks, int KS, int lane, int64_t K,
+                                           float &acc_g, float &acc_u) {
+    acc_g = 0.f;
+    acc_u = 0.f;
+    for (int64_t c = (int64_t)ks * warpSize + lane; c < chunks; c += (int64_t)KS * warpSize) {
+        float xv[kChunk];
+        load_x32(xrow, c * kChunk, xv);
+        float xsum = 0.f;
+#pragma unroll
+        for (int i = 0; i < kChunk; ++i) {
+            xsum += xv[i];
+        }
+
+        // Gate row
+        {
+            uint4 packed_g = reinterpret_cast<const uint4 *>(qrow_g)[c];
+            uint32_t words_g[4] = {packed_g.x, packed_g.y, packed_g.z, packed_g.w};
+            const QHigh32<HB> hb_g = QHigh32<HB>::load(qrow_g, K, c * kChunk);
+            const float s_g = bf16_bits_to_f32(srow_g[c * kChunk / G]);
+            const float mn_g = bf16_bits_to_f32(mrow_g[c * kChunk / G]);
+            float dot_g = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i) {
+                dot_g = fmaf(xv[i], (float)(((words_g[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_g.at(i)), dot_g);
+            }
+            acc_g = fmaf(s_g, dot_g, fmaf(mn_g, xsum, acc_g));
+        }
+
+        // Up row
+        {
+            uint4 packed_u = reinterpret_cast<const uint4 *>(qrow_u)[c];
+            uint32_t words_u[4] = {packed_u.x, packed_u.y, packed_u.z, packed_u.w};
+            const QHigh32<HB> hb_u = QHigh32<HB>::load(qrow_u, K, c * kChunk);
+            const float s_u = bf16_bits_to_f32(srow_u[c * kChunk / G]);
+            const float mn_u = bf16_bits_to_f32(mrow_u[c * kChunk / G]);
+            float dot_u = 0.f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i) {
+                dot_u = fmaf(xv[i], (float)(((words_u[i / 8] >> (4 * (i % 8))) & 0xFu) | hb_u.at(i)), dot_u);
+            }
+            acc_u = fmaf(s_u, dot_u, fmaf(mn_u, xsum, acc_u));
+        }
+    }
+}
+
 // Wave-reduce each lane's partial, then combine the KS waves of a row in
 // LDS; returns the row total on lane 0 of the row's first wave (ks == 0).
 __device__ inline float reduce_row(float v, float *part, int wave, int ks, int KS) {
@@ -297,10 +332,10 @@ __global__ void __launch_bounds__(kThreads)
     if (ok && j < I) {  // no early return: every wave reaches reduce_row's barrier
         const T *xr = x + (int64_t)blockIdx.z * K;
         const int64_t rg = (int64_t)id * N + j, ru = rg + I;
-        vg = q4_row_partial<T, G, HB>(q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
-        vu = q4_row_partial<T, G, HB>(q + ru * qsplit_row_bytes<HB>(K), scale + ru * (K / G), minv + ru * (K / G), xr,
-                                      K / kChunk, ks, KS, lane, K);
+        q4_dual_row_partial<T, G, HB>(
+            q + rg * qsplit_row_bytes<HB>(K), scale + rg * (K / G), minv + rg * (K / G),
+            q + ru * qsplit_row_bytes<HB>(K), scale + ru * (K / G), minv + ru * (K / G),
+            xr, K / kChunk, ks, KS, lane, K, vg, vu);
     }
     vg = reduce_row(vg, part_g, wave, ks, KS);
     vu = reduce_row(vu, part_u, wave, ks, KS);
@@ -395,6 +430,8 @@ void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t st
     else if (M == 3) launch_mr<TX, TY, 3>(x, w, y, M, split_k(w.K), stream);
     else if (M == 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
     else if (M == 5) launch_mr<TX, TY, 5>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 6) launch_mr<TX, TY, 6>(x, w, y, M, split_k(w.K), stream);
+    else if (M == 7) launch_mr<TX, TY, 7>(x, w, y, M, split_k(w.K), stream);
     else if (M <= kRowsPerPass) launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
     else launch_mr<TX, TY, kWideRowsPerPass>(x, w, y, M, split_k(w.K), stream);
 }
