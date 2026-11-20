@@ -51,27 +51,40 @@ __global__ void __launch_bounds__(kInvThreads) hc_inv_kernel(const T *x, int64_t
 template <typename T>
 __global__ void __launch_bounds__(kInvThreads)
     hc_inject_inv_kernel(T *x, const float *w_in, const T *y, int64_t d, float eps, float *inv) {
-    __shared__ float red[kInvThreads];
+    __shared__ float red[kH][kInvThreads];
     const int64_t t = blockIdx.x;
-    for (int s = 0; s < kH; ++s) {
-        T *xs = x + (t * kH + s) * d;
-        const float w = w_in[t * kH + s];
-        float ss = 0.f;
-        for (int64_t j = threadIdx.x; j < d; j += kInvThreads) {
-            store(xs, j, fmaf(w, to_f32(y[t * d + j]), to_f32(xs[j])));
-            const float v = to_f32(xs[j]);  // the stored (rounded) value, as hc_inv reads it
-            ss = fmaf(v, v, ss);
+    float ss[kH] = {0.f};
+    const float w[kH] = {w_in[t * kH + 0], w_in[t * kH + 1], w_in[t * kH + 2], w_in[t * kH + 3]};
+
+    for (int64_t j = threadIdx.x; j < d; j += kInvThreads) {
+        const float yv = to_f32(y[t * d + j]);
+#pragma unroll
+        for (int s = 0; s < kH; ++s) {
+            T *xs = x + (t * kH + s) * d;
+            store(xs, j, fmaf(w[s], yv, to_f32(xs[j])));
+            const float v = to_f32(xs[j]);
+            ss[s] = fmaf(v, v, ss[s]);
         }
-        red[threadIdx.x] = ss;
-        __syncthreads();
-        for (int off = kInvThreads / 2; off > 0; off >>= 1) {
-            if ((int)threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
-            __syncthreads();
+    }
+
+#pragma unroll
+    for (int s = 0; s < kH; ++s) red[s][threadIdx.x] = ss[s];
+    __syncthreads();
+
+    for (int off = kInvThreads / 2; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off) {
+#pragma unroll
+            for (int s = 0; s < kH; ++s) red[s][threadIdx.x] += red[s][threadIdx.x + off];
         }
-        if (threadIdx.x == 0) inv[t * kH + s] = 1.0f / sqrtf(red[0] / (float)d + eps);
         __syncthreads();
     }
+    if (threadIdx.x < kH) {
+        const int s = threadIdx.x;
+        inv[t * kH + s] = 1.0f / sqrtf(red[s][0] / (float)d + eps);
+    }
 }
+
+
 
 // Down, one stream per blockIdx.z: P_s [T, R] FP32 = X_s W'_s^T over the stream's d inputs, on F16: the codes
 // dequantized once while staged (code * scale + min -> F16 in LDS), x staged as F16, the whole stream's K range
@@ -90,10 +103,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
     if (threadIdx.x < BM) xoff[threadIdx.x] = (m0 + threadIdx.x) * K + s * d;
     const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
     wmma_f32x8 acc[2][2] = {};
-    __syncthreads();
+    lds_barrier();
     // Over the stream's K range [s d, (s + 1) d), software-pipelined two steps deep: two register sets (a, b) take
-    // turns, so while a step's tiles are staged and multiplied the loads for the next two steps are in flight (one
-    // step ahead left 43% of wave cycles waiting on memory; two deep: -6% / -14% at 2048 / 512 tokens).
+    // turns, so while a step's tiles are staged and multiplied the loads for the next two steps are in flight.
     WmmaXTile<T, BM, G, false> xa, xb;
     WCodes wa, wb;
     xa.fetch(x, xoff, rows_x, 0);
@@ -105,17 +117,17 @@ __global__ void __launch_bounds__(kWmmaThreads)
     auto step = [&](WmmaXTile<T, BM, G, false> &xt, WCodes &wt, int64_t k0) {
         if (wt.win) {  // uniform: depends on k0 only
             wt.stage_window(sw, mw);
-            __syncthreads();
+            lds_barrier();
         }
         xt.stage_f16(xs);
         wt.stage_f16(ws, sw, mw, k0);
-        __syncthreads();
+        lds_barrier();
         if (k0 + 2 * kWmmaKC < d) {
             xt.fetch(x, xoff, rows_x, k0 + 2 * kWmmaKC);
             wt.fetch(q, scale, minv, n0, rows_w, K, k0 + 2 * kWmmaKC, s * d);
         }
         wmma_step_f16<2, 2>(xs, ws, wm * 32, wn * 32, acc);
-        __syncthreads();
+        lds_barrier();
     };
     for (int64_t k0 = 0; k0 < d; k0 += 2 * kWmmaKC) {
         step(xa, wa, k0);
@@ -128,8 +140,89 @@ __global__ void __launch_bounds__(kWmmaThreads)
         for (int j = 0; j < 2; ++j)
 #pragma unroll
             for (int v = 0; v < 8; ++v) {
-                const int64_t m = m0 + wm * 32 + i * 16 + wmma_c_row(v), n = n0 + wn * 32 + j * 16 + threadIdx.x % 16;
+                const int64_t m = m0 + wm * 32 + i * 16 + wmma_c_row(v), n = n0 + wn * 32 + j * 16 + (int)threadIdx.x % 16;
                 if (m < Tn && n < R) P[m * R + n] = acc[i][j][v];
+            }
+}
+
+// Fused 4-stream hc_down without DRAM partials: grid.z = 1; iterates s = 0..3, accumulates
+// total[i][j][v] = fmaf(inv[m * 4 + s], acc[i][j][v], total[i][j][v]) in registers, and writes h / w_in directly.
+template <typename T, int BITS, int G>
+__global__ void __launch_bounds__(kWmmaThreads)
+    hc_down_wmma_fused_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv, int64_t R,
+                              int64_t r, int64_t d, int64_t Tn, const float *inv, float *h, float *w_in) {
+    using WCodes = WmmaWCodes<BITS, G, BN>;
+    __shared__ __attribute__((aligned(16))) uint16_t xs[BM * kWmmaLd], ws[BN * kWmmaLd];
+    __shared__ uint16_t sw[BN * WCodes::kWin], mw[BN * WCodes::kWin];
+    __shared__ int64_t xoff[BM];
+    const int64_t K = kH * d, m0 = (int64_t)blockIdx.y * BM, n0 = (int64_t)blockIdx.x * BN;
+    const int rows_x = (int)(Tn - m0 < BM ? Tn - m0 : BM), rows_w = (int)(R - n0 < BN ? R - n0 : BN);
+    const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
+
+    wmma_f32x8 total[2][2] = {};
+
+    for (int s = 0; s < kH; ++s) {
+        if (threadIdx.x < BM) xoff[threadIdx.x] = (m0 + threadIdx.x) * K + s * d;
+        wmma_f32x8 acc[2][2] = {};
+        lds_barrier();
+
+        WmmaXTile<T, BM, G, false> xa, xb;
+        WCodes wa, wb;
+        xa.fetch(x, xoff, rows_x, 0);
+        wa.fetch(q, scale, minv, n0, rows_w, K, 0, s * d);
+        if (kWmmaKC < d) {
+            xb.fetch(x, xoff, rows_x, kWmmaKC);
+            wb.fetch(q, scale, minv, n0, rows_w, K, kWmmaKC, s * d);
+        }
+        auto step = [&](WmmaXTile<T, BM, G, false> &xt, WCodes &wt, int64_t k0) {
+            if (wt.win) {
+                wt.stage_window(sw, mw);
+                lds_barrier();
+            }
+            xt.stage_f16(xs);
+            wt.stage_f16(ws, sw, mw, k0);
+            lds_barrier();
+            if (k0 + 2 * kWmmaKC < d) {
+                xt.fetch(x, xoff, rows_x, k0 + 2 * kWmmaKC);
+                wt.fetch(q, scale, minv, n0, rows_w, K, k0 + 2 * kWmmaKC, s * d);
+            }
+            wmma_step_f16<2, 2>(xs, ws, wm * 32, wn * 32, acc);
+            lds_barrier();
+        };
+        for (int64_t k0 = 0; k0 < d; k0 += 2 * kWmmaKC) {
+            step(xa, wa, k0);
+            if (k0 + kWmmaKC < d) step(xb, wb, k0 + kWmmaKC);
+        }
+
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const int64_t m = m0 + wm * 32 + i * 16 + wmma_c_row(v);
+                const float inv_val = (m < Tn) ? inv[m * kH + s] : 0.f;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    total[i][j][v] = fmaf(inv_val, acc[i][j][v], total[i][j][v]);
+                }
+            }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const int64_t m = m0 + wm * 32 + i * 16 + wmma_c_row(v), n = n0 + wn * 32 + j * 16 + (int)threadIdx.x % 16;
+                if (m < Tn && n < R) {
+                    const float a = total[i][j][v];
+                    const float z = a / (float)kH;
+                    if (n < r) {
+                        h[m * r + n] = z / (1.0f + expf(-z));
+                    } else if (w_in != nullptr) {
+                        w_in[m * kH + (n - r)] = 2.0f / (1.0f + expf(-z));
+                    }
+                }
             }
 }
 
@@ -221,9 +314,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     if (threadIdx.x < BM) hoff[threadIdx.x] = (m0 + threadIdx.x) * r;
     const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
     wmma_f32x8 acc[2][2] = {};
-    __syncthreads();
-    // F16: h rounded once to F16, the codes dequantized to F16 while staged;
-    // software-pipelined (kernels/wmma_gemm.hpp).
+    lds_barrier();
     WmmaXTileF32ToF16<BM> xt;
     UpCodes<BITS, G> wt;
     xt.fetch(h, hoff, rows_x, 0);
@@ -231,17 +322,17 @@ __global__ void __launch_bounds__(kWmmaThreads)
     for (int64_t k0 = 0; k0 < r; k0 += kWmmaKC) {
         if (wt.win) {  // uniform: depends on k0 only
             wt.stage_window(sw, mw);
-            __syncthreads();
+            lds_barrier();
         }
         xt.stage_f16(xs);
         wt.stage_f16(ws, sw, mw, k0);
-        __syncthreads();
+        lds_barrier();
         if (k0 + kWmmaKC < r) {
             xt.fetch(h, hoff, rows_x, k0 + kWmmaKC);
             wt.fetch(q, scale, minv, N, r, d, j0, k0 + kWmmaKC);
         }
         wmma_step_f16<2, 2>(xs, ws, wm * 32, wn * 32, acc);
-        __syncthreads();
+        lds_barrier();
     }
     const int s = wn;  // this wave's columns are stream s
 #pragma unroll
@@ -250,7 +341,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
         for (int j = 0; j < 2; ++j)
 #pragma unroll
             for (int v = 0; v < 8; ++v) {
-                const int row = wm * 32 + i * 16 + wmma_c_row(v), jj = j * 16 + threadIdx.x % 16;
+                const int row = wm * 32 + i * 16 + wmma_c_row(v), jj = j * 16 + (int)threadIdx.x % 16;
                 const int64_t t = m0 + row, g = (int64_t)s * d + j0 + jj;
                 float c = 0.f;
                 if (t < Tn) {
@@ -259,8 +350,8 @@ __global__ void __launch_bounds__(kWmmaThreads)
                 }
                 contrib[(s * BM + row) * kUpJ + jj] = c;
             }
-    __syncthreads();
-    for (int i = threadIdx.x; i < BM * kUpJ; i += kWmmaThreads) {
+    lds_barrier();
+    for (int i = (int)threadIdx.x; i < BM * kUpJ; i += kWmmaThreads) {
         const int row = i / kUpJ, jj = i % kUpJ;
         const int64_t t = m0 + row;
         if (t >= Tn) continue;
@@ -268,6 +359,114 @@ __global__ void __launch_bounds__(kWmmaThreads)
 #pragma unroll
         for (int k = 0; k < kH; ++k) sum += contrib[(k * BM + row) * kUpJ + jj];
         store(u, t * d + j0 + jj, sum / (float)kH);
+    }
+}
+
+// Up with BM = 128 (8 waves as 2 x 4, each 64 x 32: acc[4][2]).
+// Epilogue reuses LDS in two 64-row passes (wm = 0 then wm = 1) and vectorizes x loads and u stores via uint4.
+template <typename T, int BITS, int G>
+__global__ void __launch_bounds__(kWmmaThreads)
+    hc_up_wmma_wide128_kernel(const float *h, const uint8_t *q, const uint16_t *scale, const uint16_t *minv, const T *x,
+                              const float *norm_w, const float *inv, int64_t Tn, int64_t d, int64_t r, T *u) {
+    constexpr int BM_WIDE = 128;
+    constexpr int kTileElems = (BM_WIDE + BN) * kWmmaLd; // 18432 uint16_t (36 KiB)
+    constexpr int kContribElems = kH * 64 * kUpJ;        // 8192 float (32 KiB)
+    static_assert(kTileElems * 2 >= kContribElems * 4, "smem big enough for contrib");
+
+    __shared__ __attribute__((aligned(16))) unsigned char smem[kTileElems * 2];
+    uint16_t *xs = reinterpret_cast<uint16_t *>(smem), *ws = xs + BM_WIDE * kWmmaLd;
+    float *contrib = reinterpret_cast<float *>(smem);
+
+    __shared__ uint16_t sw[BN * UpCodes<BITS, G>::kWin], mw[BN * UpCodes<BITS, G>::kWin];
+    __shared__ int64_t hoff[BM_WIDE];
+    const int64_t j0 = (int64_t)blockIdx.x * kUpJ, m0 = (int64_t)blockIdx.y * BM_WIDE, N = kH * d;
+    const int rows_x = (int)(Tn - m0 < BM_WIDE ? Tn - m0 : BM_WIDE);
+    if (threadIdx.x < BM_WIDE) hoff[threadIdx.x] = (m0 + threadIdx.x) * r;
+    const int wave = threadIdx.x / 32, wm = wave / 4, wn = wave % 4;
+    wmma_f32x8 acc[4][2] = {};
+    lds_barrier();
+
+    WmmaXTileF32ToF16<BM_WIDE> xt;
+    UpCodes<BITS, G> wt;
+    xt.fetch(h, hoff, rows_x, 0);
+    wt.fetch(q, scale, minv, N, r, d, j0, 0);
+    for (int64_t k0 = 0; k0 < r; k0 += kWmmaKC) {
+        if (wt.win) {
+            wt.stage_window(sw, mw);
+            lds_barrier();
+        }
+        xt.stage_f16(xs);
+        wt.stage_f16(ws, sw, mw, k0);
+        lds_barrier();
+        if (k0 + kWmmaKC < r) {
+            xt.fetch(h, hoff, rows_x, k0 + kWmmaKC);
+            wt.fetch(q, scale, minv, N, r, d, j0, k0 + kWmmaKC);
+        }
+        wmma_step_f16<4, 2>(xs, ws, wm * 64, wn * 32, acc);
+        lds_barrier();
+    }
+
+    const int s = wn; // wave's stream
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        lds_barrier();
+        if (wm == pass) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const int row_half = i * 16 + wmma_c_row(v);
+                        const int jj = j * 16 + (int)threadIdx.x % 16;
+                        const float z = 1.0f / (1.0f + expf(-acc[i][j][v]));
+                        contrib[(s * 64 + row_half) * kUpJ + jj] = z;
+                    }
+        }
+        lds_barrier();
+
+        const int row_half = (int)threadIdx.x / 4;
+        const int col_chunk = (int)threadIdx.x % 4;
+        const int jj0 = col_chunk * 8;
+        const int64_t t = m0 + pass * 64 + row_half;
+        if (t < Tn) {
+            float sum[8] = {0.f};
+#pragma unroll
+            for (int k = 0; k < kH; ++k) {
+                const float inv_val = inv[t * kH + k];
+                const float *nw = norm_w + k * d + j0 + jj0;
+                if constexpr (sizeof(T) == 2) {
+                    const uint4 x_u4 = *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(x) + (t * N + k * d + j0 + jj0));
+                    const uint16_t *xb = reinterpret_cast<const uint16_t *>(&x_u4);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const float z = contrib[(k * 64 + row_half) * kUpJ + jj0 + e];
+                        const float xf = to_f32(xb[e]);
+                        const float c = z * (xf * inv_val * (1.0f + nw[e]));
+                        sum[e] += c;
+                    }
+                } else {
+                    const float *xf = reinterpret_cast<const float *>(x) + (t * N + k * d + j0 + jj0);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const float z = contrib[(k * 64 + row_half) * kUpJ + jj0 + e];
+                        const float c = z * (xf[e] * inv_val * (1.0f + nw[e]));
+                        sum[e] += c;
+                    }
+                }
+            }
+            if constexpr (sizeof(T) == 2) {
+                uint4 u_u4;
+                uint16_t *ub = reinterpret_cast<uint16_t *>(&u_u4);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) ub[e] = wmma_f32_to_bf16(sum[e] / (float)kH);
+                *reinterpret_cast<uint4 *>(reinterpret_cast<uint16_t *>(u) + t * d + j0 + jj0) = u_u4;
+            } else {
+                float *uf = reinterpret_cast<float *>(u) + t * d + j0 + jj0;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) uf[e] = sum[e] / (float)kH;
+            }
+        }
     }
 }
 
@@ -314,9 +513,21 @@ void mix_down(const void *x, const QArrays &w, int64_t T, int64_t H, int64_t d, 
                 hc_wmma_workspace_bytes(T, H, R));
     dim3 grid((unsigned)((R + BN - 1) / BN), (unsigned)((T + BM - 1) / BM), (unsigned)H), block(kWmmaThreads);
     const unsigned epi_blocks = (unsigned)((T * R + 255) / 256);
+    const int64_t total_2d_blocks = (int64_t)((R + BN - 1) / BN) * (int64_t)((T + BM - 1) / BM);
+    const bool can_fuse = (total_2d_blocks >= 4 * (int64_t)device_mps());
     auto run = [&](auto tx) {
         using TX = decltype(tx);
         const TX *xp = static_cast<const TX *>(x);
+        if (can_fuse) {
+            if (!inv_ready) hc_inv_kernel<TX><<<(unsigned)T, kInvThreads, 0, stream>>>(xp, d, eps, inv);
+            dim3 grid_fused((unsigned)((R + BN - 1) / BN), (unsigned)((T + BM - 1) / BM), 1);
+            switch (w.G) {
+                case 32: hc_down_wmma_fused_kernel<TX, BITS, 32><<<grid_fused, block, 0, stream>>>(xp, w.q, w.scale, w.minv, R, r, d, T, inv, h, w_in); break;
+                case 64: hc_down_wmma_fused_kernel<TX, BITS, 64><<<grid_fused, block, 0, stream>>>(xp, w.q, w.scale, w.minv, R, r, d, T, inv, h, w_in); break;
+                default: hc_down_wmma_fused_kernel<TX, BITS, 128><<<grid_fused, block, 0, stream>>>(xp, w.q, w.scale, w.minv, R, r, d, T, inv, h, w_in); break;
+            }
+            return;
+        }
         if (!inv_ready) hc_inv_kernel<TX><<<(unsigned)T, kInvThreads, 0, stream>>>(xp, d, eps, inv);
         switch (w.G) {
             case 32: hc_down_wmma_kernel<TX, BITS, 32><<<grid, block, 0, stream>>>(xp, w.q, w.scale, w.minv, R, d, T, ws); break;
@@ -351,10 +562,19 @@ void mix_up(const float *h, const QArrays &w, const void *x, const float *norm_w
         using TX = decltype(tx);
         const TX *xp = static_cast<const TX *>(x);
         TX *up = static_cast<TX *>(u);
-        switch (w.G) {
-            case 32: hc_up_wmma_kernel<TX, BITS, 32><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
-            case 64: hc_up_wmma_kernel<TX, BITS, 64><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
-            default: hc_up_wmma_kernel<TX, BITS, 128><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+        if (T >= 1024) {
+            dim3 grid_wide((unsigned)(d / kUpJ), (unsigned)((T + 128 - 1) / 128));
+            switch (w.G) {
+                case 32: hc_up_wmma_wide128_kernel<TX, BITS, 32><<<grid_wide, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+                case 64: hc_up_wmma_wide128_kernel<TX, BITS, 64><<<grid_wide, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+                default: hc_up_wmma_wide128_kernel<TX, BITS, 128><<<grid_wide, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+            }
+        } else {
+            switch (w.G) {
+                case 32: hc_up_wmma_kernel<TX, BITS, 32><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+                case 64: hc_up_wmma_kernel<TX, BITS, 64><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+                default: hc_up_wmma_kernel<TX, BITS, 128><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, xp, norm_w, inv, T, d, w.K, up); break;
+            }
         }
     };
     if (act == Act::F32) run(float{});
@@ -407,13 +627,14 @@ void hc_inject_inv(void *x, const float *w_in, const void *y, int64_t T, int64_t
     const auto xb = reinterpret_cast<uintptr_t>(x), yb = reinterpret_cast<uintptr_t>(y);
     STRIX_CHECK(yb + (uintptr_t)(T * d) * es <= xb || xb + (uintptr_t)(T * H * d) * es <= yb, fn,
                 ": y overlaps the streams x");
-    if (act == Act::F32)
+    if (act == Act::F32) {
         hc_inject_inv_kernel<float><<<(unsigned)T, kInvThreads, 0, stream>>>(static_cast<float *>(x), w_in,
                                                                              static_cast<const float *>(y), d, eps, inv);
-    else
+    } else {
         hc_inject_inv_kernel<uint16_t><<<(unsigned)T, kInvThreads, 0, stream>>>(static_cast<uint16_t *>(x), w_in,
                                                                                 static_cast<const uint16_t *>(y), d, eps,
                                                                                 inv);
+    }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), " T=", T, " d=", d);
 }
 

@@ -156,17 +156,7 @@ struct View {
     int64_t N, K, G;
 };
 
-// Multiprocessors as HIP reports them (WGPs on gfx1151: 20 for 40 CUs).
-int device_mps() {
-    static const int n = [] {
-        int dev = 0, v = 0;
-        STRIX_HIP_CHECK(hipGetDevice(&dev), "linear_wmma: current device");
-        STRIX_HIP_CHECK(hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev), "linear_wmma: MP count");
-        STRIX_CHECK(v >= 1, "linear_wmma: device reports ", v, " multiprocessors");
-        return v;
-    }();
-    return n;
-}
+
 
 // Row tile 128 when that still gives >= 8 blocks per WGP, else 64. Measured: 128 rows +10-15% on in_proj / qkv at T = 512 / 2048 and out_proj / o_proj at 2048 (the weight codes
 // staged once for twice the rows), but -12% on out_proj / o_proj at 512 (N = 2560: 80 blocks for 20 WGPs).

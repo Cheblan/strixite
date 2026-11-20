@@ -3,7 +3,6 @@
 // Host-side device facts the kernel launchers size grids from.
 
 #include "common/hip_check.hpp"
-
 #include "common/hip_runtime.hpp"
 
 namespace strix::kernels {
@@ -22,6 +21,19 @@ inline int device_warp_size(int block_threads) {
     }
     STRIX_CHECK(block_threads % cached == 0, "block size ", block_threads, " not a multiple of wavefront size ",
                 cached);
+    return cached;
+}
+
+// Multiprocessors as HIP reports them (WGPs on gfx1151: 20 for 40 CUs).
+inline int device_mps() {
+    static int cached = 0;
+    if (!cached) {
+        int dev = 0, v = 0;
+        STRIX_HIP_CHECK(hipGetDevice(&dev), "current device");
+        STRIX_HIP_CHECK(hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev), "MP count");
+        STRIX_CHECK(v >= 1, "device reports ", v, " multiprocessors");
+        cached = v;
+    }
     return cached;
 }
 
