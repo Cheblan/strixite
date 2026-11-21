@@ -225,14 +225,27 @@ const VisionTower &Qwen4ExpModel::vision() const {
     return *vision_;
 }
 
-void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
-    const char *fn = "Qwen4ExpModel::make_draft_head_q4";
+void Qwen4ExpModel::make_draft_head(int64_t rows, bool quantize_q4, int64_t G, int threads) {
+    const char *fn = "Qwen4ExpModel::make_draft_head";
     STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
     STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
     STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
     const int64_t N = lm_head_.N(), K = lm_head_.K();
     STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
     STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
+
+    if (!quantize_q4) {
+        draft_head_ = lm_head_;
+        switch (draft_head_.bits) {
+            case 8: draft_head_.q8.N = rows; break;
+            case 6: draft_head_.q6.N = rows; break;
+            case 4: draft_head_.q4.N = rows; break;
+            default: STRIX_FAIL(fn, ": unsupported bits ", draft_head_.bits);
+        }
+        compact_to_vocab_.clear();
+        return;
+    }
+
     STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
     STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
     STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
@@ -297,12 +310,12 @@ void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
                 draft_head_.K(), "], expected [", rows, ", ", K, "]");
 }
 
-void Qwen4ExpModel::make_draft_head_q4(const std::vector<int32_t> &selected_rows, int64_t G, int threads) {
+void Qwen4ExpModel::make_draft_head(const std::vector<int32_t> &selected_rows, bool quantize_q4, int64_t G, int threads) {
     if (selected_rows.empty()) {
-        make_draft_head_q4(dims_.vocab, G, threads);
+        make_draft_head(dims_.vocab, quantize_q4, G, threads);
         return;
     }
-    const char *fn = "Qwen4ExpModel::make_draft_head_q4(selected_rows)";
+    const char *fn = "Qwen4ExpModel::make_draft_head(selected_rows)";
     STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
     STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
     STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
@@ -310,6 +323,85 @@ void Qwen4ExpModel::make_draft_head_q4(const std::vector<int32_t> &selected_rows
     STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
     const int64_t rows = (int64_t)selected_rows.size();
     STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
+
+    if (!quantize_q4) {
+        if (lm_head_.bits == 6) {
+            const Q6DeviceView &v = lm_head_.q6;
+            STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q6 LM head view is incomplete");
+
+            const int64_t rb = q6_row_bytes(K);
+            const int64_t groups_per_row = K / v.G;
+
+            Q6Weight q6;
+            q6.N = rows, q6.K = K, q6.G = v.G;
+            q6.q.resize((size_t)(rows * rb));
+            q6.scale.resize((size_t)(rows * groups_per_row));
+            q6.minv.resize(q6.scale.size());
+
+            std::vector<uint8_t> full_q((size_t)(N * rb));
+            std::vector<uint16_t> full_scale((size_t)(N * groups_per_row));
+            std::vector<uint16_t> full_minv(full_scale.size());
+            STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q6 codes");
+            STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q6 scales");
+            STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q6 mins");
+
+            for (int64_t i = 0; i < rows; ++i) {
+                const int64_t src = selected_rows[(size_t)i];
+                STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
+                std::memcpy(q6.q.data() + i * rb, full_q.data() + src * rb, (size_t)rb);
+                std::memcpy(q6.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
+                            (size_t)(groups_per_row * sizeof(uint16_t)));
+                std::memcpy(q6.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
+                            (size_t)(groups_per_row * sizeof(uint16_t)));
+            }
+
+            draft_q6_ = std::make_unique<Q6Device>(Q6Device::upload(q6, "lm_head.mtp_draft_q6"));
+            draft_q6_bytes_ = q6.bytes();
+            draft_head_ = qweight(draft_q6_->view());
+            compact_to_vocab_ = selected_rows;
+            STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
+                        draft_head_.K(), "], expected [", rows, ", ", K, "]");
+            return;
+        } else if (lm_head_.bits == 8) {
+            const Q8DeviceView &v = lm_head_.q8;
+            STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is incomplete");
+
+            const int64_t groups_per_row = K / v.G;
+            Q8Weight q8;
+            q8.N = rows, q8.K = K, q8.G = v.G;
+            q8.q.resize((size_t)(rows * K));
+            q8.scale.resize((size_t)(rows * groups_per_row));
+            q8.minv.resize(q8.scale.size());
+
+            std::vector<uint8_t> full_q((size_t)(N * K));
+            std::vector<uint16_t> full_scale((size_t)(N * groups_per_row));
+            std::vector<uint16_t> full_minv(full_scale.size());
+            STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q8 codes");
+            STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 scales");
+            STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 mins");
+
+            for (int64_t i = 0; i < rows; ++i) {
+                const int64_t src = selected_rows[(size_t)i];
+                STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
+                std::memcpy(q8.q.data() + i * K, full_q.data() + src * K, (size_t)K);
+                std::memcpy(q8.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
+                            (size_t)(groups_per_row * sizeof(uint16_t)));
+                std::memcpy(q8.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
+                            (size_t)(groups_per_row * sizeof(uint16_t)));
+            }
+
+            draft_q8_ = std::make_unique<Q8Device>(Q8Device::upload(q8, "lm_head.mtp_draft_q8"));
+            draft_q8_bytes_ = q8.bytes();
+            draft_head_ = qweight(draft_q8_->view());
+            compact_to_vocab_ = selected_rows;
+            STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
+                        draft_head_.K(), "], expected [", rows, ", ", K, "]");
+            return;
+        } else {
+            STRIX_FAIL(fn, ": native slicing unsupported for bits ", lm_head_.bits);
+        }
+    }
+
     STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
     STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
     STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");

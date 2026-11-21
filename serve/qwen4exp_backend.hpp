@@ -51,7 +51,13 @@ public:
         if (draft.bits == 4 && draft.N() > 0) {
             return 0.550f + 1.090f * (float(draft.N()) / 248320.0f);
         }
-        return 3.405f;  // Q8 lm_head fallback
+        if (draft.bits == 6 && draft.N() > 0) {
+            return 0.550f + 1.450f * (float(draft.N()) / 248320.0f);
+        }
+        if (draft.bits == 8 && draft.N() > 0) {
+            return 0.550f + 1.850f * (float(draft.N()) / 248320.0f);
+        }
+        return 3.405f;  // LM head fallback
     }
     std::vector<float> forward_mtp(int32_t token_id, int64_t step) override {
         return session_->forward_mtp(token_id, step);
