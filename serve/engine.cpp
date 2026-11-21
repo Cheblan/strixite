@@ -61,21 +61,21 @@ inline float interpolate_mtp_prob(float delta) {
 // T = 1: 26.69 ms, T = 2: 32.12 ms, T = 3: 36.62 ms, T = 4: 41.28 ms,
 // T = 5: 45.91 ms, T = 6: 48.33 ms (Grouped WMMA MoE active), T = 7: 53.54 ms, T = 8: 57.94 ms
 // Measured hardware latency profile on AMD Strix Halo (gfx1151, Qwen 3.8-Flash-Next in ms).
-// Refreshed live steady_clock measurements:
-// T = 1: 26.84 ms, T = 2: 32.13 ms, T = 3: 36.62 ms, T = 4: 41.60 ms,
-// T = 5: 46.11 ms, T = 6: 46.89 ms (Grouped WMMA MoE active), T = 7: 50.04 ms, T = 8: 54.33 ms
+// Refreshed live steady_clock measurements with Q6-dense weights:
+// T = 1: 26.13 ms, T = 2: 30.98 ms, T = 3: 35.48 ms, T = 4: 40.02 ms,
+// T = 5: 45.38 ms, T = 6: 46.30 ms (Grouped WMMA MoE active), T = 7: 51.08 ms, T = 8: 55.09 ms
 static constexpr float kVerifyLatencyMs[] = {
     0.0f,     // T = 0
-    26.84f,   // T = 1
-    32.13f,   // T = 2
-    36.62f,   // T = 3
-    41.60f,   // T = 4
-    46.11f,   // T = 5
-    46.89f,   // T = 6
-    50.04f,   // T = 7
-    54.33f    // T = 8
+    26.13f,   // T = 1
+    30.98f,   // T = 2
+    35.48f,   // T = 3
+    40.02f,   // T = 4
+    45.38f,   // T = 5
+    46.30f,   // T = 6
+    51.08f,   // T = 7
+    55.09f    // T = 8
 };
-static constexpr float kDefaultMtpDraftStepMs = 1.69f;
+static constexpr float kDefaultMtpDraftStepMs = 1.65f;
 
 inline float get_verify_cost(int64_t T) {
     if (T < 0) return 0.0f;
