@@ -29,6 +29,18 @@ Q8Weight q8_rows(const Q8Weight &src, int64_t r0, int64_t r1) {
     return w;
 }
 
+// Rows [r0, r1) of src as their own Q6 weight (row-major: a contiguous slice of every array).
+Q6Weight q6_rows(const Q6Weight &src, int64_t r0, int64_t r1) {
+    const int64_t rb = q6_row_bytes(src.K);
+    const int64_t gpr = src.K / src.G;
+    Q6Weight w;
+    w.N = r1 - r0, w.K = src.K, w.G = src.G;
+    w.q.assign(src.q.begin() + r0 * rb, src.q.begin() + r1 * rb);
+    w.scale.assign(src.scale.begin() + r0 * gpr, src.scale.begin() + r1 * gpr);
+    w.minv.assign(src.minv.begin() + r0 * gpr, src.minv.begin() + r1 * gpr);
+    return w;
+}
+
 }  // namespace
 
 Q4Weight quantize_q4_from_q8(const Q8Weight &src, int64_t G, int threads) {
@@ -82,6 +94,59 @@ Q4Weight quantize_q4_from_q8(const Q8Weight &src, int64_t G, int threads) {
     STRIX_CHECK(out.N == src.N && out.K == src.K && out.G == G, "quantize_q4_from_q8: result [", out.N, ", ", out.K,
                 "] G ", out.G, ", expected [", src.N, ", ", src.K, "] G ", G);
     check_q4(out, "quantize_q4_from_q8: result");
+    return out;
+}
+
+Q4Weight quantize_q4_from_q6(const Q6Weight &src, int64_t G, int threads) {
+    check_q6(src, "quantize_q4_from_q6: src");
+    STRIX_CHECK(q4_group_size_supported(G), "quantize_q4_from_q6: Q4 group size ", G, ", expected 32, 64 or 128");
+    STRIX_CHECK(src.K % G == 0, "quantize_q4_from_q6: K = ", src.K, " is not a multiple of the Q4 group size ", G);
+    STRIX_CHECK(threads >= 1 && threads <= 64, "quantize_q4_from_q6: threads ", threads, ", expected 1..64");
+
+    const int64_t items = (src.N + kRowsPerItem - 1) / kRowsPerItem;
+    std::vector<Q4Weight> parts((size_t)items);
+    std::atomic<int64_t> next{0};
+    std::mutex err_mu;
+    std::string first_err;
+    auto worker = [&] {
+        for (;;) {
+            const int64_t i = next.fetch_add(1);
+            if (i >= items) return;
+            {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (!first_err.empty()) return;
+            }
+            const int64_t r0 = i * kRowsPerItem, r1 = std::min(src.N, r0 + kRowsPerItem);
+            try {
+                const Q6Weight rows = q6_rows(src, r0, r1);
+                const std::vector<float> f = dequantize_q6(rows);
+                parts[(size_t)i] = quantize_q4(f.data(), rows.N, rows.K, G);
+            } catch (const std::exception &e) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (first_err.empty())
+                    first_err = "rows [" + std::to_string(r0) + ", " + std::to_string(r1) + "): " + e.what();
+                return;
+            }
+        }
+    };
+    const int n = (int)std::min<int64_t>(threads, items);
+    std::vector<std::thread> pool;
+    pool.reserve((size_t)n);
+    try {
+        for (int t = 0; t < n; ++t) pool.emplace_back(worker);
+    } catch (const std::exception &e) {
+        next.store(items);
+        for (std::thread &th : pool) th.join();
+        STRIX_FAIL("quantize_q4_from_q6: starting worker ", pool.size() + 1, " of ", n, " failed: ", e.what());
+    }
+    for (std::thread &th : pool) th.join();
+    STRIX_CHECK(first_err.empty(), "quantize_q4_from_q6: ", first_err);
+
+    Q4Weight out;
+    for (const Q4Weight &p : parts) append_rows_q4(out, p, "quantize_q4_from_q6");
+    STRIX_CHECK(out.N == src.N && out.K == src.K && out.G == G, "quantize_q4_from_q6: result [", out.N, ", ", out.K,
+                "] G ", out.G, ", expected [", src.N, ", ", src.K, "] G ", G);
+    check_q4(out, "quantize_q4_from_q6: result");
     return out;
 }
 

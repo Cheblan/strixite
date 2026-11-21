@@ -244,27 +244,51 @@ void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
         draft_head_.q4.N = rows;
         return;
     }
-    STRIX_CHECK(lm_head_.bits == 8, fn, ": the LM head has ", lm_head_.bits, " bits, expected 8 (requantized) or 4 (used ",
-                "as loaded)");
+    STRIX_CHECK(lm_head_.bits == 8 || lm_head_.bits == 6, fn, ": the LM head has ", lm_head_.bits,
+                " bits, expected 8, 6 (requantized) or 4 (used as loaded)");
 
-    // Read the Q8 rows back (row-major: the first `rows` rows are a prefix of each array).
-    const Q8DeviceView &v = lm_head_.q8;
-    STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is ",
-                "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
-                (const void *)v.minv, ", K ", v.K, ", G ", v.G, ")");
-    Q8Weight q8;
-    q8.N = rows, q8.K = K, q8.G = v.G;
-    q8.q.resize((size_t)(rows * K));
-    q8.scale.resize((size_t)(rows * (K / v.G)));
-    q8.minv.resize(q8.scale.size());
-    STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q8.q.size(),
-                    " bytes of Q8 codes");
-    STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
-                    q8.scale.size(), " Q8 scales");
-    STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
-                    q8.minv.size(), " Q8 mins");
+    Q4Weight q4;
+    if (lm_head_.bits == 8) {
+        // Read the Q8 rows back (row-major: the first `rows` rows are a prefix of each array).
+        const Q8DeviceView &v = lm_head_.q8;
+        STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is ",
+                    "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
+                    (const void *)v.minv, ", K ", v.K, ", G ", v.G, ")");
+        Q8Weight q8;
+        q8.N = rows, q8.K = K, q8.G = v.G;
+        q8.q.resize((size_t)(rows * K));
+        q8.scale.resize((size_t)(rows * (K / v.G)));
+        q8.minv.resize(q8.scale.size());
+        STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q8.q.size(),
+                        " bytes of Q8 codes");
+        STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q8.scale.size(), " Q8 scales");
+        STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q8.minv.size(), " Q8 mins");
 
-    const Q4Weight q4 = quantize_q4_from_q8(q8, G, threads);
+        q4 = quantize_q4_from_q8(q8, G, threads);
+    } else {
+        // Read the Q6 rows back (row-major: the first `rows` rows are a prefix of each array).
+        const Q6DeviceView &v = lm_head_.q6;
+        STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q6 LM head view is ",
+                    "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
+                    (const void *)v.minv, ", K ", v.K, ", G ", v.G, ")");
+        const int64_t rb = q6_row_bytes(K);
+        Q6Weight q6;
+        q6.N = rows, q6.K = K, q6.G = v.G;
+        q6.q.resize((size_t)(rows * rb));
+        q6.scale.resize((size_t)(rows * (K / v.G)));
+        q6.minv.resize(q6.scale.size());
+        STRIX_HIP_CHECK(hipMemcpy(q6.q.data(), v.q, q6.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q6.q.size(),
+                        " bytes of Q6 codes");
+        STRIX_HIP_CHECK(hipMemcpy(q6.scale.data(), v.scale, q6.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q6.scale.size(), " Q6 scales");
+        STRIX_HIP_CHECK(hipMemcpy(q6.minv.data(), v.minv, q6.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                        q6.minv.size(), " Q6 mins");
+
+        q4 = quantize_q4_from_q6(q6, G, threads);
+    }
+
     draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
     draft_q4_bytes_ = q4.bytes();
     draft_head_ = qweight(draft_q4_->view());
@@ -290,37 +314,73 @@ void Qwen4ExpModel::make_draft_head_q4(const std::vector<int32_t> &selected_rows
     STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
     STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
 
-    STRIX_CHECK(lm_head_.bits == 8, fn, ": compact filtering requires Q8 LM head, got ", lm_head_.bits, " bits");
+    STRIX_CHECK(lm_head_.bits == 8 || lm_head_.bits == 6, fn, ": compact filtering requires Q8 or Q6 LM head, got ",
+                lm_head_.bits, " bits");
 
-    const Q8DeviceView &v = lm_head_.q8;
-    STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is incomplete");
+    Q4Weight q4;
+    if (lm_head_.bits == 8) {
+        const Q8DeviceView &v = lm_head_.q8;
+        STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is incomplete");
 
-    Q8Weight q8;
-    q8.N = rows, q8.K = K, q8.G = v.G;
-    q8.q.resize((size_t)(rows * K));
-    q8.scale.resize((size_t)(rows * (K / v.G)));
-    q8.minv.resize(q8.scale.size());
+        Q8Weight q8;
+        q8.N = rows, q8.K = K, q8.G = v.G;
+        q8.q.resize((size_t)(rows * K));
+        q8.scale.resize((size_t)(rows * (K / v.G)));
+        q8.minv.resize(q8.scale.size());
 
-    // Read full Q8 arrays back once
-    std::vector<uint8_t> full_q((size_t)(N * K));
-    std::vector<uint16_t> full_scale((size_t)(N * (K / v.G)));
-    std::vector<uint16_t> full_minv(full_scale.size());
-    STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q8 codes");
-    STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 scales");
-    STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 mins");
+        // Read full Q8 arrays back once
+        std::vector<uint8_t> full_q((size_t)(N * K));
+        std::vector<uint16_t> full_scale((size_t)(N * (K / v.G)));
+        std::vector<uint16_t> full_minv(full_scale.size());
+        STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q8 codes");
+        STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 scales");
+        STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q8 mins");
 
-    const int64_t groups_per_row = K / v.G;
-    for (int64_t i = 0; i < rows; ++i) {
-        const int64_t src = selected_rows[(size_t)i];
-        STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
-        std::memcpy(q8.q.data() + i * K, full_q.data() + src * K, (size_t)K);
-        std::memcpy(q8.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
-                    (size_t)(groups_per_row * sizeof(uint16_t)));
-        std::memcpy(q8.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
-                    (size_t)(groups_per_row * sizeof(uint16_t)));
+        const int64_t groups_per_row = K / v.G;
+        for (int64_t i = 0; i < rows; ++i) {
+            const int64_t src = selected_rows[(size_t)i];
+            STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
+            std::memcpy(q8.q.data() + i * K, full_q.data() + src * K, (size_t)K);
+            std::memcpy(q8.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
+                        (size_t)(groups_per_row * sizeof(uint16_t)));
+            std::memcpy(q8.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
+                        (size_t)(groups_per_row * sizeof(uint16_t)));
+        }
+
+        q4 = quantize_q4_from_q8(q8, G, threads);
+    } else {
+        const Q6DeviceView &v = lm_head_.q6;
+        STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q6 LM head view is incomplete");
+
+        const int64_t rb = q6_row_bytes(K);
+        const int64_t groups_per_row = K / v.G;
+
+        Q6Weight q6;
+        q6.N = rows, q6.K = K, q6.G = v.G;
+        q6.q.resize((size_t)(rows * rb));
+        q6.scale.resize((size_t)(rows * groups_per_row));
+        q6.minv.resize(q6.scale.size());
+
+        // Read full Q6 arrays back once
+        std::vector<uint8_t> full_q((size_t)(N * rb));
+        std::vector<uint16_t> full_scale((size_t)(N * groups_per_row));
+        std::vector<uint16_t> full_minv(full_scale.size());
+        STRIX_HIP_CHECK(hipMemcpy(full_q.data(), v.q, full_q.size(), hipMemcpyDeviceToHost), fn, ": read back full Q6 codes");
+        STRIX_HIP_CHECK(hipMemcpy(full_scale.data(), v.scale, full_scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q6 scales");
+        STRIX_HIP_CHECK(hipMemcpy(full_minv.data(), v.minv, full_minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back full Q6 mins");
+
+        for (int64_t i = 0; i < rows; ++i) {
+            const int64_t src = selected_rows[(size_t)i];
+            STRIX_CHECK(src >= 0 && src < N, fn, ": selected row ", src, " out of range [0, ", N, ")");
+            std::memcpy(q6.q.data() + i * rb, full_q.data() + src * rb, (size_t)rb);
+            std::memcpy(q6.scale.data() + i * groups_per_row, full_scale.data() + src * groups_per_row,
+                        (size_t)(groups_per_row * sizeof(uint16_t)));
+            std::memcpy(q6.minv.data() + i * groups_per_row, full_minv.data() + src * groups_per_row,
+                        (size_t)(groups_per_row * sizeof(uint16_t)));
+        }
+
+        q4 = quantize_q4_from_q6(q6, G, threads);
     }
-
-    const Q4Weight q4 = quantize_q4_from_q8(q8, G, threads);
     draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
     draft_q4_bytes_ = q4.bytes();
     draft_head_ = qweight(draft_q4_->view());

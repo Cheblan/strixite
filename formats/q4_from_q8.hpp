@@ -13,6 +13,7 @@
 // and append_rows_q4 makes the result byte-identical to one call over all rows.
 
 #include "formats/q4.hpp"
+#include "formats/q6.hpp"
 #include "formats/q8.hpp"
 
 #include <cstdint>
@@ -24,5 +25,8 @@ namespace strix {
 // Throws, naming the parameter and the values, on an inconsistent src, an unsupported G, a K that G doesn't divide,
 // a thread count out of range, or a failure in any worker (the first worker's message is rethrown).
 Q4Weight quantize_q4_from_q8(const Q8Weight &src, int64_t G, int threads);
+
+// src: a Q6 weight (check_q6-consistent); requantizes via dequantize_q6 into Q4.
+Q4Weight quantize_q4_from_q6(const Q6Weight &src, int64_t G, int threads);
 
 }  // namespace strix
