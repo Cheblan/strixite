@@ -52,7 +52,7 @@ public:
             return 0.550f + 1.090f * (float(draft.N()) / 248320.0f);
         }
         if (draft.bits == 6 && draft.N() > 0) {
-            return 0.550f + 1.450f * (float(draft.N()) / 248320.0f);
+            return 0.550f + 2.330f * (float(draft.N()) / 248320.0f);
         }
         if (draft.bits == 8 && draft.N() > 0) {
             return 0.550f + 1.850f * (float(draft.N()) / 248320.0f);
