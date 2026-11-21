@@ -331,7 +331,7 @@ __device__ __forceinline__ float row_xor(float x) {
 // One (attention-precision fast): P as one BF16 term - no lo half written, loaded or multiplied. Defer: kDeferK below
 // (wmma_attention_launch picks it by the call's size).
 template <bool GATHER, bool One, bool Defer, bool SingleSplit, typename R>
-__global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_eu(7)))
+__global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_eu(4, 6))) 
     attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, R kv, int64_t Hq, int64_t Hk, int64_t pos0, int64_t kps, float scale,
                                   float *ws, int64_t splits, const int32_t *sel, const int32_t *nsel, int64_t sel_ld,
                                   uint32_t *err, const uint16_t *gate = nullptr, uint16_t *out = nullptr) {
@@ -412,9 +412,8 @@ __global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_
     // 2 kp2 + 1 of the lane's dim group) are loaded into registers while tile k0 computes.
     const int kp2 = lane % 8, grp = lane / 8;
     constexpr int kKLoads = kDW / 8, kVLoads = kDW / 32;  // 16-byte loads per lane per tile
+    const int64_t c0 = kh * kD + d_w;
     uint4 kr[kKLoads], va_r[kVLoads], vb_r[kVLoads];
-    uint4 kpf0 = make_uint4(0, 0, 0, 0), kpf1 = kpf0;  // kDeferK: this lane's 8 param words of the next tile
-    bool kx = false;                                  // kDeferK: this lane's next K row is exact (kr holds BF16)
     auto load_tile = [&](int32_t t0) {
         const int32_t krow = t0 + col < ke32 ? kpos_of(t0 + col) : pos32;
         const int32_t ka = t0 + 2 * kp2, kb2 = ka + 1;
@@ -439,25 +438,15 @@ __global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_
         }
         if constexpr (kDeferK) {
             // Codes raw, or the exact BF16 row (a key past ke reads the call's own row, exact; its S is masked).
-            kx = t0 + col >= ke32 || krow >= g032;
+            const bool kx_load = t0 + col >= ke32 || krow >= g032;
 #pragma unroll
             for (int i = 0; i < kKLoads; ++i) {
-                if (kx) {
+                if (kx_load) {
                     kr[i] = kv.kexact(krow, c0 + 8 * i);
                 } else {
                     const uint2 u = kv.kcodes(krow, c0 + 8 * i);
                     kr[i] = make_uint4(u.x, u.y, 0u, 0u);
                 }
-            }
-            // The tile's params: quad lane / 8 (keys t0 + 4 q .. + 3), dims c0 + 8 (lane % 8) .. + 7. A quad's keys are
-            // 4 consecutive positions from a multiple of 4 (tiles, QSA blocks and the gathered tail all start on one),
-            // so they share a K group (kKv8Group = 32); a quad past ke or exact loads none.
-            const int32_t jq = t0 + 4 * (lane / 8), prow = jq < ke32 ? kpos_of(jq) : g032;
-            if (prow < g032) {
-                const uint4 *pp = reinterpret_cast<const uint4 *>(kv.kparams(prow, c0 + 8 * (lane % 8)));
-                kpf0 = pp[0], kpf1 = pp[1];
-            } else {
-                kpf0 = kpf1 = make_uint4(0, 0, 0, 0);
             }
         } else {
 #pragma unroll
@@ -480,18 +469,25 @@ __global__ void __launch_bounds__(kWWaves * 32) __attribute__((amdgpu_waves_per_
     for (int32_t k0 = kb32; k0 < ke32; k0 += 16) {
         const bool valid = k0 + col < ke32;
         if constexpr (kDeferK) {
-            // This tile's K as F16 (Kv8Reader::k16_from - k16 bit for bit): params into the wave's LDS slot, then each
-            // lane its quad's words; the fence orders the reads before this wave's partials overwrite the slot.
+            // Load this tile's params directly into sp[w] (1 KB = 4 quads x kDW words) without keeping them in VGPR across tiles
+            const int32_t jq = k0 + 4 * (lane / 8), prow = jq < ke32 ? kpos_of(jq) : g032;
+            uint4 p0 = make_uint4(0, 0, 0, 0), p1 = p0;
+            if (prow < g032) {
+                const uint4 *pp = reinterpret_cast<const uint4 *>(kv.kparams(prow, c0 + 8 * (lane % 8)));
+                p0 = pp[0], p1 = pp[1];
+            }
             uint32_t *kpl = reinterpret_cast<uint32_t *>(&sp[w][0][0]);
             uint4 *dst = reinterpret_cast<uint4 *>(kpl + (lane / 8) * kDW + 8 * (lane % 8));
-            dst[0] = kpf0, dst[1] = kpf1;
+            dst[0] = p0, dst[1] = p1;
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
             const uint32_t *pq = kpl + (col / 4) * kDW;
+            const int32_t krow_k0 = k0 + col < ke32 ? kpos_of(k0 + col) : pos32;
+            const bool kx_k0 = k0 + col >= ke32 || krow_k0 >= g032;
 #pragma unroll
             for (int i = 0; i < kKLoads; ++i)
-                kr[i] = kx ? kv8_math::bf16_to_f16x8(kr[i]) : R::k16_from(make_uint2(kr[i].x, kr[i].y), pq + 8 * i);
+                kr[i] = kx_k0 ? kv8_math::bf16_to_f16x8(kr[i]) : R::k16_from(make_uint2(kr[i].x, kr[i].y), pq + 8 * i);
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
