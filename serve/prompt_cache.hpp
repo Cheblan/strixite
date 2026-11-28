@@ -314,6 +314,17 @@ public:
             }
             gov_ = nullptr, bytes_ = 0;
         }
+        // Part of the allocation has landed: release up to `n` booked bytes so MemAvailable isn't double-counted.
+        void consume(uint64_t n) noexcept {
+            if (!gov_ || !bytes_ || n == 0) return;
+            const uint64_t drop = std::min(bytes_, n);
+            try {
+                gov_->release(drop);
+            } catch (...) {
+            }
+            bytes_ -= drop;
+            if (bytes_ == 0) gov_ = nullptr;
+        }
 
     private:
         MemoryGovernor *gov_ = nullptr;
@@ -410,7 +421,8 @@ private:
     // entry is therefore written AFTER its state (the whole-buffer path has its hash before it writes).
     uint64_t write_paged_state(int fd, const Entry &e, uint64_t state_at, const std::string &path) const;
     // A state from disk: header, tokens (must equal prompt[0, n)) and checksum checked; throws.
-    void load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n, HostBuffer &state) const;
+    void load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n, HostBuffer &state,
+                   RoomGrant *room = nullptr) const;
     // file_total of e, plus its base's if a write of e would have to write the base first.
     uint64_t write_bytes_locked(const Entry &e) const;
     int find_locked(const int32_t *tokens, int64_t n) const;

@@ -373,7 +373,7 @@ void PromptCache::release_locked(Entry &e) {
 }
 
 void PromptCache::load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n,
-                            HostBuffer &state) const {
+                            HostBuffer &state, RoomGrant *room) const {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     STRIX_CHECK(fd >= 0, path, ": open failed: ", std::strerror(errno));
     try {
@@ -382,9 +382,18 @@ void PromptCache::load_file(const std::string &path, const std::vector<int32_t> 
         std::vector<int32_t> tokens(h.tokens);
         read_all(fd, tokens.data(), tokens.size() * 4, kHeaderBytes, path);
         STRIX_CHECK(std::memcmp(tokens.data(), prompt.data(), (size_t)n * 4) == 0, path, ": tokens changed on disk");
+        const size_t prev_cap = state.capacity();
         state.resize(h.state_bytes);
-        read_all(fd, state.data(), state.size(), h.state_at, path);
-        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);  // don't keep GBs of it in the page cache (n-gram table's room)
+        size_t done = 0;
+        while (done < state.size()) {
+            const size_t want = std::min(state.size() - done, kReleaseChunkBytes);
+            read_all(fd, state.data() + done, want, h.state_at + done, path);
+            (void)::posix_fadvise(fd, (off_t)(h.state_at + done), (off_t)want, POSIX_FADV_DONTNEED);
+            const size_t next = done + want;
+            if (room && next > prev_cap) room->consume(next - std::max(done, prev_cap));
+            done = next;
+        }
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         STRIX_CHECK(strix_hash64(state.data(), state.size()) == h.state_hash, path, ": state checksum mismatch");
     } catch (...) {
         ::close(fd);
@@ -514,7 +523,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
             return false;
         }
         try {
-            load_file(p.path, prompt, (int64_t)p.e->tokens.size(), p.loaded);
+            load_file(p.path, prompt, (int64_t)p.e->tokens.size(), p.loaded, &room);
         } catch (const std::exception &ex) {
             slog(LogLevel::Warning, "prompt cache: dropping a damaged entry: %s", ex.what());
             std::lock_guard<std::mutex> lock(mu_);
@@ -1371,7 +1380,7 @@ void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
     STRIX_CHECK(lock.owns_lock(), "PromptCache::watch_margin: called without the cache's lock");
     // Off: no RAM tier keeps nothing to evict; shutting down, the shutdown rule writes RAM entries itself.
     if (!opt_.ram_tier || shutting_down_ || stop_) return;
-    const uint64_t avail = gov_.available();
+    const uint64_t avail = mem_available();
     if (gov_.room(avail, 0)) {
         // Trim excess spares when close to the margin so they don't starve kernel page cache for the n-gram table.
         if (spares_.size() > 1 && !gov_.room(avail, opt_.ram_watch_headroom + (2ull << 30))) {
@@ -1386,7 +1395,7 @@ void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
     }
     const int64_t before = stats_.ram_evicted;
     const uint64_t ram_before = ram_bytes_ + spare_bytes_;
-    make_room_locked(opt_.ram_watch_headroom);
+    make_room_locked(opt_.ram_watch_headroom, avail);
     const int64_t n = stats_.ram_evicted - before;
     stats_.ram_evicted_watch += n;
     // A line only when something left: a machine sitting below the margin with nothing left to evict stays quiet.
