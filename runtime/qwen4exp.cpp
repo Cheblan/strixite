@@ -940,7 +940,6 @@ Qwen4ExpSeqState::Qwen4ExpSeqState(const Qwen4ExpModel &model, int64_t capacity,
         STRIX_HIP_CHECK(hipEventCreateWithFlags(&ws.verify_done_event, hipEventDisableTiming), "MTP draft verify_done_event");
     }
     STRIX_HIP_CHECK(hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking), "Qwen4ExpSeqState: copy stream");
-    STRIX_HIP_CHECK(hipEventCreateWithFlags(&copy_event, hipEventDisableTiming), "Qwen4ExpSeqState: copy event");
 }
 
 Qwen4ExpSeqState::~Qwen4ExpSeqState() {
@@ -952,10 +951,6 @@ Qwen4ExpSeqState::~Qwen4ExpSeqState() {
     if (mtp_ws.verify_done_event) {
         (void)hipEventDestroy(mtp_ws.verify_done_event);
         mtp_ws.verify_done_event = nullptr;
-    }
-    if (copy_event) {
-        (void)hipEventDestroy(copy_event);
-        copy_event = nullptr;
     }
     if (copy_stream) {
         (void)hipStreamSynchronize(copy_stream);
@@ -1061,7 +1056,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
                                  PrefillMath prefill_math, bool mtp, KvFormat kv, int64_t n_slots,
                                  int64_t kv_generations)
     : m_(model), capacity_(capacity), max_tokens_(max_tokens), prefill_math_(prefill_math), kv_format_(kv),
-      mtp_(mtp) {
+      mtp_(mtp), ple_prefetcher_(2) {
     STRIX_CHECK(kv == KvFormat::Act || kv == KvFormat::Q8, "Qwen4ExpSession: unknown KV format ", (int)kv);
     STRIX_CHECK(prefill_math == PrefillMath::F32 || prefill_math == PrefillMath::WmmaBf16,
                 "Qwen4ExpSession: unknown prefill math ", (int)prefill_math);
@@ -1125,7 +1120,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     route_ids_ = DeviceBuffer<int32_t>((size_t)(M * A), "expert ids");
     route_coef_ = DeviceBuffer<float>((size_t)(M * A), "expert coefficients");
     logits_ = DeviceBuffer<float>((size_t)(std::min(M, kMaxLogits) * D.vocab), "logits");
-    readback_ = PinnedHostBuffer(kReadbackLogitsAt + logits_.size() * 4, "forward read-back (errors + logits)");
+    readback_ = PinnedHostBuffer(readback_logits_off() + logits_.size() * 4, "forward read-back (errors + logits)");
     {
         const int64_t rows = std::min(M, kMaxLogits);
         cand_dev_ = DeviceBuffer<uint8_t>((size_t)rows * (kernels::kLogitCands * sizeof(kernels::LogitCand) + 4),
@@ -1169,14 +1164,15 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         qsa_topk_ws_ = DeviceBuffer<uint8_t>(qsa_topk_ws_bytes_, "QSA top-k workspace");
         STRIX_HIP_CHECK(hipMemset(qsa_topk_ws_.get(), 0, qsa_topk_ws_bytes_), "zero the QSA top-k workspace");
     }
-    attn_err_ = DeviceBuffer<uint32_t>(3, "attention error");
-    STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "zero attention error");
+    const size_t err_words = err_slots() * 3, err_bytes = err_slots() * 12;
+    attn_err_ = DeviceBuffer<uint32_t>(err_words, "attention error");
+    STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, err_bytes), "zero attention error");
     if (q8 && prefill_math_ == PrefillMath::WmmaBf16 && m_.act() == Act::BF16 && max_tokens >= kKv8StageMinTokens)
         kv8_stage_ = DeviceBuffer<uint8_t>((size_t)(2 * kv8_cap_ * W) * 2, "staged K | V (8-bit prefill)");
     if (q8) {
         kv_new_ = act_buf(2 * W, "new K | V rows");
-        kv8_err_ = DeviceBuffer<uint32_t>(3, "8-bit K/V error");
-        STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "zero 8-bit K/V error");
+        kv8_err_ = DeviceBuffer<uint32_t>(err_words, "8-bit K/V error");
+        STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, err_bytes), "zero 8-bit K/V error");
     }
     // The batched path's logits-row workspace (feat/multi-sequence): the compacted logits rows of a
     // multi-run forward, so the LM head's weights are read once for the batch. (A batched verify's q8 new
@@ -1184,7 +1180,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     // single-run verify does.)
     lg_src_ = DeviceBuffer<uint8_t>((size_t)(std::max(M, kMaxLogits) * D.d) * e, "batched logits rows");
     attn_ws_ = DeviceBuffer<float>(attn_ws_bytes_ / 4 + 1, "attention workspace");
-    expert_err_ = DeviceBuffer<uint32_t>(3, "expert error");
+    expert_err_ = DeviceBuffer<uint32_t>(err_words, "expert error");
     if (prefill_math_ == PrefillMath::WmmaBf16 && M >= kWmmaMinTokens) {
         hc_ws_bytes_ = kernels::hc_wmma_workspace_bytes(M, D.H, D.r + D.H);
         hc_ws_ = DeviceBuffer<float>(hc_ws_bytes_ / 4, "hc mix partials");
@@ -1195,10 +1191,10 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         group_ws_ = DeviceBuffer<int32_t>(group_ws_bytes_ / 4, "expert grouping");
         group_partial_ = DeviceBuffer<float>((size_t)(M * A * D.d), "experts combine partials");
     }
-    router_err_ = DeviceBuffer<uint32_t>(3, "router error");
+    router_err_ = DeviceBuffer<uint32_t>(err_words, "router error");
     emb_err_ = DeviceBuffer<kernels::EmbeddingError>(1, "embedding error");
-    STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, 12), "zero expert error");
-    STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, 12), "zero router error");
+    STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, err_bytes), "zero expert error");
+    STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, err_bytes), "zero router error");
     mtp_vocab_ = D.vocab;
     if (mtp_) {
         mtp_emb_ = act_buf(D.d, "MTP embedding");
@@ -1246,7 +1242,11 @@ Qwen4ExpSession::~Qwen4ExpSession() {
     if (bias_uploaded_) (void)hipEventDestroy(bias_uploaded_);
 }
 
-Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
+Qwen4ExpSession::PleWorker::PleWorker(size_t n_threads) {
+    STRIX_CHECK(n_threads >= 1, "Qwen4ExpSession::PleWorker: n_threads = ", n_threads);
+    threads_.reserve(n_threads);
+    for (size_t i = 0; i < n_threads; ++i) threads_.emplace_back([this] { loop(); });
+}
 
 Qwen4ExpSession::PleWorker::~PleWorker() {
     {
@@ -1254,7 +1254,7 @@ Qwen4ExpSession::PleWorker::~PleWorker() {
         stop_ = true;
     }
     cv_.notify_all();
-    thread_.join();  // a job in flight finishes first
+    for (std::thread &t : threads_) t.join();  // any job in flight finishes first
 }
 
 std::future<void> Qwen4ExpSession::PleWorker::submit_alone(std::function<void()> job) {
@@ -1265,7 +1265,7 @@ std::future<void> Qwen4ExpSession::PleWorker::submit_alone(std::function<void()>
         // One at a time: normally the forward that submitted the last job waited for it; after a forward that failed
         // midway it may still be running - and it writes the same pinned buffer - so wait for it.
         std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [&] { return jobs_.empty() && !busy_; });
+        cv_.wait(lock, [&] { return jobs_.empty() && active_ == 0; });
         jobs_.push_back(std::move(task));
     }
     cv_.notify_all();
@@ -1291,16 +1291,26 @@ void Qwen4ExpSession::PleWorker::loop() {
             std::unique_lock<std::mutex> lock(mu_);
             cv_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
             if (jobs_.empty()) return;  // stop_, nothing left
-            task = std::move(jobs_.front()), busy_ = true;
+            task = std::move(jobs_.front()), ++active_;
             jobs_.pop_front();
         }
         task();  // an exception goes into the future
         {
             std::lock_guard<std::mutex> lock(mu_);
-            busy_ = false;
+            --active_;
         }
         cv_.notify_all();  // a submit_alone waiting for this job
     }
+}
+
+size_t Qwen4ExpSession::err_slots() const { return (size_t)m_.dims().layers; }
+
+size_t Qwen4ExpSession::readback_emb_off() const {
+    return ((4 * err_slots() * 12) + 15) & ~size_t(15);
+}
+
+size_t Qwen4ExpSession::readback_logits_off() const {
+    return (readback_emb_off() + sizeof(kernels::EmbeddingError) + 15) & ~size_t(15);
 }
 
 Qwen4ExpSession::PleStats Qwen4ExpSession::ple_stats() const {
@@ -1336,8 +1346,8 @@ void Qwen4ExpSession::prefetch_ple(int seq, const std::vector<int32_t> &ids, int
     PleHistory h = sq.verify_pending ? sq.verify_hist : sq.ple_hist;
     ple_ngram_ids(m_.ngram_rows().hash_params(), tok.data(), T, h, rows.data());
     rows.erase(rows.begin(), rows.begin() + first * 16);
-    // A prefetch that doesn't keep up is worth nothing: past a few queued, skip (the gather reads the rows itself).
-    constexpr size_t kMaxQueued = 8;
+    // Scale prefetch queue with active slots so 4-6 concurrent decode slots don't drop prefetches behind one cold read.
+    const size_t max_queued = std::max<size_t>(32, (size_t)n_slots() * 8);
     const bool queued = ple_prefetcher_.post(
         [this, rows = std::move(rows)] {
             const auto t0 = std::chrono::steady_clock::now();
@@ -1353,7 +1363,7 @@ void Qwen4ExpSession::prefetch_ple(int seq, const std::vector<int32_t> &ids, int
             ple_prefetch_ns_ +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         },
-        kMaxQueued);
+        max_queued);
     if (!queued) ++ple_prefetch_skipped_;
 }
 
@@ -1655,11 +1665,12 @@ void Qwen4ExpSession::reset() {
     // report that throws): left set, every later forward's read_back re-reports this stale error - the
     // engine resets after a failed request expecting a clean slate, so a reset must clear them (the
     // embedding slot has its own per-forward reset kernel).
-    STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero router error");
-    STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero expert error");
-    STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero attention error");
+    const size_t err_bytes = err_slots() * 12;
+    STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, err_bytes), "Qwen4ExpSession::reset: zero router error");
+    STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, err_bytes), "Qwen4ExpSession::reset: zero expert error");
+    STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, err_bytes), "Qwen4ExpSession::reset: zero attention error");
     if (kv_format_ == KvFormat::Q8)
-        STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, 12), "Qwen4ExpSession::reset: zero 8-bit K/V error");
+        STRIX_HIP_CHECK(hipMemset(kv8_err_.get(), 0, err_bytes), "Qwen4ExpSession::reset: zero 8-bit K/V error");
     // Every state (the slots) back to position 0; the error words / position upload machinery above are per-forward.
     try {
         for (size_t k = 0; k < seqs_.size(); ++k) reset_seq_state(*seqs_[k]);
@@ -2104,8 +2115,8 @@ void Qwen4ExpSession::export_state(int seq, const Qwen4ExpSnapshot &s, uint8_t *
     // sequence. The zeroing waits for the copies.
     const size_t tail_valid = (size_t)((n % kernels::kQsaBlock) * D.idx_d) * e;
     std::vector<std::pair<uint8_t *, size_t>> tail_unused;
-    STRIX_HIP_CHECK(hipEventRecord(sq.copy_event, stream_), "Qwen4ExpSession::export_state: record copy_event");
-    STRIX_HIP_CHECK(hipStreamWaitEvent(sq.copy_stream, sq.copy_event, 0), "Qwen4ExpSession::export_state: wait copy_event");
+    // All GPU writes to sq up to s.pos() already synchronized stream_ before save() / forward / restore returned.
+    // Copying directly on sq.copy_stream avoids touching shared stream_ concurrently or stalling behind other slots.
     try {
         for (size_t l = 0; l < sq.conv_state.size(); ++l) {
             if (D.is_attention[l]) {
@@ -2184,8 +2195,7 @@ void Qwen4ExpSession::export_small_state(int seq, const Qwen4ExpSnapshot &s, uin
     cur += sizeof(PleHistory);
     const size_t tail_valid = (size_t)((n % kernels::kQsaBlock) * D.idx_d) * e;
     std::vector<std::pair<uint8_t *, size_t>> tail_unused;
-    STRIX_HIP_CHECK(hipEventRecord(sq.copy_event, stream_), "Qwen4ExpSession::export_small_state: record copy_event");
-    STRIX_HIP_CHECK(hipStreamWaitEvent(sq.copy_stream, sq.copy_event, 0), "Qwen4ExpSession::export_small_state: wait copy_event");
+    // All GPU writes to sq up to s.pos() already synchronized stream_ before save() / forward / restore returned.
     // A drift between state_paged_ranges and this walk must name itself, never run off the buffer (the stitch
     // test is what catches it in practice; these checks are the seat belt).
     const auto room = [&](size_t b) {
@@ -2439,43 +2449,68 @@ void Qwen4ExpSession::import_state(int seq, const uint8_t *in, size_t bytes, int
 // cycle runs several forwards per token. The pinned area is reused only after this synchronize (the gfx1151
 // pinned-reuse hazard).
 std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what, int64_t n_cand_rows) {
-    STRIX_CHECK(n_floats * 4 <= readback_.size() - kReadbackLogitsAt, "Qwen4ExpSession::read_back: ", n_floats,
-                " logits, the pinned area holds ", (readback_.size() - kReadbackLogitsAt) / 4);
+    const size_t err_slots_n = err_slots(), err_bytes = err_slots_n * 12;
+    const size_t emb_off = readback_emb_off(), logits_off = readback_logits_off();
+    STRIX_CHECK(n_floats * 4 <= readback_.size() - logits_off, "Qwen4ExpSession::read_back: ", n_floats,
+                " logits, the pinned area holds ", (readback_.size() - logits_off) / 4);
     STRIX_CHECK(n_cand_rows >= 0 && (n_cand_rows == 0 || n_floats == 0), "Qwen4ExpSession::read_back: ", n_cand_rows,
                 " candidate rows with ", n_floats, " logits (one or the other)");
     const size_t cand_bytes = (size_t)n_cand_rows * kernels::kLogitCands * sizeof(kernels::LogitCand);
     STRIX_CHECK(cand_bytes + (size_t)n_cand_rows * 4 <= cand_dev_.size(), "Qwen4ExpSession::read_back: ", n_cand_rows,
                 " candidate rows, the device area holds ", cand_dev_.size(), " bytes");
     auto *host = static_cast<uint8_t *>(readback_.get());
-    auto *words = reinterpret_cast<uint32_t *>(host);  // router [0, 3), experts [3, 6), attention [6, 9), 8-bit K/V [9, 12)
-    auto *emb = reinterpret_cast<kernels::EmbeddingError *>(host + kReadbackEmbAt);
+    auto *words = reinterpret_cast<uint32_t *>(host);  // 4 blocks of err_slots_n * 3 words: router, experts, attn, kv8
+    const size_t err_words = err_slots_n * 3;
+    uint32_t *r_words = words, *e_words = words + err_words, *a_words = words + 2 * err_words,
+             *k_words = words + 3 * err_words;
+    auto *emb = reinterpret_cast<kernels::EmbeddingError *>(host + emb_off);
     auto d2h = [&](void *to, const void *from, size_t bytes, const char *name) {
         STRIX_HIP_CHECK(hipMemcpyAsync(to, from, bytes, hipMemcpyDeviceToHost, stream_), "Qwen4ExpSession::read_back",
                         what, ": ", name);
     };
-    d2h(words, router_err_.get(), 12, "router error");
-    d2h(words + 3, expert_err_.get(), 12, "expert error");
-    d2h(words + 6, attn_err_.get(), 12, "attention error");
-    if (kv_format_ == KvFormat::Q8) d2h(words + 9, kv8_err_.get(), 12, "8-bit K/V error");
-    else std::memset(words + 9, 0, 12);
+    d2h(r_words, router_err_.get(), err_bytes, "router error");
+    d2h(e_words, expert_err_.get(), err_bytes, "expert error");
+    d2h(a_words, attn_err_.get(), err_bytes, "attention error");
+    if (kv_format_ == KvFormat::Q8) d2h(k_words, kv8_err_.get(), err_bytes, "8-bit K/V error");
+    else std::memset(k_words, 0, err_bytes);
     d2h(emb, emb_err_.get(), sizeof(kernels::EmbeddingError), "embedding error");
-    if (n_floats) d2h(host + kReadbackLogitsAt, logits_.get(), n_floats * 4, "logits");
-    if (n_cand_rows) d2h(host + kReadbackLogitsAt, cand_dev_.get(), cand_bytes + (size_t)n_cand_rows * 4, "candidates");
+    if (n_floats) d2h(host + logits_off, logits_.get(), n_floats * 4, "logits");
+    if (n_cand_rows) d2h(host + logits_off, cand_dev_.get(), cand_bytes + (size_t)n_cand_rows * 4, "candidates");
     STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::read_back", what, ": end of the forward");
     const std::string tag = std::string("Qwen4ExpSession") + what;
-    kernels::report_router_error(words, (tag + " router").c_str());
-    kernels::report_expert_error(words + 3, (tag + " experts").c_str());
-    kernels::report_attention_error(words + 6, (tag + " QSA attention").c_str());
-    kernels::report_kv8_error(words + 9, (tag + " K/V cache").c_str());
+    // Check in causal pipeline order (embedding -> per-layer kv8 -> QSA attention -> experts -> router) so a downstream
+    // router NaN cannot mask the originating layer or kernel; log any extra active errors before throwing on the first.
+    int first_layer = -1, first_kind = -1;
+    for (size_t s = 0; s < err_slots_n; ++s) {
+        const uint32_t *ptrs[4] = {k_words + s * 3, a_words + s * 3, e_words + s * 3, r_words + s * 3};
+        const char *kinds[4] = {"kv8", "QSA attention", "experts", "router"};
+        for (int k = 0; k < 4; ++k) {
+            if (ptrs[k][0] == 0) continue;
+            if (first_layer < 0) {
+                first_layer = (int)s, first_kind = k;
+            } else {
+                slog(LogLevel::Error, "%s layer %zu %s error also triggered (w0=%u, w1=%u, w2=%u)",
+                     tag.c_str(), s, kinds[k], ptrs[k][0], ptrs[k][1], ptrs[k][2]);
+            }
+        }
+    }
     kernels::report_embedding_error(*emb, m_.dims().vocab);
+    if (first_layer >= 0) {
+        const size_t off = (size_t)first_layer * 3;
+        const std::string ltag = tag + " layer " + std::to_string(first_layer);
+        if (first_kind == 0) kernels::report_kv8_error(k_words + off, (ltag + " K/V cache").c_str());
+        if (first_kind == 1) kernels::report_attention_error(a_words + off, (ltag + " QSA attention").c_str());
+        if (first_kind == 2) kernels::report_expert_error(e_words + off, (ltag + " experts").c_str());
+        kernels::report_router_error(r_words + off, (ltag + " router").c_str());
+    }
     if (n_cand_rows) {
-        const auto *c = reinterpret_cast<const kernels::LogitCand *>(host + kReadbackLogitsAt);
-        const auto *f = reinterpret_cast<const uint32_t *>(host + kReadbackLogitsAt + cand_bytes);
+        const auto *c = reinterpret_cast<const kernels::LogitCand *>(host + logits_off);
+        const auto *f = reinterpret_cast<const uint32_t *>(host + logits_off + cand_bytes);
         cand_host_.rows = n_cand_rows;
         cand_host_.cand.assign(c, c + n_cand_rows * kernels::kLogitCands);
         cand_host_.nan.assign(f, f + n_cand_rows);
     }
-    const float *l = reinterpret_cast<const float *>(host + kReadbackLogitsAt);
+    const float *l = reinterpret_cast<const float *>(host + logits_off);
     return std::vector<float>(l, l + n_floats);
 }
 
@@ -3137,7 +3172,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     kernels::kv8_commit(k_out, v_out, kv_ts, r.Tr, r.p,
                                         r.p % kernels::kKv8Group ? sq.kv8_tail[sq.tail_cur][li].get() : nullptr,
                                         sq.kv8_tail[1 - sq.tail_cur][li].get(), sq.kv8_store[li].get(), kv8_cap_, W, act,
-                                        kv8_err_.get(), stream_);
+                                        kv8_err_.get() + li * 3, stream_);
                     kv8 = {sq.kv8_store[li].get(), kv8_cap_, W,
                            r.p % kernels::kKv8Group ? sq.kv8_tail[sq.tail_cur][li].get() : nullptr, k_out, v_out, kv_ts,
                            r.p};
@@ -3193,25 +3228,26 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     show(L + "qsa_sel", qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_k, ProbeType::I32);
                     show(L + "qsa_nsel", qsa_nsel_.get() + r.base, 1, ProbeType::I32);
                     stage_kv8(std::min<int64_t>(D.qsa_budget, r.p + r.Tr));
+                    uint32_t *const l_attn_err = attn_err_.get() + (size_t)i * 3;
                     if (wmma_attn && q8)
                         kernels::attention_gathered_wmma(q_r, q_r + (size_t)hd * e, kv8, as,
                                                          qsa_sel_.get() + (size_t)(r.base * qsa_k),
                                                          qsa_nsel_.get() + r.base, qsa_k, scale, core_r, attn_ws_.get(),
-                                                         attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+                                                         attn_ws_bytes_, l_attn_err, act, stream_, precision_.attention);
                     else if (wmma_attn)
                         kernels::attention_gathered_wmma(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as,
                                                          qsa_sel_.get() + (size_t)(r.base * qsa_k),
                                                          qsa_nsel_.get() + r.base, qsa_k, scale, core_r, attn_ws_.get(),
-                                                         attn_ws_bytes_, attn_err_.get(), act, stream_, precision_.attention);
+                                                         attn_ws_bytes_, l_attn_err, act, stream_, precision_.attention);
                     else if (q8)
                         kernels::attention_gathered(q_r, q_r + (size_t)hd * e, kv8, as,
                                                     qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
-                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, attn_err_.get(),
+                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, l_attn_err,
                                                     act, stream_);
                     else
                         kernels::attention_gathered(q_r, q_r + (size_t)hd * e, kc, vc, capacity_, as,
                                                     qsa_sel_.get() + (size_t)(r.base * qsa_k), qsa_nsel_.get() + r.base,
-                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, attn_err_.get(),
+                                                    qsa_k, scale, core_r, attn_ws_.get(), attn_ws_bytes_, l_attn_err,
                                                     act, stream_);
                 }
             }
@@ -3234,9 +3270,11 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             kernels::linear_bf16w(u_.get(), l.router, router_logits_.get(), T, D.experts + 1, D.d, act, Act::F32,
                                   stream_);
         show(L + "router_logits", router_logits_.get(), D.experts + 1, ProbeType::F32);
+        uint32_t *const l_router_err = router_err_.get() + (size_t)i * 3;
+        uint32_t *const l_expert_err = expert_err_.get() + (size_t)i * 3;
         kernels::moe_router(router_logits_.get(), D.experts + 1, T, D.experts, D.top_k,
                             sep ? nullptr : router_logits_.get() + D.experts, D.experts + 1, (int32_t)D.experts,
-                            route_ids_.get(), route_coef_.get(), Act::F32, router_err_.get(), stream_);
+                            route_ids_.get(), route_coef_.get(), Act::F32, l_router_err, stream_);
         show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
         show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
@@ -3257,7 +3295,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
             router_logits_.get() + D.experts,
             D.experts + 1,
             (uint32_t)D.experts,
-            router_err_.get(),
+            l_router_err,
             can_fuse_inject ? x_.get() : nullptr,
             can_fuse_inject ? w_in_.get() : nullptr,
             can_fuse_inject ? D.eps : 0.f,
@@ -3273,7 +3311,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                             ? kernels::MoeMath::WmmaF16
                                             : moe_math;
             kernels::moe_group_routes(route_ids_.get(), T, A, Estack, group_ws_.get(), group_ws_bytes_,
-                                      expert_err_.get(), stream_);
+                                      l_expert_err, stream_);
             const bool fused = em == kernels::MoeMath::WmmaF16 && l.gate_up.bits == 4;
             // h as F16 bits between the fused gather and a Q4 down: the down's x conversion done once (bit-identical)
             h_f16 = fused && l.down.bits == 4 && act == Act::BF16;
@@ -3292,9 +3330,9 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                                        h_f16);
         } else {
             kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(),
-                                                     act, expert_err_.get(), stream_);
+                                                     act, l_expert_err, stream_);
             kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A,
-                                               y_.get(), act, expert_err_.get(), stream_);
+                                               y_.get(), act, l_expert_err, stream_);
         }
         show(L + "experts_h", hh_.get(), A * D.inter, h_f16 ? ProbeType::F16 : pt);  // the routed experts' down input, T rows of A slots
         if (sep && !fold_shared) shared_expert();  // then y += sigmoid(its gate logit) * its output
@@ -3303,13 +3341,13 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         } else if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,
-                                           router_err_.get(), stream_);
+                                           l_router_err, stream_);
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = false;
         } else {
             if (sep && !fold_shared)
                 kernels::moe_shared_add(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
-                                        D.d, (uint32_t)D.experts, act, router_err_.get(), stream_);
+                                        D.d, (uint32_t)D.experts, act, l_router_err, stream_);
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = inject_y();
         }
@@ -3721,7 +3759,7 @@ void Qwen4ExpSession::keep_verify_prefix_seq(Qwen4ExpSeqState &sq, int64_t rows)
                 kernels::kv8_commit(rows_kv, rows_kv + (size_t)W * e, 2 * W, rows, p0,
                                     p0 % kernels::kKv8Group ? sq.kv8_tail[sq.verify_tail_cur][li].get() : nullptr,
                                     sq.kv8_tail[1 - sq.verify_tail_cur][li].get(), sq.kv8_store[li].get(), kv8_cap_, W, act,
-                                    kv8_err_.get(), stream_);
+                                    kv8_err_.get() + li * 3, stream_);
             }
         }
     }
@@ -4169,6 +4207,15 @@ int64_t Qwen4ExpSession::mtp_batch_body(const std::vector<MtpDraftRun> &runs) {
     return target_rows;
 }
 
+namespace {
+void report_mtp_errors(const kernels::MtpPick &p, int64_t vocab) {
+    kernels::report_embedding_error(p.emb, vocab);
+    kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
+    kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
+    kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
+}
+}  // namespace
+
 std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::mtp_batch_reduce(const std::vector<MtpDraftRun> &runs,
                                                                          int64_t pick_vocab) {
     const char *fn = "Qwen4ExpSession::mtp_batch_reduce";
@@ -4190,10 +4237,7 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::mtp_batch_reduce(const st
     std::vector<MtpTop2> results((size_t)T);
     for (size_t r = 0; r < (size_t)T; ++r) {
         const kernels::MtpPick &p = host_picks[r];
-        kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
-        kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
-        kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
-        kernels::report_embedding_error(p.emb, m_.dims().vocab);
+        report_mtp_errors(p, m_.dims().vocab);
         STRIX_CHECK(p.nan || (p.best >= 0 && p.best < pick_vocab),
                     fn, ": pick ", p.best, " outside the draft vocabulary [0, ", pick_vocab, ")");
         int32_t final_best = p.best;
@@ -4240,10 +4284,7 @@ std::vector<Qwen4ExpSession::MtpTop2> Qwen4ExpSession::forward_mtp_top2_batch(co
         std::vector<MtpTop2> results((size_t)T);
         for (size_t r = 0; r < (size_t)T; ++r) {
             const kernels::MtpPick &p = host_picks[r];
-            kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
-            kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
-            kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
-            kernels::report_embedding_error(p.emb, m_.dims().vocab);
+            report_mtp_errors(p, m_.dims().vocab);
             STRIX_CHECK(p.nan || (p.best >= 0 && p.best < m_.dims().vocab), fn, ": pick ", p.best,
                         " outside [0, ", m_.dims().vocab, ")");
             mtp_done(runs[r].seq, runs[r].step);
@@ -4319,10 +4360,7 @@ std::vector<Qwen4ExpSession::MtpCands> Qwen4ExpSession::forward_mtp_cands_batch(
         std::vector<MtpCands> out((size_t)T);
         for (size_t r = 0; r < (size_t)T; ++r) {
             const kernels::MtpPick &p = host_picks[r];
-            kernels::report_router_error(p.err, "Qwen4ExpSession MTP router");
-            kernels::report_expert_error(p.err + 3, "Qwen4ExpSession MTP experts");
-            kernels::report_attention_error(p.err + 6, "Qwen4ExpSession MTP QSA attention");
-            kernels::report_embedding_error(p.emb, m_.dims().vocab);
+            report_mtp_errors(p, m_.dims().vocab);
             STRIX_CHECK(p.nan || (p.best >= 0 && p.best < m_.dims().vocab), fn, ": pick ", p.best,
                         " outside [0, ", m_.dims().vocab, ")");
             mtp_done(runs[r].seq, runs[r].step);

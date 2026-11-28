@@ -824,20 +824,24 @@ bool Engine::save_state(Slot &sl, const int32_t *tokens, int slot, int64_t n, Pr
     // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin. Parked
     // records the room rule retires go back right here (this thread may hand the GPU work to the arbiter).
     const uint64_t want = sl.be->snapshot_bytes(slot, base_n);
-    if (want > state.capacity() &&
-        !cache_->make_room_for(want - state.capacity(), [&](const std::vector<int64_t> &ids) {
+    PromptCache::RoomGrant room;
+    if (want > state.capacity()) {
+        room = cache_->make_room_for(want - state.capacity(), [&](const std::vector<int64_t> &ids) {
             for (const int64_t id : ids) sl.be->release_parked(id);
-        })) {
-        slog_row(LogLevel::Warning, rows++ ? "" : "cache",
-                 "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s GiB)",
-                 what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
-                 fmt_rate(cache_->mem_available_now() / (double)(1ull << 30), 1).c_str(),
-                 fmt_rate(cache_->options().ram_margin / (double)(1ull << 30), 0).c_str());
-        slog_row(LogLevel::Warning, "", "%s", cache_->ram_summary().c_str());
-        cache_->give_back(std::move(state));
-        return false;
+        });
+        if (!room) {
+            slog_row(LogLevel::Warning, rows++ ? "" : "cache",
+                     "%s, %s tokens: not saved - no room in RAM (needs %s GB more; MemAvailable %s GiB, margin %s GiB)",
+                     what, fmt_n(n).c_str(), fmt_rate((want - state.capacity()) / 1e9, 1).c_str(),
+                     fmt_rate(cache_->mem_available_now() / (double)(1ull << 30), 1).c_str(),
+                     fmt_rate(cache_->options().ram_margin / (double)(1ull << 30), 0).c_str());
+            slog_row(LogLevel::Warning, "", "%s", cache_->ram_summary().c_str());
+            cache_->give_back(std::move(state));
+            return false;
+        }
     }
     sl.be->export_snapshot(slot, state, base_n);
+    room.release();  // state's physical pages have landed in MemAvailable
     const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
     const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
     // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
@@ -1628,7 +1632,8 @@ void Engine::run(Job &job, Slot &sl) {
                         }
                     }
 
-                    if (step + 1 < steps) sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
+                    // Verify's batch wait and GPU forward provide ample window to hide the final draft token's PLE lookup.
+                    sl.be->prefetch_ple(ids, (int64_t)ids.size() - 1);
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {

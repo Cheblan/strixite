@@ -583,7 +583,6 @@ struct Qwen4ExpSeqState {
     // Dedicated non-blocking stream for async device -> host snapshot exports (so exports never contend with
     // other slots on the shared compute stream_).
     hipStream_t copy_stream = nullptr;
-    hipEvent_t copy_event = nullptr;
 
     int64_t pos3Hend() const { return pos3_start + (int64_t)pos3_host.size() / 3; }  // == pos when non-empty
 
@@ -1108,9 +1107,11 @@ private:
     // over the embedding's rows in x_ at the image_token_id positions. Called from forward_impl right
     // after the embedding launch.
     void run_tower_and_scatter(const std::vector<int32_t> &ids, const ImageInput &image);
-    // Pinned: the error words at 0 (router, experts, attention - 3 words each), the embedding slot at
-    // kReadbackEmbAt, the logits from kReadbackLogitsAt. read_back fills and checks it at the end of a forward.
-    static constexpr size_t kReadbackEmbAt = 64, kReadbackLogitsAt = 128;  // error words [0, 12): 48 bytes
+    // Pinned: per-layer error words (err_slots() * 12 bytes each for router, experts, attention, 8-bit K/V),
+    // embedding error at emb_off, logits from logits_off. read_back fills and checks them at the end of a forward.
+    size_t err_slots() const;
+    size_t readback_emb_off() const;
+    size_t readback_logits_off() const;
     PinnedHostBuffer readback_;
     // n_cand_rows > 0: the candidates (cand_dev_: [rows, kLogitCands] then rows NaN words) come back in place of the
     // logits, into cand_host_.
@@ -1161,7 +1162,7 @@ private:
     // are freed.
     class PleWorker {
     public:
-        PleWorker();
+        explicit PleWorker(size_t n_threads = 1);
         ~PleWorker();  // runs the queued jobs first
         PleWorker(const PleWorker &) = delete;
         PleWorker &operator=(const PleWorker &) = delete;
@@ -1173,8 +1174,9 @@ private:
         std::mutex mu_;
         std::condition_variable cv_;
         std::deque<std::packaged_task<void()>> jobs_;
-        bool busy_ = false, stop_ = false;
-        std::thread thread_;
+        int active_ = 0;
+        bool stop_ = false;
+        std::vector<std::thread> threads_;
     };
     PleWorker ple_worker_;
     // Where the gathers' time goes (ple_stats): on the worker / in async gathers, and how long forwards waited for
@@ -1183,8 +1185,8 @@ private:
     std::atomic<int64_t> ple_prefetches_{0}, ple_prefetch_ns_{0}, ple_prefetch_skipped_{0}, ple_prefetch_failed_{0};
     // Vision tower counters (vision_stats): images (tower forwards), patches, merged tokens, total / max ns.
     std::atomic<int64_t> vision_images_{0}, vision_patches_{0}, vision_merged_{0}, vision_ns_{0}, vision_max_ns_{0};
-    // prefetch_ple's jobs: their own thread, so a prefetch never delays a gather's start (the table's lock orders
-    // the two: whichever runs second finds the rows cached). Declared after the counters it writes.
+    // prefetch_ple's jobs: dedicated worker pool (2 threads), so one cold SSD read doesn't stall other slots'
+    // prefetches behind it. Declared after the counters it writes.
     PleWorker ple_prefetcher_;
     enum class PleRun { Worker, Async };
     std::future<void> start_ple_gather(std::vector<int64_t> rows, int64_t T, PinnedHostBuffer &dst, PleRun run);

@@ -373,7 +373,7 @@ void PromptCache::release_locked(Entry &e) {
 }
 
 void PromptCache::load_file(const std::string &path, const std::vector<int32_t> &prompt, int64_t n,
-                            HostBuffer &state) const {
+                            HostBuffer &state, RoomGrant *room) const {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     STRIX_CHECK(fd >= 0, path, ": open failed: ", std::strerror(errno));
     try {
@@ -382,9 +382,18 @@ void PromptCache::load_file(const std::string &path, const std::vector<int32_t> 
         std::vector<int32_t> tokens(h.tokens);
         read_all(fd, tokens.data(), tokens.size() * 4, kHeaderBytes, path);
         STRIX_CHECK(std::memcmp(tokens.data(), prompt.data(), (size_t)n * 4) == 0, path, ": tokens changed on disk");
+        const size_t prev_cap = state.capacity();
         state.resize(h.state_bytes);
-        read_all(fd, state.data(), state.size(), h.state_at, path);
-        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);  // don't keep GBs of it in the page cache (n-gram table's room)
+        size_t done = 0;
+        while (done < state.size()) {
+            const size_t want = std::min(state.size() - done, kReleaseChunkBytes);
+            read_all(fd, state.data() + done, want, h.state_at + done, path);
+            (void)::posix_fadvise(fd, (off_t)(h.state_at + done), (off_t)want, POSIX_FADV_DONTNEED);
+            const size_t next = done + want;
+            if (room && next > prev_cap) room->consume(next - std::max(done, prev_cap));
+            done = next;
+        }
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         STRIX_CHECK(strix_hash64(state.data(), state.size()) == h.state_hash, path, ": state checksum mismatch");
     } catch (...) {
         ::close(fd);
@@ -514,7 +523,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
             return false;
         }
         try {
-            load_file(p.path, prompt, (int64_t)p.e->tokens.size(), p.loaded);
+            load_file(p.path, prompt, (int64_t)p.e->tokens.size(), p.loaded, &room);
         } catch (const std::exception &ex) {
             slog(LogLevel::Warning, "prompt cache: dropping a damaged entry: %s", ex.what());
             std::lock_guard<std::mutex> lock(mu_);
@@ -601,11 +610,12 @@ void PromptCache::give_back(HostBuffer b) {
     hb.take(this);
 }
 
-void PromptCache::keep_spare_locked(HostBuffer b) {
-    if (b.capacity() == 0) return;
-    spare_bytes_ += b.capacity();
-    spares_.push_back(std::move(b));
-    while ((int)spares_.size() > opt_.max_spares) {  // the smallest goes
+uint64_t PromptCache::spare_cap_locked() const {
+    return std::max<uint64_t>(4ull << 30, prefault_bytes_ + (256ull << 20));
+}
+
+void PromptCache::trim_spares_locked(size_t max_count, uint64_t max_bytes) {
+    while (spares_.size() > max_count || (spares_.size() > 1 && spare_bytes_ > max_bytes)) {  // the smallest goes
         size_t small = 0;
         for (size_t i = 1; i < spares_.size(); ++i)
             if (spares_[i].capacity() < spares_[small].capacity()) small = i;
@@ -613,6 +623,13 @@ void PromptCache::keep_spare_locked(HostBuffer b) {
         trash_.push_back(std::move(spares_[small]));
         spares_.erase(spares_.begin() + (int64_t)small);
     }
+}
+
+void PromptCache::keep_spare_locked(HostBuffer b) {
+    if (b.capacity() == 0) return;
+    spare_bytes_ += b.capacity();
+    spares_.push_back(std::move(b));
+    trim_spares_locked((size_t)opt_.max_spares, spare_cap_locked());
 }
 
 void PromptCache::drop_ram_locked(Entry &e, bool to_spare) {
@@ -800,10 +817,16 @@ double PromptCache::budget_now_locked() const {
     return std::min(cap, budget_bytes_ + (now_s() - budget_at_) * cap / 3600.0);
 }
 
-bool PromptCache::spend_budget_locked(uint64_t bytes) {
+uint64_t PromptCache::idle_write_reserve_locked() const {
+    if (opt_.write_gib_per_hour <= 0) return 0;
+    const double hourly = opt_.write_gib_per_hour * (double)(1ull << 30);
+    return (uint64_t)std::min(hourly * 0.25, (double)(4ull << 30));
+}
+
+bool PromptCache::spend_budget_locked(uint64_t bytes, uint64_t reserve) {
     if (opt_.write_gib_per_hour <= 0) return true;
     budget_bytes_ = budget_now_locked(), budget_at_ = now_s();
-    if (budget_bytes_ < (double)bytes) return false;
+    if (budget_bytes_ < (double)bytes + (double)reserve) return false;
     budget_bytes_ -= (double)bytes;
     return true;
 }
@@ -1032,23 +1055,23 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
     }
     // Then resume points: the least lost (a point only helps a client that edits old history), and small.
     while (need > 0 && !points_.empty()) {
-        size_t lru = 0;
-        for (size_t i = 1; i < points_.size(); ++i)
-            if (points_[i].last_used < points_[lru].last_used) lru = i;
-        need -= std::min(need, (uint64_t)points_[lru].small->capacity());
-        drop_point_locked();
+        const uint64_t freed = drop_point_locked();
+        need -= std::min(need, freed);
         ++stats_.points_evicted;
     }
-    while (need > 0) {
-        // Candidates: every RAM entry not being imported and not already leaving. One queued for a write (idle, or
-        // being written) counts too - it leaves RAM once written, its last read releasing it if one holds it - so the
-        // least recently used goes first, never the newest just because the older ones sat in the write queue
-        // (otherwise the entry just saved was dropped, "write queue full", and its conversation re-prefilled 132k
-        // tokens).
+    auto pick_lru = [&](bool persisted_or_queued_only) {
         Entry *lru = nullptr;
-        for (const EntryPtr &e : entries_)
-            if (can_leave_ram(*e) && (!lru || e->last_used < lru->last_used))
-                lru = e.get();
+        for (const EntryPtr &e : entries_) {
+            if (!can_leave_ram(*e)) continue;
+            if (persisted_or_queued_only && e->path.empty() && !e->queued) continue;
+            if (!lru || e->last_used < lru->last_used) lru = e.get();
+        }
+        return lru;
+    };
+    while (need > 0) {
+        // Evict RAM copies of entries already on disk or queued for write first: zero write budget spent, zero state lost.
+        Entry *lru = pick_lru(/*persisted_or_queued_only=*/true);
+        if (!lru) lru = pick_lru(/*persisted_or_queued_only=*/false);
         if (!lru) break;  // the rest is in use or on its way out; the next put tries again
         if (opt_.ram_tier) need -= std::min(need, lru->ram_cost());
         ++stats_.ram_evicted;
@@ -1137,6 +1160,7 @@ void PromptCache::summary_locked(double now) {
 
 void PromptCache::write_idle_locked(double now) {
     if (shutting_down_) return;
+    const uint64_t reserve = idle_write_reserve_locked();
     for (const EntryPtr &e : entries_) {
         if (!e->in_ram() || !e->path.empty() || e->queued || e->no_room || e->ram_only ||
             now - e->touched_s < opt_.idle_seconds)
@@ -1148,7 +1172,7 @@ void PromptCache::write_idle_locked(double now) {
         const uint64_t total = write_bytes_locked(*e);
         const uint64_t free = disk_free();
         const uint64_t fs_cap = disk_bytes_ + (free > opt_.disk_free_margin ? free - opt_.disk_free_margin : 0);
-        if (total > std::min(max_bytes_, fs_cap) || !spend_budget_locked(total)) continue;  // later, maybe
+        if (total > std::min(max_bytes_, fs_cap) || !spend_budget_locked(total, reserve)) continue;  // keep reserve for evictions
         enqueue_locked(e, Why::Idle);
     }
 }
@@ -1158,7 +1182,9 @@ uint64_t PromptCache::prefault_want_locked() const {
     int ready = 0;
     for (const HostBuffer &b : spares_) ready += b.capacity() >= prefault_bytes_;
     if (ready >= opt_.max_spares) return 0;
-    if (!gov_.room_now(prefault_bytes_)) return 0;  // never into memory pressure
+    if (spare_bytes_ + prefault_bytes_ > spare_cap_locked()) return 0;
+    const uint64_t spare_headroom = std::min<uint64_t>(opt_.ram_margin, 4ull << 30);
+    if (!gov_.room_now(prefault_bytes_ + spare_headroom)) return 0;  // leave room for Linux page cache (ngram table)
     return prefault_bytes_;
 }
 
@@ -1172,16 +1198,17 @@ void PromptCache::flush() {
     idle_cv_.wait(lock, [&] { return queue_.empty() && !writing_; });
 }
 
-bool PromptCache::drop_point_locked() {
-    if (points_.empty()) return false;
+uint64_t PromptCache::drop_point_locked() {
+    if (points_.empty()) return 0;
     size_t lru = 0;
     for (size_t i = 1; i < points_.size(); ++i)
         if (points_[i].last_used < points_[lru].last_used) lru = i;
     Point &p = points_[lru];
-    ram_bytes_ -= std::min<uint64_t>(ram_bytes_, p.small->capacity());
+    const uint64_t freed = (uint64_t)p.small->capacity();
+    ram_bytes_ -= std::min<uint64_t>(ram_bytes_, freed);
     points_[lru] = std::move(points_.back());
     points_.pop_back();
-    return true;
+    return freed;
 }
 
 bool PromptCache::put_point(std::vector<int32_t> tokens, HostBuffer small, int64_t saved_by) {
@@ -1353,11 +1380,22 @@ void PromptCache::watch_margin(std::unique_lock<std::mutex> &lock) {
     STRIX_CHECK(lock.owns_lock(), "PromptCache::watch_margin: called without the cache's lock");
     // Off: no RAM tier keeps nothing to evict; shutting down, the shutdown rule writes RAM entries itself.
     if (!opt_.ram_tier || shutting_down_ || stop_) return;
-    const uint64_t avail = gov_.available();
-    if (gov_.room(avail, 0)) return;
+    const uint64_t avail = mem_available();
+    if (gov_.room(avail, 0)) {
+        // Trim excess spares when close to the margin so they don't starve kernel page cache for the n-gram table.
+        if (spares_.size() > 1 && !gov_.room(avail, opt_.ram_watch_headroom + (2ull << 30))) {
+            trim_spares_locked(1, UINT64_MAX);
+            Handback hb;
+            hb.take(this);
+            lock.unlock();
+            hb.trash.clear();
+            lock.lock();
+        }
+        return;
+    }
     const int64_t before = stats_.ram_evicted;
     const uint64_t ram_before = ram_bytes_ + spare_bytes_;
-    make_room_locked(opt_.ram_watch_headroom);
+    make_room_locked(opt_.ram_watch_headroom, avail);
     const int64_t n = stats_.ram_evicted - before;
     stats_.ram_evicted_watch += n;
     // A line only when something left: a machine sitting below the margin with nothing left to evict stays quiet.
